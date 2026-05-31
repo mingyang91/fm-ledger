@@ -1,0 +1,78 @@
+package build
+
+import mill._, scalalib._
+
+/* =============================================================================
+ * BUILD — production app (root module) + the `transpiler` tool that GENERATES
+ * the production business core from the Stainless-verified source of truth.
+ *
+ * WIRING (how generation is part of the build):
+ *   - `transpiler` is a separate ScalaModule (scalameta 4.13.4) holding the
+ *     Stainless->Ox transpiler. It is a BUILD-TIME tool, not shipped.
+ *   - The root module registers a `generatedSources` entry produced by the
+ *     `transpile` task. `transpile` runs the transpiler over
+ *       verify/src/main/scala/io/linewise/jobfm/verify/JobModel.scala
+ *     and writes
+ *       <generatedSources>/io/linewise/jobfm/generated/JobModel.scala
+ *   - Because `generatedSources` feeds `allSourceFiles`, `./mill compile`
+ *     (and `run`) AUTOMATICALLY regenerates the production core from the
+ *     verified source first. There is no hand-written core.scala anymore.
+ *   - `./mill transpile` can also be invoked directly to (re)generate on demand.
+ * ========================================================================== */
+
+object `package` extends SbtModule {
+
+  def scalaVersion = "3.8.1"
+
+  // Ox virtual threads need a JDK 21+ class-file target. Host JDK is 26, which
+  // runs JDK-21-targeted bytecode fine.
+  def scalacOptions = Seq("-release", "21")
+
+  def mainClass = Some("io.linewise.jobfm.Main")
+
+  def mvnDeps = Seq(
+    mvn"com.softwaremill.ox::core:1.0.4",
+    mvn"org.tpolecat::doobie-core:1.0.0-RC12",
+    mvn"com.h2database:h2:2.3.232",
+    mvn"org.typelevel::cats-effect:3.6.3"
+  )
+
+  // The verified source of truth that the production core is generated FROM.
+  def verifiedModelSource: T[PathRef] = Task.Source(
+    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "JobModel.scala"
+  )
+
+  /** Run the transpiler over the verified JobModel.scala and emit the production
+    * core into a generated-sources directory. Registered in `generatedSources`
+    * below, so `./mill compile` regenerates automatically. Also a standalone
+    * task: `./mill transpile`. */
+  def transpile: T[PathRef] = Task {
+    val in  = verifiedModelSource().path
+    val dest = Task.dest / "io" / "linewise" / "jobfm" / "generated" / "JobModel.scala"
+    val label = "verify/src/main/scala/io/linewise/jobfm/verify/JobModel.scala"
+    os.makeDir.all(dest / os.up)
+    transpiler.runner().run(
+      args = Seq(in.toString, dest.toString, label),
+      mainClass = "io.linewise.jobfm.transpiler.Main"
+    )
+    Task.log.info(s"[transpile] generated $dest from $in")
+    PathRef(Task.dest)
+  }
+
+  /** Feed the generated core into the compile. `generatedSources` is part of
+    * `allSourceFiles`, so the production core is regenerated on every compile. */
+  def generatedSources: T[Seq[PathRef]] = Task {
+    super.generatedSources() :+ transpile()
+  }
+
+  /* The build-time transpiler tool. scalameta parses the verified Scala-3
+   * source and the Transformer applies the proven Stainless->Ox rewrite rules.
+   * Nested inside the root module; referenced as `transpiler` here and invoked
+   * externally as `./mill transpiler.<task>`. */
+  object transpiler extends ScalaModule {
+    def scalaVersion = "3.8.1"
+    def mvnDeps = Seq(
+      mvn"org.scalameta::scalameta:4.13.4"
+    )
+  }
+}

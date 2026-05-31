@@ -1,0 +1,7 @@
+/out/
+/.bsp/
+/.bloop/
+/.metals/
+/.scala-build/
+/.idea/
+verify/.stainless-cache/

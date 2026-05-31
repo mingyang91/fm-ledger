@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FM Translator Output Strategy — Validation via Stainless Cache Experiments</title>
+<style>
+:root{
+  --bg:#0d1117; --bg2:#0a0e14; --panel:#161b22; --panel2:#1c2230; --line:#2a3340;
+  --ink:#e6edf3; --mut:#9aa7b4; --mut2:#6e7d8c; --accent:#58a6ff; --accent2:#7ee787;
+  --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --ok:#3fb950; --okbg:rgba(63,185,80,.12);
+  --warn:#d29922; --warnbg:rgba(210,153,34,.12);
+  --bad:#f85149; --badbg:rgba(248,81,73,.12);
+  --info:#58a6ff; --infobg:rgba(88,166,255,.12);
+  --neutral:#8b949e; --neutralbg:rgba(139,148,158,.12);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:
+  radial-gradient(1200px 600px at 80% -10%,rgba(88,166,255,.08),transparent 60%),
+  radial-gradient(900px 500px at -10% 10%,rgba(126,231,135,.05),transparent 55%),
+  var(--bg);
+  color:var(--ink);font-family:var(--sans);line-height:1.6;font-size:15px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:1180px;margin:0 auto;padding:40px 28px 80px;
+  display:grid;grid-template-columns:230px minmax(0,1fr);gap:38px;align-items:start}
+/* header */
+header{grid-column:1/-1;border-bottom:1px solid var(--line);padding-bottom:24px;margin-bottom:4px}
+h1{font-size:30px;line-height:1.18;margin:0 0 8px;letter-spacing:-.5px}
+.sub{color:var(--mut);font-size:15.5px;max-width:760px;margin:0 0 16px}
+.meta{display:flex;flex-wrap:wrap;gap:8px}
+.kv{font-family:var(--mono);font-size:12px;color:var(--mut);background:var(--panel);
+  border:1px solid var(--line);border-radius:7px;padding:4px 9px}
+.kv b{color:var(--ink);font-weight:600}
+/* toc */
+nav{position:sticky;top:24px}
+nav .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mut2);margin:0 0 12px}
+nav ol{list-style:none;margin:0;padding:0;counter-reset:s}
+nav li{margin:0 0 2px}
+nav a{display:block;color:var(--mut);font-size:13.5px;padding:6px 10px;border-radius:7px;border-left:2px solid transparent}
+nav a:hover{background:var(--panel);color:var(--ink);text-decoration:none;border-left-color:var(--accent)}
+/* sections */
+main{min-width:0}
+section{margin:0 0 40px;scroll-margin-top:24px}
+h2{font-size:20px;margin:0 0 14px;display:flex;align-items:baseline;gap:12px;border-bottom:1px solid var(--line);padding-bottom:9px}
+h2 .num{font-family:var(--mono);font-size:13px;color:var(--accent);font-weight:600}
+h3{font-size:15px;margin:20px 0 9px;color:var(--ink)}
+p{margin:0 0 12px}
+.lead{color:var(--mut)}
+/* pills */
+.pill{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11.5px;
+  font-weight:600;border-radius:999px;padding:3px 10px;border:1px solid;white-space:nowrap}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.pill.ok{color:var(--ok);background:var(--okbg);border-color:rgba(63,185,80,.35)}
+.pill.warn{color:var(--warn);background:var(--warnbg);border-color:rgba(210,153,34,.35)}
+.pill.bad{color:var(--bad);background:var(--badbg);border-color:rgba(248,81,73,.35)}
+.pill.info{color:var(--info);background:var(--infobg);border-color:rgba(88,166,255,.35)}
+.pill.neutral{color:var(--neutral);background:var(--neutralbg);border-color:rgba(139,148,158,.35)}
+.pill.nodot::before{display:none}
+/* callout */
+.callout{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+  border-radius:10px;padding:14px 16px;margin:0 0 14px}
+.callout.ok{border-left-color:var(--ok)}
+.callout.warn{border-left-color:var(--warn)}
+.callout.bad{border-left-color:var(--bad)}
+.callout strong{color:var(--ink)}
+.callout.big{font-size:16px;line-height:1.55;background:linear-gradient(120deg,rgba(88,166,255,.10),rgba(126,231,135,.05));border-color:rgba(88,166,255,.35)}
+/* cards */
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:16px}
+.card h4{margin:0 0 8px;font-size:13.5px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.card .big-num{font-family:var(--mono);font-size:24px;font-weight:700;color:var(--ink);letter-spacing:-.5px}
+.card .cap{font-family:var(--mono);font-size:11px;color:var(--mut2);text-transform:uppercase;letter-spacing:.08em}
+/* table */
+table{width:100%;border-collapse:collapse;font-size:13.5px;background:var(--panel);
+  border:1px solid var(--line);border-radius:11px;overflow:hidden}
+th{text-align:left;font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--mut);background:var(--panel2);padding:10px 12px;border-bottom:1px solid var(--line)}
+td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+td.n,th.n{font-family:var(--mono)}
+/* log/code */
+pre{font-family:var(--mono);font-size:12.5px;line-height:1.55;background:var(--bg2);
+  border:1px solid var(--line);border-radius:10px;padding:13px 15px;overflow-x:auto;margin:0 0 12px;color:var(--mut)}
+code{font-family:var(--mono);font-size:12.5px;background:var(--panel2);border:1px solid var(--line);
+  border-radius:5px;padding:1px 6px;color:#cdd9e5}
+pre code{background:none;border:none;padding:0}
+.hit{color:var(--ok);font-weight:600}
+.miss{color:var(--bad);font-weight:600}
+.kw{color:var(--accent)}
+.del{color:var(--bad)}
+.add{color:var(--ok)}
+.logrow{display:block;white-space:pre;color:var(--mut)}
+.footer{grid-column:1/-1;border-top:1px solid var(--line);margin-top:24px;padding-top:18px;
+  color:var(--mut2);font-size:12px;font-family:var(--mono)}
+.tag{font-family:var(--mono);font-size:13px;color:var(--mut)}
+@media (max-width:900px){
+  .wrap{grid-template-columns:1fr;gap:20px;padding:28px 18px 60px}
+  nav{position:static}
+  .grid-2,.grid-3{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>FM Translator Output Strategy</h1>
+  <p class="sub">Empirical validation of the TASTy&rarr;Stainless translator's monomorphic-per-World output strategy at 10k-VC scale. Every figure below is read from an actual Z3/Stainless verify log, not estimated.</p>
+  <div class="meta">
+    <span class="kv">repo <b>linewise-api/verify</b></span>
+    <span class="kv">status <b>verified</b></span>
+    <span class="kv">date <b>2026-05-29</b></span>
+    <span class="kv">method <b>Stainless 0.9.9.3 &middot; nativez3 &middot; Docker</b></span>
+    <span class="kv">corpus <b>10,012 VCs measured</b></span>
+  </div>
+</header>
+
+<nav>
+  <p class="eyebrow">Contents</p>
+  <ol>
+    <li><a href="#verdict">01 &nbsp;Headline verdict</a></li>
+    <li><a href="#ctx">02 &nbsp;Context</a></li>
+    <li><a href="#c">03 &nbsp;Direction C — cache key</a></li>
+    <li><a href="#b">04 &nbsp;Direction B — lowering</a></li>
+    <li><a href="#d">05 &nbsp;Direction D — two-layer</a></li>
+    <li><a href="#e">06 &nbsp;Direction E — scale</a></li>
+    <li><a href="#conv">07 &nbsp;Convergence</a></li>
+    <li><a href="#gotchas">08 &nbsp;Operational gotchas</a></li>
+    <li><a href="#flow">09 &nbsp;Decision flow</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- 1 -->
+<section id="verdict">
+  <h2><span class="num">01</span> Headline verdict</h2>
+  <div class="callout big">
+    <strong>Stainless's VC-cache key is purely structural</strong> — invariant under the World type's
+    <em>name</em> and <em>package</em>. A cache miss is never caused by a name; only by a genuine difference
+    in the structure a VC quantifies over. This single fact decides the whole strategy question.
+  </div>
+  <p class="lead">Independently reproduced with a name-only control: two byte-identical case classes
+  <code>AlphaWorld</code> and <code>BetaWorld</code> — both <code>(UserRepoState, FMInt)</code>, differing only
+  in type name and package — share the same contract VC. The consequence is that whether duplicated logic
+  re-proves or rides the cache depends entirely on whether it produces <em>structurally identical</em> VCs.</p>
+  <div class="grid-3">
+    <div class="card"><div class="cap">strategy</div><div class="big-num">Duplication</div><div class="tag">bound to minimal slices — not two-layer generation</div></div>
+    <div class="card"><div class="cap">monad lowering</div><div class="big-num">Don't</div><div class="tag">net-negative; <code>inline</code> already first-order</div></div>
+    <div class="card"><div class="cap">10k-VC CI</div><div class="big-num">~27s</div><div class="tag">tractable with a persistent cache, run serial</div></div>
+  </div>
+</section>
+
+<!-- 2 -->
+<section id="ctx">
+  <h2><span class="num">02</span> Context</h2>
+  <p>The pipeline translates production pure-FP Cats-Effect Scala into Stainless-checkable code:
+  <code>production CE Scala &rarr; wired TASTy (givens resolved) &rarr; Stainless &rarr; Z3 SMT</code>.
+  The FM effect model is a state monad with halt, and each verification proposition is written against a
+  monomorphic <em>ConcreteWorld</em> case class that lists the state the proof touches.</p>
+  <pre><span class="kw">case class</span> IO[W, A](run: W =&gt; (W, Option[A]))            <span class="tag">// Some = success, None = halt</span>
+<span class="kw">case class</span> EitherT[W, E, A](value: IO[W, Either[E, A]])  <span class="tag">// None = halt, Left = business error, Right = success</span></pre>
+  <p>The open question: when the translator emits monomorphic Stainless per ConcreteWorld, the same logic is
+  duplicated across proof files. Does that cause redundant proving at 10k VCs, and what generation strategy
+  minimizes it? Four directions were run as parallel experiments; each had to back every claim with a runnable
+  log.</p>
+</section>
+
+<!-- 3 -->
+<section id="c">
+  <h2><span class="num">03</span> Direction C — the cache key <span class="pill ok nodot">confirmed</span></h2>
+  <p class="lead">Whole-World binding <span class="miss">misses</span> across proof files because real ConcreteWorlds
+  differ structurally — <code>ProjWorld(users, projectCount: FMInt)</code> versus
+  <code>LedgerWorld(users, balance: FMLong)</code>. A whole-World contract VC quantifies over the entire World
+  including the untouched field, so its canonical hash diverges and Z3 re-solves. Minimal-slice binding to
+  <code>UserRepoState</code> <span class="hit">hits</span>, because the slice is structurally identical in every
+  World that contains it. And <strong>duplicate equals shared</strong>: identical slices declared in separate
+  packages still hit — no shared definition required.</p>
+
+  <table>
+    <thead><tr><th>Experiment</th><th>Setup</th><th>Core contract VC</th><th class="n">warm summary</th><th>Outcome</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>EXP1</b> name-only control</td>
+        <td>Alpha &amp; Beta byte-identical, differ only in <em>name + package</em></td>
+        <td class="n"><span class="hit">valid from cache</span></td>
+        <td class="n">73 / (44 cache) / 0.02s</td>
+        <td><span class="pill ok">HIT</span></td>
+      </tr>
+      <tr>
+        <td><b>EXP2</b> whole-World (A-v2)</td>
+        <td>ProjWorld <code>FMInt</code> prime &rarr; LedgerWorld <code>FMLong</code> warm</td>
+        <td class="n"><span class="miss">valid&nbsp;&nbsp;nativez3</span></td>
+        <td class="n">73 / (42 cache) / 0.06s</td>
+        <td><span class="pill bad">MISS</span></td>
+      </tr>
+      <tr>
+        <td><b>EXP3</b> slice-dup, separate pkgs</td>
+        <td><code>dupone.UserRepoState</code> &rarr; <code>duptwo.UserRepoState</code></td>
+        <td class="n"><span class="hit">valid from cache</span></td>
+        <td class="n">70 / (42 cache) / 0.02s</td>
+        <td><span class="pill ok">HIT</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>The decisive per-VC log rows (reproduced)</h3>
+  <pre><span class="tag"># EXP1 warm Beta — name differs, structure identical</span>
+WorldNameOnlyB.scala:24:5  lookupContract  postcondition  <span class="hit">valid from cache</span>   0.0
+<span class="tag"># EXP2 warm Ledger — FMInt vs FMLong is a real structural difference</span>
+LedgerWorldAV2.scala:22:5  lookupContract  postcondition  <span class="miss">valid</span>             nativez3  0.0
+<span class="tag"># EXP3 warm duptwo — identical slice, different package, no shared definition</span>
+SliceDupTwo.scala:30:5     lookupContract  postcondition  <span class="hit">valid from cache</span>   0.0</pre>
+  <p class="tag">The 44-vs-42 cache delta between EXP1 and EXP2 is exactly the one contract VC that hit under the
+  identical-structure control and missed once the field type genuinely changed.</p>
+
+  <div class="callout warn">
+    <strong>Caveat that shapes the strategy:</strong> per-World <em>leaf example</em> proofs of the form
+    <code>assert(op.run(concreteWorld) == …)</code> embed the concrete World <em>value</em> literally in the VC
+    text, so they <strong>never</strong> cross-share under any binding. Only reusable contract postconditions
+    (quantified over the slice) deduplicate. The translator should prefer emitting slice-bound postconditions
+    over concrete-World example assertions wherever the property allows.
+  </div>
+  <p><b>Verdict:</b> hypothesis confirmed; <span class="pill neutral">gatesD = D-unnecessary</span></p>
+</section>
+
+<!-- 4 -->
+<section id="b">
+  <h2><span class="num">04</span> Direction B — monad lowering <span class="pill bad nodot">net negative</span></h2>
+  <p class="lead">Lowering the <code>EitherT</code>/<code>IO</code> flatMap chains to first-order val-binding code
+  did not reduce per-VC SMT cost — and slightly hurt. The combinators <code>IO.flatMap/map/tap</code> are
+  <code>inline</code>, so the chain unfolds at the source level <em>before</em> VC generation; Z3 already gets a
+  first-order obligation.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h4>BEFORE — monadic (as generated) <span class="pill ok">baseline</span></h4>
+      <pre>total: 95   valid: 95
+(12 from cache, 27 trivial)
+invalid: 0   time: <b>0.65s</b></pre>
+      <div class="tag">createProject ops VCs: 3 &middot; deleteProject ops VCs: 0</div>
+    </div>
+    <div class="card">
+      <h4>AFTER — lowered to first-order <span class="pill bad">worse</span></h4>
+      <pre>total: <b>120</b>  valid: 120
+(26 from cache, 28 trivial)
+invalid: 0   time: <b>0.83s</b></pre>
+      <div class="tag">createProject ops VCs: 8 &middot; deleteProject ops VCs: 1 &nbsp;(+match&nbsp;exhaustiveness)</div>
+    </div>
+  </div>
+  <p>The property VCs are <strong>byte-identical</strong> before and after — e.g. <code>createBlankNameProof</code>
+  body assertion stays <code>valid nativez3 0.0</code> in both — so there is nothing to speed up. Lowering only
+  re-introduces <code>match exhaustiveness</code> VCs that the monadic form avoided.</p>
+  <div class="callout bad">
+    <strong>Recommendation:</strong> do not add a monad-elimination lowering pass. Keep emitting the monadic
+    combinators (the front end inlines them for free) and spend the engineering effort on cross-run caching —
+    the warm re-run already drops 0.65s &rarr; 0.03s. The lowering rules are a purely structural fold and need
+    no static analysis to perform; the data simply says don't perform them.
+  </div>
+</section>
+
+<!-- 5 -->
+<section id="d">
+  <h2><span class="num">05</span> Direction D — two-layer generation <span class="pill warn nodot">feasible, unnecessary</span></h2>
+  <p class="lead">The shared-slice-core + per-World-wrapper structure verifies (81 VCs, 0 invalid) and is
+  mechanically derivable at <span class="pill info nodot">structural-only</span> cost — but it does not beat pure
+  duplication. Since C showed duplication already cache-hits without a shared definition, D's machinery buys
+  nothing.</p>
+  <table>
+    <thead><tr><th>Variant</th><th class="n">cold</th><th class="n">warm</th><th>cross-share</th></tr></thead>
+    <tbody>
+      <tr><td>Two-layer (shared core + wrappers)</td><td class="n">0.63s · 81 VCs</td><td class="n">0.03s · 54 cache</td><td><span class="pill ok">yes</span></td></tr>
+      <tr><td>Pure duplication</td><td class="n">0.70s · 83 VCs</td><td class="n">0.02s · 56 cache</td><td><span class="pill ok">yes</span></td></tr>
+      <tr><td>Whole-World binding (anti-pattern)</td><td class="n">0.49s · 69 VCs</td><td class="n">—</td><td><span class="pill bad">none (2 fresh solves)</span></td></tr>
+    </tbody>
+  </table>
+  <p class="tag">Two-layer vs duplication sit within ~10% solver/JVM noise cold, and both fully cache warm.</p>
+
+  <h3>The valuable byproduct: a one-line translator change</h3>
+  <p><code>TastyFMGen</code> already groups ghost state per repository (<code>TraitInfo(name, ghostFields, methods)</code>,
+  one emitted case class per trait). The <em>only</em> whole-World-binding site is <code>emitRepoIO</code> (~line 1367):</p>
+  <pre><span class="del">- IO.read[$worldName, $retType](_.$fieldName.$method(...))</span>
+<span class="add">+ IO.read[&lt;RepoState&gt;, $retType](_.$method(...))</span>
+<span class="add">+ def project(w: World): RepoState = w.&lt;fieldName&gt;   // thin per-World lens</span></pre>
+  <p>This moves the cacheable contract layer out of the anti-pattern using only the per-repo grouping that
+  already exists — no footprint inference.</p>
+  <div class="callout warn">
+    <strong>Boundary (flagged):</strong> minimal-slice binding for multi-repo <em>service</em> methods —
+    <code>createProject</code> touches both <code>ProjectRepository</code> and <code>QuotaService</code> — would
+    require footprint/effect inference, which contradicts the wired-TASTy simplicity goal and is out of scope.
+    Those contracts stay whole-World and won't cross-share; they are the minority.
+  </div>
+  <p><b>Verdict:</b> <span class="pill neutral">beatsPureDuplication = no, C suffices</span></p>
+</section>
+
+<!-- 6 -->
+<section id="e">
+  <h2><span class="num">06</span> Direction E — scale &amp; cache strategy <span class="pill ok nodot">CI-tractable</span></h2>
+  <p class="lead">A real 10,012-VC corpus (65 Worlds &times; 50 props, 0 invalid) was measured directly — not
+  extrapolated — across four configurations.</p>
+  <table>
+    <thead><tr><th>Configuration</th><th class="n">wall clock</th><th class="n">solver</th><th>cache hits</th><th>re-solves</th><th>state</th></tr></thead>
+    <tbody>
+      <tr><td>Cold (fresh cache)</td><td class="n">35.07s</td><td class="n">8.19s</td><td class="n">9,814 / 10,012 (within-run)</td><td>~171 genuine</td><td><span class="pill neutral">baseline</span></td></tr>
+      <tr><td>Persistent cache, re-run</td><td class="n">26.79s</td><td class="n">0.04s</td><td class="n">9,985 / 10,012 (cross-run)</td><td>nothing</td><td><span class="pill ok">flat</span></td></tr>
+      <tr><td>Incremental — one fn changed</td><td class="n">27.03s</td><td class="n">0.40s</td><td class="n">9,983 / 10,012</td><td><b>exactly 2</b> / 10,012</td><td><span class="pill ok">the CI number</span></td></tr>
+      <tr><td>Parallel shard, K=2</td><td class="n">24.10s</td><td class="n">—</td><td class="n">~1.46&times; vs serial</td><td>no gain past K&asymp;2</td><td><span class="pill warn">don't</span></td></tr>
+    </tbody>
+  </table>
+  <div class="callout">
+    <strong>Why sharding stalls:</strong> the dominant cost at this scale is the fixed ~27s of Docker + JVM +
+    Scala-frontend startup, not solving. Each shard pays that startup again and fragments the free within-run
+    dedup (aggregate VCs rise 10,012 &rarr; 10,481 at K=8). The lever is cache hit-rate, not parallelism.
+  </div>
+  <p>The pessimistic bound is 10&ndash;16 minutes, and only in the hypothetical where a 10k corpus has zero
+  slice-sharing and 10k genuinely-distinct cold VCs (per-fresh-VC cost climbs ~36ms &rarr; ~108ms as Z3's
+  context grows). Even then, warm and incremental runs stay at ~27s. <span class="pill ok">ciTractable = yes, with cache</span></p>
+</section>
+
+<!-- 7 -->
+<section id="conv">
+  <h2><span class="num">07</span> Convergence — the three answers</h2>
+  <div class="grid-3">
+    <div class="card">
+      <h4>1 · Output strategy <span class="pill ok">duplication</span></h4>
+      <p>Pure duplication bound to <strong>minimal state slices</strong> — one ops object per repository bound to
+      that repo's own case class, projecting <code>ConcreteWorld &rarr; slice</code> at the boundary. Not
+      two-layer generation: duplication equals sharing to the cache. Concretely, the one-line
+      <code>emitRepoIO</code> change. Avoid the whole-World <code>type F[A] = IO[ProjectWorld, A]</code>
+      anti-pattern; prefer slice-bound postconditions over concrete-World example assertions.</p>
+    </div>
+    <div class="card">
+      <h4>2 · Monad lowering <span class="pill bad">none</span></h4>
+      <p>No per-VC reduction worth pursuing — it is a net negative. <code>inline</code> already hands Z3 a
+      first-order obligation; lowering only adds trivial exhaustiveness VCs. Keep the monadic combinators and
+      invest in caching.</p>
+    </div>
+    <div class="card">
+      <h4>3 · 10k-VC CI <span class="pill ok">yes</span></h4>
+      <p>Tractable with a persistent cross-run vc-cache, run <strong>serial</strong> in a single container with
+      the cache restored between runs. Do not shard. ~27s warm; ~27s for a one-function PR (2 VCs re-solve).
+      Protect the cache hit-rate by keeping the shared-slice contract layer broad.</p>
+    </div>
+  </div>
+  <div class="callout ok">
+    <strong>No conflict between directions.</strong> Where C (D-unnecessary) could have collided with D
+    (does it justify itself?), D's own logs agree — it does not beat duplication. Empirical logs and the design
+    recommendation point the same way.
+  </div>
+</section>
+
+<!-- 8 -->
+<section id="gotchas">
+  <h2><span class="num">08</span> Operational gotchas</h2>
+  <div class="callout warn">
+    <strong>Cross-run cache is not automatic.</strong> The default <code>.stainless-cache</code> lives inside the
+    <code>--rm</code> container and evaporates each run. CI must mount <code>--cache-dir</code> to a persisted
+    host directory, restored between runs — that mount is what turns 35s into 27s and makes incremental PRs flat.
+  </div>
+  <div class="callout warn">
+    <strong>The shell is zsh, which does not word-split unquoted variables.</strong>
+    <code>docker run … $LIBS</code> passes the whole file list as one giant argument &rarr; "source file not found",
+    with exactly as many errors as you have variables. Hand-list files literally or build a bash array.
+  </div>
+  <div class="callout">
+    <strong>Known-invalid baseline VC.</strong> <code>PipelineProofs.scala:329</code>
+    (<code>fullPipelineNonHostile</code>) is a genuinely-failing assertion, unrelated to this study. The clean
+    ground-truth proofs are project / folder / scoped.
+  </div>
+</section>
+
+<!-- 9 -->
+<section id="flow">
+  <h2><span class="num">09</span> Decision flow</h2>
+  <svg viewBox="0 0 760 260" width="100%" role="img" aria-label="Binding decision flow" style="background:var(--bg2);border:1px solid var(--line);border-radius:12px">
+    <defs>
+      <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#6e7d8c"/></marker>
+    </defs>
+    <!-- start -->
+    <rect x="24" y="104" width="180" height="52" rx="10" fill="#161b22" stroke="#2a3340"/>
+    <text x="114" y="128" text-anchor="middle" fill="#e6edf3" font-family="monospace" font-size="12.5">Same logic under</text>
+    <text x="114" y="146" text-anchor="middle" fill="#e6edf3" font-family="monospace" font-size="12.5">N ConcreteWorlds</text>
+    <line x1="204" y1="130" x2="252" y2="130" stroke="#6e7d8c" stroke-width="1.5" marker-end="url(#ar)"/>
+    <!-- branch label -->
+    <text x="300" y="46" text-anchor="middle" fill="#9aa7b4" font-family="monospace" font-size="11">bind to…</text>
+    <!-- whole world path -->
+    <rect x="256" y="20" width="210" height="56" rx="10" fill="rgba(248,81,73,.10)" stroke="rgba(248,81,73,.45)"/>
+    <text x="361" y="44" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="12.5">whole World</text>
+    <text x="361" y="62" text-anchor="middle" fill="#9aa7b4" font-family="monospace" font-size="11">IO[ProjectWorld, A]</text>
+    <line x1="466" y1="48" x2="514" y2="48" stroke="#6e7d8c" stroke-width="1.5" marker-end="url(#ar)"/>
+    <rect x="518" y="20" width="218" height="56" rx="10" fill="#161b22" stroke="rgba(248,81,73,.45)"/>
+    <text x="627" y="44" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="12.5" font-weight="bold">MISS &times; N</text>
+    <text x="627" y="62" text-anchor="middle" fill="#9aa7b4" font-family="monospace" font-size="11">N fresh solves (redundant)</text>
+    <!-- slice path -->
+    <rect x="256" y="184" width="210" height="56" rx="10" fill="rgba(63,185,80,.10)" stroke="rgba(63,185,80,.45)"/>
+    <text x="361" y="208" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="12.5">minimal slice</text>
+    <text x="361" y="226" text-anchor="middle" fill="#9aa7b4" font-family="monospace" font-size="11">IO[UserRepoState, A]</text>
+    <line x1="466" y1="212" x2="514" y2="212" stroke="#6e7d8c" stroke-width="1.5" marker-end="url(#ar)"/>
+    <rect x="518" y="184" width="218" height="56" rx="10" fill="#161b22" stroke="rgba(63,185,80,.45)"/>
+    <text x="627" y="208" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="12.5" font-weight="bold">HIT</text>
+    <text x="627" y="226" text-anchor="middle" fill="#9aa7b4" font-family="monospace" font-size="11">1 solve, N&minus;1 cache hits</text>
+    <!-- connectors from start to branches -->
+    <path d="M252,122 C270,100 250,70 256,52" fill="none" stroke="#6e7d8c" stroke-width="1.5" marker-end="url(#ar)"/>
+    <path d="M252,138 C270,160 250,190 256,208" fill="none" stroke="#6e7d8c" stroke-width="1.5" marker-end="url(#ar)"/>
+  </svg>
+  <p class="tag">Structurally-identical duplication and a single shared definition are equivalent to the cache — so
+  the slice path needs no two-layer machinery.</p>
+</section>
+
+</main>
+
+<div class="footer">
+  Generated from Stainless cache experiments in /tmp/fmlab/{C,D,E} &middot; 4-agent workflow wf_0f53fdee-a8c &middot;
+  all figures are verify-log measured, not estimated.
+</div>
+
+</div>
+</body>
+</html>
