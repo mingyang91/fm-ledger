@@ -4,8 +4,7 @@ import stainless.lang._
 import stainless.collection._
 import io.linewise.verify.effect.{FMInt, FMLong}
 import JobModel._
-import JobStore._
-import WorkerFlow._
+import StoreCore._
 
 /* =============================================================================
  * REQUIREMENT-EVOLUTION CONFLICTS — the deliberately-INVALID VCs.
@@ -19,8 +18,7 @@ import WorkerFlow._
  *   ./mill verify.scala \
  *     verify/stainless-lib/FMTypes.scala \
  *     verify/src/main/scala/io/linewise/jobfm/verify/JobModel.scala \
- *     verify/src/main/scala/io/linewise/jobfm/verify/JobStore.scala \
- *     verify/src/main/scala/io/linewise/jobfm/verify/WorkerFlow.scala \
+ *     verify/src/main/scala/io/linewise/jobfm/verify/StoreCore.scala \
  *     verify/src/main/scala/io/linewise/jobfm/verify/EvolutionConflict.scala
  *
  * TWO conflicts are surfaced:

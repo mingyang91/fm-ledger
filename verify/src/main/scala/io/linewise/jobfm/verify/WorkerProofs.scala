@@ -5,8 +5,8 @@ import stainless.annotation._
 import stainless.collection._
 import io.linewise.verify.effect.{FMInt, FMLong}
 import JobModel._
-import JobStore._
-import WorkerFlow._
+import StoreCore._
+import StoreProofs._
 
 /* =============================================================================
  * THE OPERATIONAL REQUIREMENT LIBRARY — R1..R5, each a NAMED BUSINESS
@@ -42,21 +42,25 @@ object WorkerProofs {
 
   def r1_claimPreservesInv(s: JobStore, id: FMLong, w: FMLong, stale: Boolean): Boolean = {
     require(storeInv(s))
+    claimOnePreservesInv(s, id, w, stale)
     storeInv(claimOne(s, id, w, stale))
   }.holds
 
   def r1_applyOutcomePreservesInv(s: JobStore, id: FMLong, o: Event): Boolean = {
     require(storeInv(s))
+    applyOutcomePreservesInv(s, id, o)
     storeInv(applyOutcome(s, id, o))
   }.holds
 
   def r1_handoffPreservesInv(s: JobStore, ev: Event2): Boolean = {
     require(storeInv(s))
+    handoffPreservesInv(s, ev)
     storeInv(handoff(s, ev))
   }.holds
 
   def r1_sweepPreservesInv(s: JobStore, dag: Dag): Boolean = {
     require(storeInv(s))
+    sweepPreservesInv(s, dag)
     storeInv(sweep(s, dag))
   }.holds
 
@@ -76,33 +80,22 @@ object WorkerProofs {
     val f = handoffRow(ev)
     handoffKeepsIds(s.rows, ev)
     mapKeepsIds(s.rows, f)
-    ids(handoff0(s, ev).rows) == ids(s.rows)
+    ids(handoff(s, ev).rows) == ids(s.rows)
   }.holds
 
   def frame_sweepKeepsIdList(s: JobStore, dag: Dag): Boolean = {
     val f = sweepRow(dag)
     sweepKeepsIds(s.rows, dag)
     mapKeepsIds(s.rows, f)
-    ids(sweep0(s, dag).rows) == ids(s.rows)
+    ids(sweep(s, dag).rows) == ids(s.rows)
   }.holds
 
   def frame_claimKeepsIdList(s: JobStore, id: FMLong, w: FMLong, stale: Boolean): Boolean = {
     val f = claimRow(id, w, stale)
     claimKeepsIds(s.rows, id, w, stale)
     mapKeepsIds(s.rows, f)
-    ids(claim0(s, id, w, stale).rows) == ids(s.rows)
+    ids(claimOne(s, id, w, stale).rows) == ids(s.rows)
   }.holds
-
-  /* Precondition-free op aliases used by the frame lemmas above: the frame is a
-   * fact about the `map` SHAPE and holds for ANY store, so we expose the raw
-   * `map` without the storeInv require (the ops claimOne/handoff/sweep carry the
-   * require for the R1 postcondition; the frame does not need it). */
-  def handoff0(s: JobStore, ev: Event2): JobStore =
-    JobStore(s.rows.map(handoffRow(ev)))
-  def sweep0(s: JobStore, dag: Dag): JobStore =
-    JobStore(s.rows.map(sweepRow(dag)))
-  def claim0(s: JobStore, id: FMLong, w: FMLong, stale: Boolean): JobStore =
-    JobStore(s.rows.map(claimRow(id, w, stale)))
 
   /* =====================================================================
    * R2 — HANDOFF-FRAME.

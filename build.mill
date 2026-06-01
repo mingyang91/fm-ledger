@@ -37,25 +37,45 @@ object `package` extends SbtModule {
     mvn"org.typelevel::cats-effect:3.6.3"
   )
 
-  // The verified source of truth that the production core is generated FROM.
-  def verifiedModelSource: T[PathRef] = Task.Source(
-    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "JobModel.scala"
+  // The verified sources of truth that the production code is generated FROM.
+  // The transpiler input files are the PROOF-FREE executable cores; the
+  // lemmas/@law/.holds live in sibling verify-only files that are NEVER
+  // transpiled (StoreProofs/StoreLaw/WorkerProofs/SeqMirrorProofs).
+  def verifiedSources: T[Seq[PathRef]] = Task.Sources(
+    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "JobModel.scala",
+    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "StoreCore.scala",
+    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "SeqMirror.scala"
   )
 
-  /** Run the transpiler over the verified JobModel.scala and emit the production
-    * core into a generated-sources directory. Registered in `generatedSources`
-    * below, so `./mill compile` regenerates automatically. Also a standalone
-    * task: `./mill transpile`. */
+  /** Run the transpiler over each verified executable core and emit the
+    * production code into a generated-sources directory. Registered in
+    * `generatedSources` below, so `./mill compile` regenerates automatically.
+    * Also a standalone task: `./mill transpile`. A leak-guard fails the build if
+    * any proof-only token (Nil()/Cons()/.holds) ever reaches generated output. */
   def transpile: T[PathRef] = Task {
-    val in  = verifiedModelSource().path
-    val dest = Task.dest / "io" / "linewise" / "jobfm" / "generated" / "JobModel.scala"
-    val label = "verify/src/main/scala/io/linewise/jobfm/verify/JobModel.scala"
-    os.makeDir.all(dest / os.up)
-    transpiler.runner().run(
-      args = Seq(in.toString, dest.toString, label),
-      mainClass = "io.linewise.jobfm.transpiler.Main"
-    )
-    Task.log.info(s"[transpile] generated $dest from $in")
+    val genDir = Task.dest / "io" / "linewise" / "jobfm" / "generated"
+    os.makeDir.all(genDir)
+    for (src <- verifiedSources()) {
+      val in    = src.path
+      val dest  = genDir / in.last
+      val label = s"verify/src/main/scala/io/linewise/jobfm/verify/${in.last}"
+      transpiler.runner().run(
+        args = Seq(in.toString, dest.toString, label),
+        mainClass = "io.linewise.jobfm.transpiler.Main"
+      )
+      val leaked = os.read.lines(dest).zipWithIndex.collect {
+        case (l, i)
+            if {
+              val t = l.trim
+              val isComment = t.startsWith("*") || t.startsWith("//") || t.startsWith("/*")
+              !isComment && (t.contains("Nil(") || t.contains("Cons(") || t.contains(".holds"))
+            } =>
+          s"  ${i + 1}: ${l.trim}"
+      }
+      if (leaked.nonEmpty)
+        sys.error(s"[transpile] proof scaffolding leaked into $dest:\n${leaked.mkString("\n")}")
+      Task.log.info(s"[transpile] generated $dest from $in")
+    }
     PathRef(Task.dest)
   }
 
@@ -63,6 +83,15 @@ object `package` extends SbtModule {
     * `allSourceFiles`, so the production core is regenerated on every compile. */
   def generatedSources: T[Seq[PathRef]] = Task {
     super.generatedSources() :+ transpile()
+  }
+
+  /** Differential test module: drives the verified-GENERATED ListStore and the
+    * TRUSTED doobie JdbcStore over the same scenarios and asserts they agree
+    * row-for-row — the machine-checked drift gate. Inherits the parent's deps
+    * (ox/doobie/h2/cats + the generated sources) and adds munit. `./mill test`. */
+  object test extends SbtTests with TestModule.Munit {
+    def scalacOptions = Seq("-release", "21")
+    def mvnDeps = Seq(mvn"org.scalameta::munit:1.0.0")
   }
 
   /* The build-time transpiler tool. scalameta parses the verified Scala-3
