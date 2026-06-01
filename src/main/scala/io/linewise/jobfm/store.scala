@@ -19,7 +19,11 @@ import io.linewise.jobfm.generated.JobModel.*
  * runtime behaviour differs is noted inline.
  * ========================================================================== */
 
-object Db:
+/* PACKAGE-PRIVATE: the doobie ConnectionIO building blocks (the "Queries" layer,
+ * in linewise-api's idiom). ConnectionIO never escapes the package — JdbcStore
+ * (Stores.scala) composes these and evaluates them at a single boundary, so the
+ * shell (worker.scala / main.scala) only ever sees bare values. */
+private[jobfm] object Db:
 
   // ---------------------------------------------------------------------------
   // CODECS: JobState's algebraic fields <-> varchar columns. These are doobie

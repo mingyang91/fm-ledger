@@ -37,10 +37,10 @@ class DifferentialSpec extends munit.FunSuite:
       url = s"jdbc:h2:mem:diff_${java.util.UUID.randomUUID};DB_CLOSE_DELAY=-1",
       user = "sa", password = "", logHandler = None
     )
-    Db.ddlJob.transact(xa).unsafeRunSync()
-    Db.ddlJobQueue.transact(xa).unsafeRunSync()
-    seed.foreach(r => Db.seed(r.id, r.st, 1_000_000L).transact(xa).unsafeRunSync())
-    JdbcStore(xa)
+    val store = JdbcStore(xa)
+    store.initSchema()
+    seed.foreach(r => store.seed(r.id, r.st, 1_000_000L))
+    store
 
   def runOps(s0: Store, ops: List[Store => Store]): Store =
     ops.foldLeft(s0)((s, op) => op(s))
