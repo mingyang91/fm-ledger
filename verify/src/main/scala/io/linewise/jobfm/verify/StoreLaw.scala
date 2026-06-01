@@ -43,6 +43,10 @@ object StoreLaw {
     def handoff(ev: Event2): AbstractStore
     def sweep(dag: Dag): AbstractStore
 
+    // a point read (no @law — its result only selects the worker's branch; the
+    // storeInv proof comes from the op laws regardless of what findById returns).
+    def findById(id: FMLong): Option[JobState]
+
     /* THE CONTRACT — invariant-preservation, one law per op, over `view`. Every
      * concrete store MUST satisfy these; Stainless generates a discharge VC per
      * subclass. (The doobie store's discharge is the trusted/differential-tested
@@ -65,6 +69,9 @@ object StoreLaw {
    * storeInv guard, .ensuring the per-op implication). */
   case class ListStoreModel(items: List[JobRow]) extends AbstractStore {
     def view: List[JobRow] = items
+
+    def findById(id: FMLong): Option[JobState] =
+      items.find((r: JobRow) => r.id == id).map((r: JobRow) => r.st)
 
     def claimOne(id: FMLong, worker: FMLong, stale: Boolean): AbstractStore = {
       val f = claimRow(id, worker, stale)

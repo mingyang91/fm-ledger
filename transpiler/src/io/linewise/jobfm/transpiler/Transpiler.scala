@@ -104,10 +104,12 @@ object Transpiler {
     var s = input
     s = ruleR1_dropStainlessImports(s)
     s = ruleR1b_dropFmTypeImports(s)
+    s = ruleR1c_dropProofImports(s)
     s = ruleR2_rewritePackage(s)
     s = ruleR7_stripAnnotations(s)   // before R5/R6 so annotated defs are clean
     s = ruleR8_dropHoldsProofs(s)
     s = ruleR5_dropRequire(s)
+    s = ruleR5b_dropAssert(s)
     s = ruleR6_dropEnsuring(s)
     s = ruleR3_eraseFmTypes(s)
     s = ruleR4_dropOptionTypeArgs(s)
@@ -127,6 +129,16 @@ object Transpiler {
   def ruleR1b_dropFmTypeImports(s: String): String =
     s.linesIterator
       .filterNot(l => l.trim.matches("""import\s+io\.linewise\.verify\.effect\..*"""))
+      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
+
+  // --- R1c: drop imports of verify-only PROOF objects ----------------------
+  // `import StoreProofs.storeInv` (and any `*Proofs` object) is verify-only: the
+  // proofs live in files that are NEVER transpiled, so the generated code must
+  // not import them. The store CONTRACT the worker is verified against
+  // (StoreLaw.AbstractStore) is kept — production provides generated.StoreLaw.
+  def ruleR1c_dropProofImports(s: String): String =
+    s.linesIterator
+      .filterNot(l => l.trim.matches("""import\s+\w*Proofs\..*"""))
       .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
 
   // --- R2: rewrite the package declaration ---------------------------------
@@ -233,6 +245,15 @@ object Transpiler {
   def ruleR5_dropRequire(s: String): String =
     s.linesIterator
       .filterNot(l => l.trim.matches("""require\(.*\)\s*"""))
+      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
+
+  // --- R5b: drop `assert(...)` proof hints ---------------------------------
+  // The worker invokes @law contracts as `assert(s.claimLaw(...))` hints so
+  // Stainless chains them; these reference verify-only @law methods and are pure
+  // proof scaffolding. Drop any line that is a bare `assert(...)` call.
+  def ruleR5b_dropAssert(s: String): String =
+    s.linesIterator
+      .filterNot(l => l.trim.matches("""assert\(.*\)\s*"""))
       .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
 
   // --- R6: drop a trailing `.ensuring(...)` postcondition ------------------

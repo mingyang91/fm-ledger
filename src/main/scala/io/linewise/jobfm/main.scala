@@ -6,7 +6,6 @@ import cats.effect.IO
 import java.util.concurrent.atomic.AtomicLong
 import io.linewise.jobfm.generated.JobModel.*
 import io.linewise.jobfm.generated.WorkerCore
-import io.linewise.jobfm.generated.WorkerModel.World
 
 /* =============================================================================
  * DRIVER — seed 5 rows, drive the persisted pipeline through the VERIFIED
@@ -89,12 +88,11 @@ object Main:
 
     supervised:
       // the GENERATED worker logic (generated.WorkerCore.runOne) runs against the
-      // doobie-backed production World; the heartbeat daemon is forked inside
-      // World.claim on this ambient Ox scope.
-      val world = World(xa)
+      // doobie JdbcStore directly — JdbcStore implements the SAME AbstractStore
+      // the worker is verified against. No separate World.
       // === TRANSCODE (id1): claim -> sidecar -> OutDone -> DONE ===
       line("STEP 1  run Transcode (id1)  [worker 11]")
-      WorkerCore.runOne(world, 1L, 11L, sidecarEvent(11L))
+      WorkerCore.runOne(store, 1L, 11L, sidecarEvent(11L))
       dump("after transcode DONE")
 
       // === HANDOFF: Transcode DONE produces VideoMetaDuration -> unblock id2 ===
@@ -109,7 +107,7 @@ object Main:
 
       // === EMBEDDING (id2): now PENDING, claim -> OutDone -> DONE ===
       line("STEP 2  run Embedding (id2)  [worker 12]")
-      WorkerCore.runOne(world, 2L, 12L, sidecarEvent(12L))
+      WorkerCore.runOne(store, 2L, 12L, sidecarEvent(12L))
       val ev2 = producedEventOf(fullDag, Embedding).get
       line(s"HANDOFF embedding DONE produces $ev2 -> unblock Masking (id3)")
       val un2 = store.handoffEvent(ev2)
@@ -119,19 +117,19 @@ object Main:
 
       // === MASKING (id3): now PENDING, claim -> OutDone -> DONE ===
       line("STEP 3  run Masking (id3)  [worker 13]")
-      WorkerCore.runOne(world, 3L, 13L, sidecarEvent(13L))
+      WorkerCore.runOne(store, 3L, 13L, sidecarEvent(13L))
       dump("after masking DONE")
       rule()
 
       // === IMPORT (id5) -> RAGINDEX (id4) ===
       line("STEP 4  run Import (id5)  [worker 15]")
-      WorkerCore.runOne(world, 5L, 15L, sidecarEvent(15L))
+      WorkerCore.runOne(store, 5L, 15L, sidecarEvent(15L))
       val ev3 = producedEventOf(fullDag, Import).get
       line(s"HANDOFF import DONE produces $ev3 -> unblock RagIndex (id4)")
       val un3 = store.handoffEvent(ev3)
       un3.foreach((rid, st) => line(f"  UNBLOCK row=$rid%-2d -> ${st.status}"))
       line("STEP 5  run RagIndex (id4)  [worker 14]")
-      WorkerCore.runOne(world, 4L, 14L, sidecarEvent(14L))
+      WorkerCore.runOne(store, 4L, 14L, sidecarEvent(14L))
       dump("after import + ragindex DONE")
       dumpQueue("final (shadow mirrors authoritative job)")
       rule()
@@ -154,7 +152,7 @@ object Main:
 
     line(s"  claim() returned a winning post-state for workers: ${winners.mkString(", ")}")
     // confirm by READING the DB: exactly one owner, status RUNNING.
-    val raceRow = store.loadById(6L).get
+    val raceRow = store.findById(6L).get
     line(f"  DB row id6 after race: status=${raceRow.status} owner=${raceRow.owner.map(_.toString).getOrElse("-")}")
     line(s"  RACE RESULT: ${if winners.size == 1 && raceRow.status == RUNNING then "EXACTLY ONE WINNER (correct)" else "MULTIPLE/zero winners (WRONG)"}")
     rule()
