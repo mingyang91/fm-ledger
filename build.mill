@@ -44,7 +44,8 @@ object `package` extends SbtModule {
   def verifiedSources: T[Seq[PathRef]] = Task.Sources(
     moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "JobModel.scala",
     moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "StoreCore.scala",
-    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "SeqMirror.scala"
+    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "SeqMirror.scala",
+    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "WorkerCore.scala"
   )
 
   /** Run the transpiler over each verified executable core and emit the

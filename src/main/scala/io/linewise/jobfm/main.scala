@@ -5,6 +5,8 @@ import doobie.*
 import cats.effect.IO
 import java.util.concurrent.atomic.AtomicLong
 import io.linewise.jobfm.generated.JobModel.*
+import io.linewise.jobfm.generated.WorkerCore
+import io.linewise.jobfm.generated.WorkerModel.World
 
 /* =============================================================================
  * DRIVER — seed 5 rows, drive the persisted pipeline through the VERIFIED
@@ -56,6 +58,9 @@ object Main:
     // honest sidecar: every kind succeeds here (Right). Reasons are exercised by
     // the core's own tests; the DB demo focuses on persistence + handoff + race.
     val sidecar: Kind => Either[Reason, Output] = _ => Right(Output("ok"))
+    // adapter feeding the GENERATED worker its sidecar capability (Kind => Event).
+    def sidecarEvent(worker: Long): Kind => Event =
+      (k: Kind) => Worker.outcomeToEvent(worker, k, sidecar(k))
 
     line("=" * 78)
     line("PERSISTED JOB SYSTEM  (real doobie + embedded H2; verified step() unchanged)")
@@ -83,9 +88,13 @@ object Main:
     rule()
 
     supervised:
+      // the GENERATED worker logic (generated.WorkerCore.runOne) runs against the
+      // doobie-backed production World; the heartbeat daemon is forked inside
+      // World.claim on this ambient Ox scope.
+      val world = World(xa)
       // === TRANSCODE (id1): claim -> sidecar -> OutDone -> DONE ===
       line("STEP 1  run Transcode (id1)  [worker 11]")
-      Worker.runOne(store, 1L, 11L, lease, now, sidecar, log = line)
+      WorkerCore.runOne(world, 1L, 11L, sidecarEvent(11L))
       dump("after transcode DONE")
 
       // === HANDOFF: Transcode DONE produces VideoMetaDuration -> unblock id2 ===
@@ -100,7 +109,7 @@ object Main:
 
       // === EMBEDDING (id2): now PENDING, claim -> OutDone -> DONE ===
       line("STEP 2  run Embedding (id2)  [worker 12]")
-      Worker.runOne(store, 2L, 12L, lease, now, sidecar, log = line)
+      WorkerCore.runOne(world, 2L, 12L, sidecarEvent(12L))
       val ev2 = producedEventOf(fullDag, Embedding).get
       line(s"HANDOFF embedding DONE produces $ev2 -> unblock Masking (id3)")
       val un2 = store.handoffEvent(ev2)
@@ -110,19 +119,19 @@ object Main:
 
       // === MASKING (id3): now PENDING, claim -> OutDone -> DONE ===
       line("STEP 3  run Masking (id3)  [worker 13]")
-      Worker.runOne(store, 3L, 13L, lease, now, sidecar, log = line)
+      WorkerCore.runOne(world, 3L, 13L, sidecarEvent(13L))
       dump("after masking DONE")
       rule()
 
       // === IMPORT (id5) -> RAGINDEX (id4) ===
       line("STEP 4  run Import (id5)  [worker 15]")
-      Worker.runOne(store, 5L, 15L, lease, now, sidecar, log = line)
+      WorkerCore.runOne(world, 5L, 15L, sidecarEvent(15L))
       val ev3 = producedEventOf(fullDag, Import).get
       line(s"HANDOFF import DONE produces $ev3 -> unblock RagIndex (id4)")
       val un3 = store.handoffEvent(ev3)
       un3.foreach((rid, st) => line(f"  UNBLOCK row=$rid%-2d -> ${st.status}"))
       line("STEP 5  run RagIndex (id4)  [worker 14]")
-      Worker.runOne(store, 4L, 14L, lease, now, sidecar, log = line)
+      WorkerCore.runOne(world, 4L, 14L, sidecarEvent(14L))
       dump("after import + ragindex DONE")
       dumpQueue("final (shadow mirrors authoritative job)")
       rule()
