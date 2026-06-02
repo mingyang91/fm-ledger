@@ -3,58 +3,49 @@ package io.linewise.jobfm.transpiler
 import scala.meta._
 
 /* =============================================================================
- * STAINLESS -> OX TRANSPILER  (scalameta-validated, principled text-rewriter)
+ * STAINLESS -> OX/PRODUCTION TRANSPILER  (scalameta AST-driven)
  *
  * WHICH APPROACH, AND WHY.
- * The task preferred a scalameta AST Transformer. I built one and hit a hard
- * Scala-3 wall: scalameta 4.13.4 implements the convenient bottom-up rewrite
- * helpers (`Tree.transform`, `Tree.traverse`) and the `Transformer`/`Traverser`
- * base classes as SCALA-2.13 def-macros (they live in
- * `scala.meta.internal.transversers.{TransformerMacros,TraverserMacros}` in
- * common_2.13-4.13.4.jar). Scala 3 cannot expand Scala-2 def-macros, so
- * `source.transform { ... }` does not compile, and there is no non-macro
- * `Transformer` base class published to subclass. scalameta PARSING works fine
- * under `dialects.Scala3` — it is only the tree-REWRITING surface that is
- * Scala-3-hostile.
+ * Rules DETECT structurally on the scalameta AST and EDIT by splicing the
+ * original source at node character offsets (`.pos.start`/`.pos.end`). This is
+ * the Scalafix "syntactic patch" model: matching is on real syntax (an `Import`
+ * node, a `Term.Apply(Term.Name("FMInt"), _)`, a `.ensuring` `Term.Select`),
+ * never on regex over raw text — so a token inside a string/comment, a partial
+ * identifier, or an unusual line break can no longer trip a rule. Edits splice
+ * the ORIGINAL text, so everything we do NOT touch (doc comments, formatting)
+ * survives verbatim.
  *
- * So this transpiler is a PRINCIPLED TEXT-REWRITER, but scalameta is still a
- * first-class part of it as a VALIDATION GATE on BOTH ends:
- *   1. it PARSES the input with `dialects.Scala3` — a malformed verified source
- *      is rejected before any rewrite runs;
- *   2. each rule is an ANCHORED token rewrite (not blind global regex): the
- *      rules key off concrete Stainless syntax (`import stainless.*`, the
- *      `BigInt` token, `Some[T](`, `None[T]()`, `require(...)`, `.ensuring(...)`,
- *      `.holds`), exactly the proven substitutions;
- *   3. it RE-PARSES the generated output with `dialects.Scala3` and FAILS if the
- *      result is not valid Scala 3 — so a bad rewrite cannot silently ship.
+ * On the old Scala-3 wall: scalameta 4.13.4 implements the convenience rewrite
+ * helpers (`Tree.transform`/`.traverse`/`.collect`) as Scala-2.13 def-macros
+ * that Scala 3 cannot expand. We do NOT use them. Manual `.children` recursion,
+ * `.pos`, and case-class pattern matching are plain (non-macro) and work fine —
+ * that is the whole engine (`collectEdits`).
  *
- * THE RULES (each applied once, in order):
- *   R1  drop  import stainless.*            (verification-only imports)
- *   R1b drop  import io.linewise.verify.effect.{FMInt, FMLong} (FM-type imports)
- *   R2  rewrite package -> io.linewise.jobfm.generated
- *   R3  TWO-TIER OVERFLOW ERASURE — FMInt -> Int, FMLong -> Long. The bounded
- *       proof-carrying wrappers (whose `+` carried a PROVEN no-overflow VC)
- *       erase to the native machine types, because the bound was discharged in
- *       the verifier so production needs no runtime check:
- *         FMInt(BigInt(n))  -> n        ; FMLong(BigInt(n)) -> nL   (literals)
- *         FMInt(e)          -> (e).toInt; FMLong(e)          -> (e).toLong (general)
- *         FMInt (type)      -> Int      ; FMLong (type)      -> Long  (type tokens)
- *         x.value           -> x        (erase the bounded-value accessor,
- *                                        anchored so Map/.values and tuple ._2
- *                                        are untouched)
- *       Operators (+,-,>=,<=,==,!=,<,>) and .toLong/.toInt pass through to the
- *       native Int/Long that already define them. NO BigInt in the output.
- *   R4  Some[T](x) -> Some(x) ; None[T]() -> None
- *   R5  drop  require(...)                  (proven precondition)
- *   R6  drop  <block>.ensuring(...)         (proven postcondition)
- *   R7  strip @law @opaque @inlineOnce @extern @ghost ... annotations
- *   R8  drop  def ... .holds  proof defs    (defensive; none in JobModel)
+ * scalameta is also the VALIDATION GATE on both ends: the input is parsed before
+ * any rule runs (a malformed verified source is rejected), and the generated
+ * output is re-parsed at the end (a bad edit cannot silently ship). Each rule is
+ * its own parse -> collect-edits -> apply pass, so a later rule sees the tree the
+ * earlier rules produced (e.g. `.value` erasure runs after FM-ctor erasure).
+ *
+ * THE RULES (each its own pass, in order):
+ *   imports  drop `import stainless.*`, `import io.linewise.verify.effect.{FMInt,FMLong}`,
+ *            `import *Proofs.*`; REDIRECT `io.linewise.verify.ox` -> `ox` and
+ *            `io.linewise.verify.effect.SafeArith` -> `io.linewise.jobfm.SafeArith`
+ *   R2       rewrite the package ref -> <targetPkg>
+ *   R7       strip @law @opaque @inlineOnce @extern @ghost @pure @induct @partialEval
+ *   R8       drop whole `def`s whose body contains `.holds`
+ *   R5       drop `require(...)` / `assert(...)` / `decreases(...)` statements
+ *   R6       drop a trailing `.ensuring(...)` (keep its body)
+ *   R3a      FMInt(BigInt(n)) -> n ; FMLong(BigInt(n)) -> nL ; FMInt(e) -> (e).toInt ; ...
+ *   R3b      `x.value` -> `x`   (the bounded-value accessor)
+ *   R3c      type names FMInt -> Int ; FMLong -> Long
+ *   R4       Some[T](x) -> Some(x) ; None[T]() -> None
  * ========================================================================== */
 object Transpiler {
 
   /** Stainless-only annotations stripped by R7. */
-  val strippedAnnotations: Seq[String] =
-    Seq("law", "opaque", "inlineOnce", "extern", "ghost", "pure", "induct", "partialEval")
+  val strippedAnnotations: Set[String] =
+    Set("law", "opaque", "inlineOnce", "extern", "ghost", "pure", "induct", "partialEval")
 
   def header(srcRel: String): String =
     s"""// =============================================================================
@@ -77,7 +68,6 @@ object Transpiler {
     * to the job system's package so existing callers are unaffected, and the ledger
     * passes `io.linewise.ledgerfm.generated`. */
   def transpile(input: String, srcRel: String, targetPkg: String = "io.linewise.jobfm.generated"): String = {
-    // (1) parse-validate the verified source as Scala 3.
     parseScala3(input).fold(
       err => throw new IllegalArgumentException(s"input is not valid Scala 3: $err"),
       _   => ()
@@ -86,7 +76,6 @@ object Transpiler {
     val body = rewrite(input, targetPkg)
     val out  = header(srcRel) + "\n" + body
 
-    // (3) parse-validate the GENERATED output as Scala 3. A bad rewrite fails here.
     parseScala3(out).fold(
       err => throw new IllegalStateException(
         s"generated output is not valid Scala 3 (transpiler bug): $err\n--- output ---\n$out"),
@@ -102,254 +91,209 @@ object Transpiler {
       case Parsed.Success(tree) => Right(tree)
       case Parsed.Error(_, msg, _) => Left(msg)
 
-  /** Apply R1..R8 to the source text. Each rule is anchored and ordered. */
-  def rewrite(input: String, targetPkg: String = "io.linewise.jobfm.generated"): String = {
-    var s = input
-    s = ruleR1_dropStainlessImports(s)
-    s = ruleR1d_redirectShadowImports(s)  // before R1b: redirect verify shadows (SafeArith,
-    s = ruleR1b_dropFmTypeImports(s)      //   ox), so R1b does not drop them as verify imports
-    s = ruleR1c_dropProofImports(s)
-    s = ruleR2_rewritePackage(s, targetPkg)
-    s = ruleR7_stripAnnotations(s)   // before R5/R6 so annotated defs are clean
-    s = ruleR8_dropHoldsProofs(s)
-    s = ruleR5_dropRequire(s)
-    s = ruleR5b_dropAssert(s)
-    s = ruleR5c_dropDecreases(s)
-    s = ruleR6_dropEnsuring(s)
-    s = ruleR3_eraseFmTypes(s)
-    s = ruleR4_dropOptionTypeArgs(s)
-    s
-  }
+  // ===========================================================================
+  // EDIT ENGINE
+  // ===========================================================================
 
-  // --- R1: drop `import stainless.*` lines ---------------------------------
-  def ruleR1_dropStainlessImports(s: String): String =
-    s.linesIterator
-      .filterNot(l => l.trim.matches("""import\s+stainless\..*"""))
-      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
+  /** A splice into the original source: replace chars [start,end) with `repl`. */
+  private final case class Edit(start: Int, end: Int, repl: String)
 
-  // --- R1b: drop the FM-type import lines ----------------------------------
-  // `import io.linewise.verify.effect.{FMInt, FMLong}` (and any single-name
-  // variant) is a verify-only import: the wrappers are ERASED by R3, so the
-  // generated core must not reference the verify package at all.
-  def ruleR1b_dropFmTypeImports(s: String): String =
-    s.linesIterator
-      .filterNot(l => l.trim.matches("""import\s+io\.linewise\.verify\.effect\..*"""))
-      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
-
-  // --- R1c: drop imports of verify-only PROOF objects ----------------------
-  // `import StoreProofs.storeInv` (and any `*Proofs` object) is verify-only: the
-  // proofs live in files that are NEVER transpiled, so the generated code must
-  // not import them. The store CONTRACT the worker is verified against
-  // (StoreLaw.AbstractStore) is kept — production provides generated.StoreLaw.
-  def ruleR1c_dropProofImports(s: String): String =
-    s.linesIterator
-      .filterNot(l => l.trim.matches("""import\s+\w*Proofs\..*"""))
-      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
-
-  // --- R1d: redirect verify-side SHADOW imports to their production counterparts ---
-  // Two verify shadows are swapped for the real production APIs (literal replace, so
-  // any comment text mentioning them follows along harmlessly):
-  //   io.linewise.verify.effect.SafeArith -> io.linewise.jobfm.SafeArith
-  //     the Tier-2 safeAdd: the verify body computes in BigInt; production uses the
-  //     trusted-equivalent Math.addExact (see src/.../SafeArith.scala).
-  //   io.linewise.verify.ox               -> ox
-  //     the structured-concurrency shadow (verify/stainless-lib/Ox.scala): under
-  //     verification it gives a pure, eager, source-order semantics Stainless can
-  //     reason about; production runs real Ox `fork`/`join`. The call sites are
-  //     name-for-name, so only the import is swapped.
-  // Run BEFORE R1b so R1b does not drop these as generic verify imports.
-  def ruleR1d_redirectShadowImports(s: String): String =
-    s.replace("io.linewise.verify.effect.SafeArith", "io.linewise.jobfm.SafeArith")
-     .replace("io.linewise.verify.ox", "ox")
-
-  // --- R2: rewrite the package declaration ---------------------------------
-  // The target package is a parameter so the SAME transpiler serves both the job
-  // system (io.linewise.jobfm.generated) and the ledger (io.linewise.ledgerfm.generated).
-  def ruleR2_rewritePackage(s: String, targetPkg: String): String =
-    s.replaceFirst(
-      """(?m)^package\s+[\w\.]+""",
-      s"package $targetPkg"
-    )
-
-  // --- R3: TWO-TIER OVERFLOW ERASURE — FMInt/FMLong -> native Int/Long ------
-  // The Tier-1 strategy: bounded ints whose no-overflow `+` was PROVEN in the
-  // verifier erase to native machine ints in production. The erasure is staged
-  // so each more-specific form is consumed before the more-general one:
-  //
-  //   (a) FMInt(BigInt(n))  -> n        FMLong(BigInt(n)) -> nL    (literals)
-  //   (b) FMInt(<expr>)     -> (<expr>).toInt ; FMLong(<expr>) -> (<expr>).toLong
-  //       for any REMAINING constructor whose argument is not the literal form
-  //       (balanced-paren scan, so a nested call in <expr> is handled).
-  //   (c) bare type tokens  FMInt -> Int ; FMLong -> Long
-  //   (d) `.value` accessor on a bounded value -> erased (x.value -> x),
-  //       anchored so `Map`-style `.values` and tuple `._2` are NOT touched.
-  //
-  // After R3 there is no FMInt/FMLong/BigInt token left, and every operator
-  // (+,-,>=,<=,==,!=,<,>,.toInt,.toLong) resolves against native Int/Long.
-  def ruleR3_eraseFmTypes(s: String): String = {
-    // (a) literal constructors first, so (b) does not see them.
-    val litInt  = """FMInt\(\s*BigInt\(\s*(-?\d+)\s*\)\s*\)""".r
-      .replaceAllIn(s, m => m.group(1))
-    val litLong = """FMLong\(\s*BigInt\(\s*(-?\d+)\s*\)\s*\)""".r
-      .replaceAllIn(litInt, m => m.group(1) + "L")
-
-    // (b) general constructors (balanced-paren) on whatever literals left behind.
-    val genInt  = eraseGeneralCtor(litLong, "FMInt",  "toInt")
-    val genLong = eraseGeneralCtor(genInt,  "FMLong", "toLong")
-
-    // (c) remaining bare type tokens are TYPE uses -> native.
-    val tInt  = """\bFMInt\b""".r.replaceAllIn(genLong, _ => "Int")
-    val tLong = """\bFMLong\b""".r.replaceAllIn(tInt,    _ => "Long")
-
-    // (d) erase the bounded-value accessor `.value`. Anchor on a value/paren
-    // receiver immediately followed by `.value` and a NON-identifier boundary,
-    // so `.values` (Map) is excluded by the `\b` after `value`. Tuple `._2`
-    // never matches because the accessor name is `value`, not `_2`.
-    """\.value\b""".r.replaceAllIn(tLong, _ => "")
-  }
-
-  /** Erase a `<Ctor>(<expr>)` constructor whose argument is matched with
-    * balanced parentheses, rewriting it to `(<expr>).<conv>`. Scans left to
-    * right; only constructor occurrences with a balanced arg list are rewritten.
-    * Literal forms have already been consumed by step (a), so this catches the
-    * residual general cases (e.g. `FMLong(a.value + b.value)`), keeping the
-    * inner expression intact for the type-token and `.value` passes that follow. */
-  private def eraseGeneralCtor(s: String, ctor: String, conv: String): String = {
-    val sb = new StringBuilder
-    val needle = ctor + "("
-    var i = 0
-    while i < s.length do
-      // a constructor occurrence is `<ctor>(` with the `<ctor>` token not part
-      // of a longer identifier (so `FMInts(` would not match — none exist, but
-      // be precise).
-      val isCtorHere =
-        s.startsWith(needle, i) &&
-        (i == 0 || !s.charAt(i - 1).isLetterOrDigit && s.charAt(i - 1) != '_')
-      if isCtorHere then
-        val argStart = i + needle.length
-        val argEnd   = matchingParen(s, argStart - 1) // index of the closing ')'
-        if argEnd >= 0 then
-          val arg = s.substring(argStart, argEnd)
-          sb.append('(').append(arg).append(").").append(conv)
-          i = argEnd + 1
-        else
-          sb.append(s.charAt(i)); i += 1
-      else
-        sb.append(s.charAt(i)); i += 1
+  /** Apply non-overlapping edits, splicing the original string from the end
+    * backwards so earlier offsets stay valid. Throws if two edits overlap (a
+    * transpiler bug — rules are designed to produce disjoint spans per pass). */
+  private def applyEdits(src: String, edits: Seq[Edit]): String = {
+    val sorted = edits.sortBy(-_.start)
+    val sb = new StringBuilder(src)
+    var lastStart = src.length
+    for (e <- sorted) {
+      require(e.start <= e.end && e.end <= lastStart,
+        s"overlapping/invalid edit $e (next span starts at $lastStart)")
+      sb.replace(e.start, e.end, e.repl)
+      lastStart = e.start
+    }
     sb.toString
   }
 
-  /** Given the index of an opening '(' in `s`, return the index of its matching
-    * ')', or -1 if unbalanced. */
-  private def matchingParen(s: String, open: Int): Int = {
-    var depth = 0
-    var i = open
-    while i < s.length do
-      val c = s.charAt(i)
-      if c == '(' then depth += 1
-      else if c == ')' then
-        depth -= 1
-        if depth == 0 then return i
-      i += 1
-    -1
+  /** OUTERMOST-match traversal: when `pf` matches a node, take its edits and do
+    * NOT descend into it (so a node and its descendants never both emit edits).
+    * Manual `.children` recursion — NOT the Scala-2.13 macro `.traverse`. */
+  private def collectEdits(tree: Tree)(pf: PartialFunction[Tree, List[Edit]]): List[Edit] =
+    pf.lift(tree) match
+      case Some(edits) => edits
+      case None        => tree.children.flatMap(c => collectEdits(c)(pf))
+
+  /** One rule pass: parse, collect edits, apply. */
+  private def astRule(s: String)(pf: PartialFunction[Tree, List[Edit]]): String =
+    parseScala3(s) match
+      case Right(tree) => applyEdits(s, collectEdits(tree)(pf))
+      case Left(err)   => throw new IllegalStateException(s"intermediate parse failed (transpiler bug): $err")
+
+  // ---- small helpers --------------------------------------------------------
+
+  private def text(s: String, t: Tree): String = s.substring(t.pos.start, t.pos.end)
+
+  /** Leftmost identifier of a ref: a.b.c -> "a". */
+  private def rootName(t: Tree): String = t match
+    case Term.Select(q, _) => rootName(q)
+    case Term.Name(n)      => n
+    case _                 => ""
+
+  /** Dotted path of a ref: a.b.c -> "a.b.c". */
+  private def refPath(t: Tree): String = t match
+    case Term.Select(q, Term.Name(n)) => val p = refPath(q); if p.isEmpty then n else s"$p.$n"
+    case Term.Name(n)                 => n
+    case _                            => ""
+
+  /** Expand a node to the whole line(s) it occupies: [start-of-its-first-line,
+    * start-of-line-after-its-last-line) — for deleting a statement/import line
+    * without leaving a blank line behind. */
+  private def lineSpan(src: String, node: Tree): (Int, Int) = {
+    var a = node.pos.start
+    while a > 0 && src.charAt(a - 1) != '\n' do a -= 1
+    var b = node.pos.end
+    while b < src.length && src.charAt(b) != '\n' do b += 1
+    if b < src.length then b += 1 // include the trailing newline
+    (a, b)
   }
 
-  // --- R4: Some[T](x) -> Some(x) ; None[T]() -> None -----------------------
-  def ruleR4_dropOptionTypeArgs(s: String): String = {
-    // None[T]() -> None  (with an empty arg list)
-    val noneFixed = """None\[[^\]]*\]\(\s*\)""".r.replaceAllIn(s, _ => "None")
-    // Some[T]( -> Some(   (drop only the type application; keep the arg list)
-    """Some\[[^\]]*\]\(""".r.replaceAllIn(noneFixed, _ => "Some(")
+  /** Extend an end offset over following spaces/tabs (so deleting `@law ` removes
+    * the trailing space too, not just `@law`). */
+  private def overSpaces(src: String, end: Int): Int = {
+    var e = end
+    while e < src.length && (src.charAt(e) == ' ' || src.charAt(e) == '\t') do e += 1
+    e
   }
 
-  // --- R5: drop `require(...)` statements ----------------------------------
-  // The only require in JobModel is the JobState invariant, on its own line in
-  // the case-class body. Drop any line that is a bare `require(...)` call.
-  def ruleR5_dropRequire(s: String): String =
-    s.linesIterator
-      .filterNot(l => l.trim.matches("""require\(.*\)\s*"""))
-      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
+  // ===========================================================================
+  // RULES
+  // ===========================================================================
 
-  // --- R5b: drop `assert(...)` proof hints ---------------------------------
-  // The worker invokes @law contracts as `assert(s.claimLaw(...))` hints so
-  // Stainless chains them; these reference verify-only @law methods and are pure
-  // proof scaffolding. Drop any line that is a bare `assert(...)` call.
-  def ruleR5b_dropAssert(s: String): String =
-    s.linesIterator
-      .filterNot(l => l.trim.matches("""assert\(.*\)\s*"""))
-      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
-
-  // --- R5c: drop `decreases(...)` termination metadata ---------------------
-  // `decreases` is Stainless-only termination evidence (e.g. on the ledger's
-  // sumSafe fold). Like require/assert it is proof-only; drop any line that is a
-  // bare `decreases(...)` call so it does not leak into the generated core.
-  def ruleR5c_dropDecreases(s: String): String =
-    s.linesIterator
-      .filterNot(l => l.trim.matches("""decreases\(.*\)\s*"""))
-      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
-
-  // --- R6: drop a trailing `.ensuring(...)` postcondition ------------------
-  // In JobModel, `step`'s body is `{ ... }.ensuring(res => ...)`. The closing
-  // brace of the block sits on its own line as `  }.ensuring(res => ...)`.
-  // Drop the `.ensuring(...)` suffix on that line, leaving the bare `}`.
-  def ruleR6_dropEnsuring(s: String): String =
-    s.linesIterator
-      .map { l =>
-        val idx = l.indexOf(".ensuring(")
-        if idx >= 0 && l.take(idx).trim == "}" then l.substring(0, idx)
-        else l
-      }
-      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
-
-  // --- R7: strip stainless annotations -------------------------------------
-  // Remove `@law`, `@opaque`, ... wherever they appear (start of a def/val or
-  // mid-line). Anchored on the `@<name>` token with an optional trailing space.
-  def ruleR7_stripAnnotations(s: String): String = {
-    val alt = strippedAnnotations.mkString("|")
-    s.replaceAll(s"""@(?:$alt)\\b\\s*""", "")
+  def rewrite(input: String, targetPkg: String = "io.linewise.jobfm.generated"): String = {
+    var s = input
+    s = importsRule(s)
+    s = packageRule(s, targetPkg)
+    s = annotationsRule(s)
+    s = holdsDefsRule(s)
+    s = statementsRule(s)
+    s = ensuringRule(s)
+    s = eraseCtorsRule(s)
+    s = eraseValueRule(s)
+    s = eraseTypeNamesRule(s)
+    s = optionTypeArgsRule(s)
+    s
   }
 
-  // --- R8: drop `.holds` proof defs ----------------------------------------
-  // JobModel has none (proofs live in JobProofs.scala), but the rule is here so
-  // the transpiler is correct if a `.holds` ever leaks into the model. We drop
-  // whole `def` blocks that contain a `.holds` token. Brace-balanced from the
-  // `def` line to its closing brace.
-  def ruleR8_dropHoldsProofs(s: String): String = {
-    if !s.contains(".holds") then return s
-    val lines = s.linesIterator.toArray
-    val keep  = Array.fill(lines.length)(true)
-    var i = 0
-    while i < lines.length do
-      val l = lines(i)
-      if l.trim.startsWith("def ") && lineBlockContainsHolds(lines, i) then
-        // drop from this def line to the end of its brace-balanced block.
-        val end = blockEnd(lines, i)
-        var j = i
-        while j <= end do { keep(j) = false; j += 1 }
-        i = end + 1
-      else i += 1
-    lines.zipWithIndex.collect { case (l, idx) if keep(idx) => l }.mkString("\n") +
-      (if s.endsWith("\n") then "\n" else "")
+  // --- imports: drop verification-only imports; redirect the two shadows -----
+  // Each import here has a single importer. Classified once by its ref path:
+  //   io.linewise.verify.ox               -> redirect ref to `ox`
+  //   io.linewise.verify.effect.SafeArith -> redirect ref to io.linewise.jobfm
+  //   stainless.*                         -> drop the line
+  //   io.linewise.verify.effect.{FMInt,FMLong} -> drop the line
+  //   *Proofs.*                           -> drop the line
+  private def importsRule(s: String): String = astRule(s) {
+    case imp: Import =>
+      val er   = imp.importers.head
+      val path = refPath(er.ref)
+      val root = rootName(er.ref)
+      val importees = er.importees.map(_.toString)
+      def redirect(to: String) = List(Edit(er.ref.pos.start, er.ref.pos.end, to))
+      def dropLine = { val (a, b) = lineSpan(s, imp); List(Edit(a, b, "")) }
+      if path == "io.linewise.verify.ox" then
+        redirect("ox")
+      else if path.startsWith("io.linewise.verify.effect.SafeArith") then
+        // `import io.linewise.verify.effect.SafeArith._` (SafeArith is the ref tail)
+        redirect(path.replace("io.linewise.verify.effect.SafeArith", "io.linewise.jobfm.SafeArith"))
+      else if path == "io.linewise.verify.effect" && importees.exists(_.contains("SafeArith")) then
+        // `import io.linewise.verify.effect.SafeArith` (SafeArith is the importee)
+        redirect("io.linewise.jobfm")
+      else if root == "stainless" then dropLine
+      else if path == "io.linewise.verify.effect" then dropLine
+      else if root.endsWith("Proofs") then dropLine
+      else Nil
   }
 
-  /** Does the brace-balanced block starting at def-line `start` contain `.holds`? */
-  private def lineBlockContainsHolds(lines: Array[String], start: Int): Boolean = {
-    val end = blockEnd(lines, start)
-    (start to end).exists(k => lines(k).contains(".holds"))
+  // --- R2: rewrite the (outermost) package ref to the target package ---------
+  private def packageRule(s: String, targetPkg: String): String = astRule(s) {
+    case Pkg(ref, _) => List(Edit(ref.pos.start, ref.pos.end, targetPkg))
   }
 
-  /** End line index (inclusive) of the brace-balanced block opened on/after the
-    * def line `start`. If no brace opens, the def is single-line: end == start. */
-  private def blockEnd(lines: Array[String], start: Int): Int = {
-    var depth = 0
-    var seenOpen = false
-    var i = start
-    while i < lines.length do
-      val l = lines(i)
-      depth += l.count(_ == '{') - l.count(_ == '}')
-      if l.contains("{") then seenOpen = true
-      if seenOpen && depth <= 0 then return i
-      i += 1
-    if seenOpen then lines.length - 1 else start
+  // --- R7: strip stainless annotations (the @<name> token + trailing space) --
+  private def annotationsRule(s: String): String = astRule(s) {
+    case a: Mod.Annot if annotName(a).exists(strippedAnnotations.contains) =>
+      List(Edit(a.pos.start, overSpaces(s, a.pos.end), ""))
+  }
+
+  private def annotName(a: Mod.Annot): Option[String] = a.init.tpe match
+    case Type.Name(n)                 => Some(n)
+    case Type.Select(_, Type.Name(n)) => Some(n)
+    case _                            => None
+
+  // --- R8: drop whole `def`s whose body contains a `.holds` select -----------
+  private def holdsDefsRule(s: String): String = astRule(s) {
+    case d: Defn.Def if containsHolds(d) =>
+      val (a, b) = lineSpan(s, d); List(Edit(a, b, ""))
+  }
+
+  private def containsHolds(t: Tree): Boolean = t match
+    case Term.Select(_, Term.Name("holds")) => true
+    case _                                   => t.children.exists(containsHolds)
+
+  // --- R5: drop `require(...)` / `assert(...)` / `decreases(...)` statements --
+  private val droppedCalls = Set("require", "assert", "decreases")
+  private def statementsRule(s: String): String = astRule(s) {
+    case t @ Term.Apply(Term.Name(fn), _) if droppedCalls.contains(fn) =>
+      val (a, b) = lineSpan(s, t); List(Edit(a, b, ""))
+  }
+
+  // --- R6: drop a trailing `.ensuring(...)`, keeping its body ----------------
+  private def ensuringRule(s: String): String = astRule(s) {
+    case t @ Term.Apply(Term.Select(body, Term.Name("ensuring")), _) =>
+      List(Edit(body.pos.end, t.pos.end, ""))
+    case t @ Term.ApplyInfix(body, Term.Name("ensuring"), _, _) =>
+      List(Edit(body.pos.end, t.pos.end, ""))
+  }
+
+  // --- R3a: erase FMInt/FMLong constructors ----------------------------------
+  //   FMInt(BigInt(n))  -> n        FMLong(BigInt(n)) -> nL    (numeric literal)
+  //   FMInt(e)          -> (e).toInt ; FMLong(e) -> (e).toLong (any other arg)
+  private def eraseCtorsRule(s: String): String = astRule(s) {
+    case t @ Term.Apply(Term.Name("FMInt"),  List(arg)) =>
+      List(Edit(t.pos.start, t.pos.end, ctorRepl(s, arg, "toInt", isLong = false)))
+    case t @ Term.Apply(Term.Name("FMLong"), List(arg)) =>
+      List(Edit(t.pos.start, t.pos.end, ctorRepl(s, arg, "toLong", isLong = true)))
+  }
+
+  private def ctorRepl(s: String, arg: Tree, conv: String, isLong: Boolean): String = arg match
+    case Term.Apply(Term.Name("BigInt"), List(inner)) if numericText(s, inner).isDefined =>
+      val n = numericText(s, inner).get
+      if isLong then s"${n}L" else n
+    case _ =>
+      s"(${text(s, arg)}).$conv"
+
+  private def numericText(s: String, t: Tree): Option[String] =
+    val txt = text(s, t).trim
+    if txt.matches("-?\\d+") then Some(txt) else None
+
+  // --- R3b: erase the bounded-value accessor `x.value` -> `x` -----------------
+  private def eraseValueRule(s: String): String = astRule(s) {
+    case t @ Term.Select(qual, Term.Name("value")) =>
+      List(Edit(t.pos.start, t.pos.end, text(s, qual)))
+  }
+
+  // --- R3c: erase the FM type names -> native -------------------------------
+  private def eraseTypeNamesRule(s: String): String = astRule(s) {
+    case t @ Type.Name("FMInt")  => List(Edit(t.pos.start, t.pos.end, "Int"))
+    case t @ Type.Name("FMLong") => List(Edit(t.pos.start, t.pos.end, "Long"))
+  }
+
+  // --- R4: drop Option type applications -------------------------------------
+  //   None[T]()  -> None   (whole apply)      Some[T]  -> Some  (just the type args)
+  private def optionTypeArgsRule(s: String): String = astRule(s) {
+    case t @ Term.Apply(Term.ApplyType(Term.Name("None"), _), args) if args.isEmpty =>
+      List(Edit(t.pos.start, t.pos.end, "None"))
+    case t @ Term.ApplyType(Term.Name("Some"), _) =>
+      List(Edit(t.pos.start, t.pos.end, "Some"))
+    case t @ Term.ApplyType(Term.Name("None"), _) =>
+      List(Edit(t.pos.start, t.pos.end, "None"))
   }
 }
