@@ -63,8 +63,16 @@ final case class JdbcLedger(xa: Transactor[IO]) extends AbstractLedger:
       LedgerCore.sumSafe(tx.postings) match
         case Left(e)  => Left(e) // Overflow propagated
         case Right(s) =>
-          if s == 0L then { eval(Db.insertTx(tx.id, tx.postings)); Right(this) }
-          else Left(LedgerError.Unbalanced)
+          if s != 0L then Left(LedgerError.Unbalanced)
+          else
+            // the ledger_tx PK is the AUTHORITATIVE append-only guard. Under a
+            // concurrent race the txExists pre-check above can pass for two clerks
+            // at once, but only one INSERT commits — the loser hits the PK and is
+            // mapped to DuplicateTx (its whole tx rolls back atomically). This is
+            // the ledger's analog of the job store's re-validating UPDATE, and the
+            // verified justification is LedgerProofs.sameIdRaceKeepsExactlyOne.
+            try { eval(Db.insertTx(tx.id, tx.postings)); Right(this) }
+            catch case t if JdbcLedger.isDuplicateKey(t) => Left(LedgerError.DuplicateTx)
 
   // post is total: a no-op on rejection (the verified `post` shape).
   def post(tx: Tx): AbstractLedger =
@@ -83,3 +91,20 @@ final case class JdbcLedger(xa: Transactor[IO]) extends AbstractLedger:
 
   // --- driver helper: create the append-only schema ---
   def initSchema(): Unit = { eval(Db.ddlLedgerTx); eval(Db.ddlPosting); () }
+
+object JdbcLedger:
+  /** True if the throwable (or one of its causes) is a duplicate-key / unique
+    * violation — a SQLIntegrityConstraintViolationException, or any SQLException
+    * whose SQLState is class 23 (integrity-constraint violation). The ledger_tx
+    * primary key raises this when a second clerk races the same id. The cause
+    * chain is walked (with a self-cycle guard) because cats-effect / doobie may
+    * surface the driver exception wrapped. */
+  def isDuplicateKey(t: Throwable): Boolean =
+    if t == null then false
+    else
+      t match
+        case _: java.sql.SQLIntegrityConstraintViolationException => true
+        case e: java.sql.SQLException if Option(e.getSQLState).exists(_.startsWith("23")) => true
+        case _ =>
+          val c = t.getCause
+          (c ne null) && (c ne t) && isDuplicateKey(c)

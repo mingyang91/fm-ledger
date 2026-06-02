@@ -201,6 +201,38 @@ object LedgerProofs {
   }.holds
 
   /* =====================================================================
+   * RACE / ORDER-INDEPENDENCE — the verified justification for the concurrent
+   * Gears posting race (GearsLedgerRace). The ledger analog of the job system's
+   * SeqMirrorProofs.raceExactlyOneWinner: when two clerks race to post the SAME id
+   * the DB serializes them to SOME order (the `ledger_tx` PK — TRUSTED), and EVERY
+   * order is safe (VERIFIED here): exactly one is admitted (the first), the second
+   * is refused as a duplicate, and the journal grows by exactly one either way.
+   * ===================================================================== */
+
+  // posting the same transaction twice is idempotent — the second is a no-op
+  // (append-only: its id is already present). So replaying a post any number of
+  // times, in any order, yields one copy.
+  def postIdempotentOnSameTx(l: Ledger, tx: Tx): Boolean = {
+    require(ledgerInv(l))
+    post(post(l, tx), tx) == post(l, tx)
+  }.holds
+
+  // EXACTLY ONE WINNER, FIRST WINS, BOTH ORDERS: two well-formed transactions
+  // sharing an id, posted in either order onto a ledger that has neither, leave
+  // exactly the FIRST-applied one in the journal (the journal grows by one) and
+  // refuse the second. Which one wins depends on the serialization order (trusted);
+  // that exactly one wins does not (verified).
+  def sameIdRaceKeepsExactlyOne(l: Ledger, a: Tx, b: Tx): Boolean = {
+    require(ledgerInv(l) && a.id == b.id)
+    require(!txIds(l.txs).contains(a.id))
+    require(txWellFormed(a) && txWellFormed(b))
+    val ab = post(post(l, a), b) // a then b
+    val ba = post(post(l, b), a) // b then a
+    findTx(ab, a.id) == Some[Tx](a) && ab.txs.size == l.txs.size + BigInt(1) &&
+    findTx(ba, b.id) == Some[Tx](b) && ba.txs.size == l.txs.size + BigInt(1)
+  }.holds
+
+  /* =====================================================================
    * WITNESSES — the propositions are non-vacuous on concrete journal entries.
    * ===================================================================== */
 

@@ -25,8 +25,10 @@ object `package` extends SbtModule {
   def scalaVersion = "3.8.1"
 
   // Ox virtual threads need a JDK 21+ class-file target. Host JDK is 26, which
-  // runs JDK-21-targeted bytecode fine.
-  def scalacOptions = Seq("-release", "21")
+  // runs JDK-21-targeted bytecode fine. `-experimental` enables the Gears API
+  // (ch.epfl.lamp::gears is published @experimental), used by the ledger's
+  // concurrent posting race (GearsLedgerRace).
+  def scalacOptions = Seq("-release", "21", "-experimental")
 
   def mainClass = Some("io.linewise.jobfm.Main")
 
@@ -34,7 +36,8 @@ object `package` extends SbtModule {
     mvn"com.softwaremill.ox::core:1.0.4",
     mvn"org.tpolecat::doobie-core:1.0.0-RC12",
     mvn"com.h2database:h2:2.3.232",
-    mvn"org.typelevel::cats-effect:3.6.3"
+    mvn"org.typelevel::cats-effect:3.6.3",
+    mvn"ch.epfl.lamp::gears:0.2.0"
   )
 
   // The verified sources of truth that the production code is generated FROM.
@@ -106,7 +109,7 @@ object `package` extends SbtModule {
     * row-for-row — the machine-checked drift gate. Inherits the parent's deps
     * (ox/doobie/h2/cats + the generated sources) and adds munit. `./mill test`. */
   object test extends SbtTests with TestModule.Munit {
-    def scalacOptions = Seq("-release", "21")
+    def scalacOptions = Seq("-release", "21", "-experimental")
     def mvnDeps = Seq(mvn"org.scalameta::munit:1.0.0")
   }
 
