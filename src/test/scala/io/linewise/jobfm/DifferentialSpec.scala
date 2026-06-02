@@ -8,6 +8,7 @@ import io.linewise.jobfm.generated.JobModel.*
 import io.linewise.jobfm.generated.StoreCore.{JobRow, JobStore}
 import io.linewise.jobfm.generated.StoreLaw.AbstractStore
 import io.linewise.jobfm.generated.WorkerCore
+import io.linewise.jobfm.generated.SeqMirror
 
 /* =============================================================================
  * DIFFERENTIAL SPEC — the machine-checked DRIFT GATE, now over the ONE store.
@@ -104,12 +105,14 @@ class DifferentialSpec extends munit.FunSuite:
     assertEquals(r._3, Some(21L)) // first claimer wins; second denied (live lease)
   }
 
-  test("claim race (concurrent, via Ox SeqMirrorOx.par): exactly one RUNNING owner") {
+  test("claim race (concurrent, via generated SeqMirror.par): exactly one RUNNING owner") {
     val seed = List(JobRow(6L, JobState(PENDING, None, 0, Transcode, None)))
     val db   = freshJdbc(seed)
     // the real fork/join race (SKIP LOCKED) — the production realization of the
     // verified SeqMirrorProofs.raceExactlyOneWinner order-independence theorem.
-    SeqMirrorOx.par(() => db.claimOne(6L, 21L, false), () => db.claimOne(6L, 22L, false))
+    // SeqMirror.par is now GENERATED from the verified source (shadow fork/join),
+    // not hand-written: the transpiler swapped `io.linewise.verify.ox` -> `ox`.
+    SeqMirror.par(() => db.claimOne(6L, 21L, false), () => db.claimOne(6L, 22L, false))
     val r = norm(db).head
     assertEquals(r._2, RUNNING)
     assert(r._3 == Some(21L) || r._3 == Some(22L), s"exactly one winner, got owner ${r._3}")

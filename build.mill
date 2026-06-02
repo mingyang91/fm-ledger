@@ -48,36 +48,51 @@ object `package` extends SbtModule {
     moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "WorkerCore.scala"
   )
 
+  // The ledger module's verified executable cores. Same transpiler, different
+  // target package (io.linewise.ledgerfm.generated); the proofs (LedgerProofs/
+  // LedgerLaw/ConservationConflict) are verify-only and never transpiled.
+  def ledgerVerifiedSources: T[Seq[PathRef]] = Task.Sources(
+    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "ledgerfm" / "verify" / "LedgerModel.scala",
+    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "ledgerfm" / "verify" / "LedgerCore.scala"
+  )
+
   /** Run the transpiler over each verified executable core and emit the
-    * production code into a generated-sources directory. Registered in
-    * `generatedSources` below, so `./mill compile` regenerates automatically.
-    * Also a standalone task: `./mill transpile`. A leak-guard fails the build if
-    * any proof-only token (Nil()/Cons()/.holds) ever reaches generated output. */
+    * production code into a generated-sources directory, one package per module.
+    * Registered in `generatedSources` below, so `./mill compile` regenerates
+    * automatically. Also a standalone task: `./mill transpile`. A leak-guard fails
+    * the build if any proof-only token (Nil()/Cons()/.holds) reaches generated output. */
   def transpile: T[PathRef] = Task {
-    val genDir = Task.dest / "io" / "linewise" / "jobfm" / "generated"
-    os.makeDir.all(genDir)
-    for (src <- verifiedSources()) {
-      val in    = src.path
-      val dest  = genDir / in.last
-      val label = s"verify/src/main/scala/io/linewise/jobfm/verify/${in.last}"
-      transpiler.runner().run(
-        args = Seq(in.toString, dest.toString, label),
-        mainClass = "io.linewise.jobfm.transpiler.Main"
-      )
-      val leaked = os.read.lines(dest).zipWithIndex.collect {
-        case (l, i)
-            if {
-              val t = l.trim
-              val isComment = t.startsWith("*") || t.startsWith("//") || t.startsWith("/*")
-              !isComment && (t.contains("Nil(") || t.contains("Cons(") || t.contains(".holds"))
-            } =>
-          s"  ${i + 1}: ${l.trim}"
+    val genRoot = Task.dest
+
+    def genInto(srcs: Seq[PathRef], targetPkg: String): Unit = {
+      val genDir = targetPkg.split('.').foldLeft(genRoot)((p, seg) => p / seg)
+      os.makeDir.all(genDir)
+      for (src <- srcs) {
+        val in    = src.path
+        val dest  = genDir / in.last
+        val label = in.relativeTo(moduleDir).toString
+        transpiler.runner().run(
+          args = Seq(in.toString, dest.toString, label, targetPkg),
+          mainClass = "io.linewise.jobfm.transpiler.Main"
+        )
+        val leaked = os.read.lines(dest).zipWithIndex.collect {
+          case (l, i)
+              if {
+                val t = l.trim
+                val isComment = t.startsWith("*") || t.startsWith("//") || t.startsWith("/*")
+                !isComment && (t.contains("Nil(") || t.contains("Cons(") || t.contains(".holds"))
+              } =>
+            s"  ${i + 1}: ${l.trim}"
+        }
+        if (leaked.nonEmpty)
+          sys.error(s"[transpile] proof scaffolding leaked into $dest:\n${leaked.mkString("\n")}")
+        Task.log.info(s"[transpile] generated $dest from $in")
       }
-      if (leaked.nonEmpty)
-        sys.error(s"[transpile] proof scaffolding leaked into $dest:\n${leaked.mkString("\n")}")
-      Task.log.info(s"[transpile] generated $dest from $in")
     }
-    PathRef(Task.dest)
+
+    genInto(verifiedSources(), "io.linewise.jobfm.generated")
+    genInto(ledgerVerifiedSources(), "io.linewise.ledgerfm.generated")
+    PathRef(genRoot)
   }
 
   /** Feed the generated core into the compile. `generatedSources` is part of

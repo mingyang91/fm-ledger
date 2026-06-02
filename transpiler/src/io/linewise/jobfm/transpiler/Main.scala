@@ -19,9 +19,11 @@ object Main {
     val in: Path  = Paths.get(args(0))
     val out: Path = Paths.get(args(1))
     val label     = if args.length >= 3 then args(2) else in.getFileName.toString
+    // optional 4th arg: the production package the generated core lands in.
+    val targetPkg = if args.length >= 4 then args(3) else "io.linewise.jobfm.generated"
 
     val source    = Files.readString(in)
-    val generated = Transpiler.transpile(source, label)
+    val generated = Transpiler.transpile(source, label, targetPkg)
 
     Option(out.getParent).foreach(p => Files.createDirectories(p))
     Files.writeString(out, generated)

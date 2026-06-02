@@ -38,6 +38,11 @@ object SeqMirrorProofs {
 
   /* --- TIER 1: the mirror equivalences (trivial, by definition). --- */
 
+  // mapPar forks one element at a time and joins them all; eagerly that is
+  // `xs.map(x => Fork(f(x))).map(_.join())`. Proving it equals `xs.map(f)` is a
+  // list map-fusion fact, so it needs structural induction on `xs` (without
+  // @induct Stainless times out chasing the two chained maps).
+  @induct
   def mapParIsMap[A, B](xs: List[A], f: A => B): Boolean = {
     SeqMirror.mapPar(xs, f) == xs.map(f)
   }.holds

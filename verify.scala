@@ -56,6 +56,7 @@ def main(args: String*): Unit =
             // exclude the intentional INVALID counterexamples from the headline run
             .filter(_.last != "EvolutionConflict.scala")
             .filter(_.last != "OverflowCounterexample.scala")
+            .filter(_.last != "ConservationConflict.scala")
             .map: p =>
               s"/work/src/main/scala/${p.relativeTo(verifyBase)}"
         else Seq.empty

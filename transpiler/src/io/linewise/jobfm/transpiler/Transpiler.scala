@@ -72,15 +72,18 @@ object Transpiler {
        |// =============================================================================
        |""".stripMargin
 
-  /** Full pipeline. Parse-validate input (Scala3), rewrite, parse-validate output. */
-  def transpile(input: String, srcRel: String): String = {
+  /** Full pipeline. Parse-validate input (Scala3), rewrite, parse-validate output.
+    * `targetPkg` is the production package the generated core lands in; it defaults
+    * to the job system's package so existing callers are unaffected, and the ledger
+    * passes `io.linewise.ledgerfm.generated`. */
+  def transpile(input: String, srcRel: String, targetPkg: String = "io.linewise.jobfm.generated"): String = {
     // (1) parse-validate the verified source as Scala 3.
     parseScala3(input).fold(
       err => throw new IllegalArgumentException(s"input is not valid Scala 3: $err"),
       _   => ()
     )
 
-    val body = rewrite(input)
+    val body = rewrite(input, targetPkg)
     val out  = header(srcRel) + "\n" + body
 
     // (3) parse-validate the GENERATED output as Scala 3. A bad rewrite fails here.
@@ -100,16 +103,18 @@ object Transpiler {
       case Parsed.Error(_, msg, _) => Left(msg)
 
   /** Apply R1..R8 to the source text. Each rule is anchored and ordered. */
-  def rewrite(input: String): String = {
+  def rewrite(input: String, targetPkg: String = "io.linewise.jobfm.generated"): String = {
     var s = input
     s = ruleR1_dropStainlessImports(s)
-    s = ruleR1b_dropFmTypeImports(s)
+    s = ruleR1d_redirectShadowImports(s)  // before R1b: redirect verify shadows (SafeArith,
+    s = ruleR1b_dropFmTypeImports(s)      //   ox), so R1b does not drop them as verify imports
     s = ruleR1c_dropProofImports(s)
-    s = ruleR2_rewritePackage(s)
+    s = ruleR2_rewritePackage(s, targetPkg)
     s = ruleR7_stripAnnotations(s)   // before R5/R6 so annotated defs are clean
     s = ruleR8_dropHoldsProofs(s)
     s = ruleR5_dropRequire(s)
     s = ruleR5b_dropAssert(s)
+    s = ruleR5c_dropDecreases(s)
     s = ruleR6_dropEnsuring(s)
     s = ruleR3_eraseFmTypes(s)
     s = ruleR4_dropOptionTypeArgs(s)
@@ -141,11 +146,29 @@ object Transpiler {
       .filterNot(l => l.trim.matches("""import\s+\w*Proofs\..*"""))
       .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
 
+  // --- R1d: redirect verify-side SHADOW imports to their production counterparts ---
+  // Two verify shadows are swapped for the real production APIs (literal replace, so
+  // any comment text mentioning them follows along harmlessly):
+  //   io.linewise.verify.effect.SafeArith -> io.linewise.jobfm.SafeArith
+  //     the Tier-2 safeAdd: the verify body computes in BigInt; production uses the
+  //     trusted-equivalent Math.addExact (see src/.../SafeArith.scala).
+  //   io.linewise.verify.ox               -> ox
+  //     the structured-concurrency shadow (verify/stainless-lib/Ox.scala): under
+  //     verification it gives a pure, eager, source-order semantics Stainless can
+  //     reason about; production runs real Ox `fork`/`join`. The call sites are
+  //     name-for-name, so only the import is swapped.
+  // Run BEFORE R1b so R1b does not drop these as generic verify imports.
+  def ruleR1d_redirectShadowImports(s: String): String =
+    s.replace("io.linewise.verify.effect.SafeArith", "io.linewise.jobfm.SafeArith")
+     .replace("io.linewise.verify.ox", "ox")
+
   // --- R2: rewrite the package declaration ---------------------------------
-  def ruleR2_rewritePackage(s: String): String =
+  // The target package is a parameter so the SAME transpiler serves both the job
+  // system (io.linewise.jobfm.generated) and the ledger (io.linewise.ledgerfm.generated).
+  def ruleR2_rewritePackage(s: String, targetPkg: String): String =
     s.replaceFirst(
       """(?m)^package\s+[\w\.]+""",
-      "package io.linewise.jobfm.generated"
+      s"package $targetPkg"
     )
 
   // --- R3: TWO-TIER OVERFLOW ERASURE — FMInt/FMLong -> native Int/Long ------
@@ -254,6 +277,15 @@ object Transpiler {
   def ruleR5b_dropAssert(s: String): String =
     s.linesIterator
       .filterNot(l => l.trim.matches("""assert\(.*\)\s*"""))
+      .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
+
+  // --- R5c: drop `decreases(...)` termination metadata ---------------------
+  // `decreases` is Stainless-only termination evidence (e.g. on the ledger's
+  // sumSafe fold). Like require/assert it is proof-only; drop any line that is a
+  // bare `decreases(...)` call so it does not leak into the generated core.
+  def ruleR5c_dropDecreases(s: String): String =
+    s.linesIterator
+      .filterNot(l => l.trim.matches("""decreases\(.*\)\s*"""))
       .mkString("\n") + (if s.endsWith("\n") then "\n" else "")
 
   // --- R6: drop a trailing `.ensuring(...)` postcondition ------------------
