@@ -59,6 +59,19 @@ object `package` extends SbtModule {
     moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "ledgerfm" / "verify" / "LedgerCore.scala"
   )
 
+  // The scala-pet-store translation's verified executable cores (entities/DTOs +
+  // per-domain repository+service). Target package io.linewise.petstore.generated;
+  // the proofs (Pet/Order/User Proofs) are verify-only and never transpiled.
+  def petstoreVerifiedSources: T[Seq[PathRef]] =
+    val base = moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "petstore" / "verify"
+    // the DTO model + the three layers per domain (Repository / Validation / Service)
+    Task.Sources(
+      base / "PetStoreModel.scala",
+      base / "PetRepository.scala", base / "PetValidation.scala", base / "PetService.scala",
+      base / "OrderRepository.scala", base / "OrderService.scala",
+      base / "UserRepository.scala", base / "UserValidation.scala", base / "UserService.scala",
+    )
+
   /** Run the transpiler over each verified executable core and emit the
     * production code into a generated-sources directory, one package per module.
     * Registered in `generatedSources` below, so `./mill compile` regenerates
@@ -95,6 +108,7 @@ object `package` extends SbtModule {
 
     genInto(verifiedSources(), "io.linewise.jobfm.generated")
     genInto(ledgerVerifiedSources(), "io.linewise.ledgerfm.generated")
+    genInto(petstoreVerifiedSources(), "io.linewise.petstore.generated")
     PathRef(genRoot)
   }
 
