@@ -6,45 +6,35 @@ import io.linewise.verify.effect.{FMInt, FMLong}
 import PetStoreModel._
 
 /* =============================================================================
- * PET — THE REPOSITORY LAYER (PetRepositoryAlgebra, realized purely).
- *
- * The data-access algebra: the in-memory store `PetTable` and its total ops
- * (create/get/update/delete/findByNameAndCategory/list/findByStatus/findByTag).
- * NO validation, NO service composition — that is PetService's job. The id source
- * (DB BIGSERIAL / in-memory AtomicLong) is the trusted `freshId` parameter.
+ * PET — THE REPOSITORY LAYER as a VALUE with methods (PetRepositoryAlgebra). A
+ * World holds a `PetRepository` value; a service reaches it through a Has lens and
+ * rewrites it with `repo.save(pet)` etc. Pure data access, no validation.
  * Transpile-clean; transpiler input.
  * ========================================================================== */
-object PetRepository {
+case class PetRepository(rows: List[Pet]) {
 
-  case class PetTable(rows: List[Pet])
+  // save inserts a fully-formed pet (its id already assigned by the service from
+  // the trusted BIGSERIAL sequence). `hasPets(w).write(_.save(saved))`.
+  def save(pet: Pet): PetRepository = PetRepository(pet :: rows)
 
-  def create(t: PetTable, pet: Pet, freshId: FMLong): (PetTable, Pet) = {
-    val saved = pet.copy(id = Some[FMLong](freshId))
-    (PetTable(saved :: t.rows), saved)
-  }
+  def get(id: FMLong): Option[Pet] =
+    rows.find((p: Pet) => p.id == Some[FMLong](id))
 
-  def get(t: PetTable, id: FMLong): Option[Pet] =
-    t.rows.find((p: Pet) => p.id == Some[FMLong](id))
+  def update(pet: Pet): PetRepository =
+    PetRepository(rows.map((p: Pet) => if p.id == pet.id then pet else p))
 
-  def update(t: PetTable, pet: Pet): (PetTable, Option[Pet]) =
-    t.rows.find((p: Pet) => p.id == pet.id) match
-      case Some(_) =>
-        (PetTable(t.rows.map((p: Pet) => if p.id == pet.id then pet else p)), Some[Pet](pet))
-      case _ => (t, None[Pet]())
+  def delete(id: FMLong): PetRepository =
+    PetRepository(rows.filter((p: Pet) => p.id != Some[FMLong](id)))
 
-  def delete(t: PetTable, id: FMLong): (PetTable, Option[Pet]) =
-    (PetTable(t.rows.filter((p: Pet) => p.id != Some[FMLong](id))),
-     t.rows.find((p: Pet) => p.id == Some[FMLong](id)))
+  def findByNameAndCategory(name: String, category: String): List[Pet] =
+    rows.filter((p: Pet) => p.name == name && p.category == category)
 
-  def findByNameAndCategory(t: PetTable, name: String, category: String): List[Pet] =
-    t.rows.filter((p: Pet) => p.name == name && p.category == category)
+  def list(pageSize: FMInt, offset: FMInt): List[Pet] =
+    rows.drop(offset.value).take(pageSize.value)
 
-  def list(t: PetTable, pageSize: FMInt, offset: FMInt): List[Pet] =
-    t.rows.drop(offset.value).take(pageSize.value)
+  def findByStatus(statuses: List[PetStatus]): List[Pet] =
+    rows.filter((p: Pet) => statuses.contains(p.status))
 
-  def findByStatus(t: PetTable, statuses: List[PetStatus]): List[Pet] =
-    t.rows.filter((p: Pet) => statuses.contains(p.status))
-
-  def findByTag(t: PetTable, tags: List[String]): List[Pet] =
-    t.rows.filter((p: Pet) => tags.exists((tag: String) => p.tags.contains(tag)))
+  def findByTag(tags: List[String]): List[Pet] =
+    rows.filter((p: Pet) => tags.exists((tag: String) => p.tags.contains(tag)))
 }

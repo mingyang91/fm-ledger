@@ -4,22 +4,21 @@ import stainless.lang._
 import stainless.collection._
 import io.linewise.verify.effect.FMLong
 import PetStoreModel._
-import UserRepository.UserTable
 
 /* =============================================================================
- * USER — THE VALIDATION LAYER (UserValidationInterpreter, realized purely).
- * doesNotExist: no user already has this userName. Transpile-clean.
+ * USER — THE VALIDATION LAYER (UserValidationInterpreter). Pure predicates over a
+ * UserRepository value. Transpile-clean.
  * ========================================================================== */
 object UserValidation {
 
-  def doesNotExist(t: UserTable, user: User): Boolean =
-    UserRepository.findByUserName(t, user.userName).isEmpty
+  def doesNotExist(repo: UserRepository, user: User): Boolean =
+    repo.findByUserName(user.userName).isEmpty
 
-  def exists(t: UserTable, id: FMLong): Boolean =
-    UserRepository.get(t, id).isDefined
+  def exists(repo: UserRepository, id: FMLong): Boolean =
+    repo.get(id).isDefined
 
-  def existsOpt(t: UserTable, userId: Option[FMLong]): Boolean =
+  def existsOpt(repo: UserRepository, userId: Option[FMLong]): Boolean =
     userId match
-      case Some(id) => exists(t, id)
+      case Some(id) => exists(repo, id)
       case _        => false
 }

@@ -64,9 +64,11 @@ object `package` extends SbtModule {
   // the proofs (Pet/Order/User Proofs) are verify-only and never transpiled.
   def petstoreVerifiedSources: T[Seq[PathRef]] =
     val base = moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "petstore" / "verify"
-    // the DTO model + the three layers per domain (Repository / Validation / Service)
+    // the DTO model + the Has lens + the World + the three layers per domain
+    // (Repository value / Validation / [W]-polymorphic Service). The *Proofs are
+    // verify-only and never transpiled.
     Task.Sources(
-      base / "PetStoreModel.scala",
+      base / "PetStoreModel.scala", base / "Has.scala", base / "World.scala",
       base / "PetRepository.scala", base / "PetValidation.scala", base / "PetService.scala",
       base / "OrderRepository.scala", base / "OrderService.scala",
       base / "UserRepository.scala", base / "UserValidation.scala", base / "UserService.scala",

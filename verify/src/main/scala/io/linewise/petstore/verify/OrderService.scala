@@ -4,23 +4,25 @@ import stainless.lang._
 import stainless.collection._
 import io.linewise.verify.effect.FMLong
 import PetStoreModel._
-import OrderRepository.OrderTable
 
 /* =============================================================================
- * ORDER — THE SERVICE LAYER (OrderService). The original has no validation here:
- * placeOrder delegates straight to the repository; get -> Either; delete is
- * idempotent. Transpile-clean; transpiler input.
+ * ORDER — THE SERVICE LAYER, polymorphic in W via a Has lens (no validation, as
+ * in the original). placeOrder writes through the lens; get reads; delete is
+ * idempotent. Transpile-clean.
  * ========================================================================== */
-object OrderService {
+case class OrderService[W](has: Has[W, OrderRepository]) {
 
-  def placeOrder(t: OrderTable, order: Order, freshId: FMLong): (OrderTable, Order) =
-    OrderRepository.create(t, order, freshId)
+  def placeOrder(w: W, order: Order, freshId: FMLong): (W, Order) = {
+    val saved = order.copy(id = Some[FMLong](freshId))
+    val w1 = has(w).write((r: OrderRepository) => r.save(saved))
+    (w1, saved)
+  }
 
-  def get(t: OrderTable, id: FMLong): Either[ValidationError, Order] =
-    OrderRepository.get(t, id) match
+  def get(w: W, id: FMLong): Either[ValidationError, Order] =
+    has.get(w).get(id) match
       case Some(o) => Right[ValidationError, Order](o)
       case _       => Left[ValidationError, Order](OrderNotFoundError)
 
-  def delete(t: OrderTable, id: FMLong): OrderTable =
-    OrderRepository.delete(t, id)._1
+  def delete(w: W, id: FMLong): W =
+    has(w).write((r: OrderRepository) => r.delete(id))
 }

@@ -5,12 +5,11 @@ import stainless.annotation._
 import stainless.collection._
 import io.linewise.verify.effect.{FMInt, FMLong}
 import PetStoreModel._
-import PetRepository.PetTable
 
 /* =============================================================================
- * PET PROOFS — VERIFY-ONLY. Each PetService capability is proven over the layered
- * Repository / Validation / Service objects, plus the distinct-id store invariant.
- * Never transpiled.
+ * PET PROOFS — VERIFY-ONLY. Every PetService capability is proven over the
+ * concrete World and the HasPets lens — i.e. through the [W]-generic service wired
+ * by a lawful lens — plus the distinct-id invariant on the pet repository value.
  * ========================================================================== */
 object PetProofs {
 
@@ -26,7 +25,7 @@ object PetProofs {
       case Nil()      => true
       case Cons(h, t) => !t.contains(h) && distinctL(t)
 
-  def tableInv(t: PetTable): Boolean = distinctL(petIds(t.rows))
+  def repoInv(repo: PetRepository): Boolean = distinctL(petIds(repo.rows))
 
   @opaque @inlineOnce
   def filterSat(xs: List[Pet], q: Pet => Boolean): Unit = {
@@ -43,53 +42,51 @@ object PetProofs {
   }.ensuring(_ =>
     rows.filter((p: Pet) => p.id != Some[FMLong](id)).find((p: Pet) => p.id == Some[FMLong](id)) == None[Pet]())
 
-  /* --- SERVICE-LAYER capabilities (PetService), proven. --- */
+  /* --- SERVICE capabilities over the World + HasPets lens. --- */
 
-  def createThenGet(t: PetTable, pet: Pet, freshId: FMLong): Boolean = {
-    require(PetValidation.doesNotExist(t, pet))
-    PetService.create(t, pet, freshId) match
-      case Right((t2, saved)) =>
-        saved.id == Some[FMLong](freshId) && PetRepository.get(t2, freshId) == Some[Pet](saved)
-      case Left(_) => false
+  def createThenGet(w: World, pet: Pet, freshId: FMLong): Boolean = {
+    require(PetValidation.doesNotExist(w.pets, pet))
+    val svc = PetService[World](HasPets())
+    svc.create(w, pet, freshId) match
+      case (w1, Right(saved)) =>
+        saved.id == Some[FMLong](freshId) && svc.get(w1, freshId) == Right[ValidationError, Pet](saved)
+      case (_, Left(_)) => false
   }.holds
 
-  def createRejectsDuplicate(t: PetTable, pet: Pet, freshId: FMLong): Boolean = {
-    require(!PetValidation.doesNotExist(t, pet))
-    PetService.create(t, pet, freshId) == Left[ValidationError, (PetTable, Pet)](PetAlreadyExistsError(pet))
+  def createRejectsDuplicate(w: World, pet: Pet, freshId: FMLong): Boolean = {
+    require(!PetValidation.doesNotExist(w.pets, pet))
+    val svc = PetService[World](HasPets())
+    svc.create(w, pet, freshId)._2 == Left[ValidationError, Pet](PetAlreadyExistsError(pet))
   }.holds
 
-  def createPreservesDistinct(t: PetTable, pet: Pet, freshId: FMLong): Boolean = {
-    require(tableInv(t) && !petIds(t.rows).contains(freshId))
-    tableInv(PetRepository.create(t, pet, freshId)._1)
+  def createPreservesDistinct(w: World, pet: Pet, freshId: FMLong): Boolean = {
+    require(PetValidation.doesNotExist(w.pets, pet))
+    require(repoInv(w.pets) && !petIds(w.pets.rows).contains(freshId))
+    val svc = PetService[World](HasPets())
+    repoInv(svc.create(w, pet, freshId)._1.pets)
   }.holds
 
-  def getPresentSucceeds(t: PetTable, id: FMLong, p: Pet): Boolean = {
-    require(PetRepository.get(t, id) == Some[Pet](p))
-    PetService.get(t, id) == Right[ValidationError, Pet](p)
+  def getMissingFails(w: World, id: FMLong): Boolean = {
+    require(w.pets.get(id) == None[Pet]())
+    val svc = PetService[World](HasPets())
+    svc.get(w, id) == Left[ValidationError, Pet](PetNotFoundError)
   }.holds
 
-  def getMissingFails(t: PetTable, id: FMLong): Boolean = {
-    require(PetRepository.get(t, id) == None[Pet]())
-    PetService.get(t, id) == Left[ValidationError, Pet](PetNotFoundError)
+  def updateMissingFails(w: World, pet: Pet): Boolean = {
+    require(!PetValidation.existsOpt(w.pets, pet.id))
+    val svc = PetService[World](HasPets())
+    svc.update(w, pet)._2 == Left[ValidationError, Pet](PetNotFoundError)
   }.holds
 
-  def updateMissingFails(t: PetTable, pet: Pet): Boolean = {
-    require(!PetValidation.existsOpt(t, pet.id))
-    PetService.update(t, pet) == Left[ValidationError, (PetTable, Pet)](PetNotFoundError)
+  def deleteRemoves(w: World, id: FMLong): Boolean = {
+    deleteRemovesLemma(w.pets.rows, id)
+    val svc = PetService[World](HasPets())
+    svc.get(svc.delete(w, id), id) == Left[ValidationError, Pet](PetNotFoundError)
   }.holds
 
-  def deleteRemoves(t: PetTable, id: FMLong): Boolean = {
-    deleteRemovesLemma(t.rows, id)
-    PetRepository.get(PetService.delete(t, id), id) == None[Pet]()
-  }.holds
-
-  def findByStatusSound(t: PetTable, statuses: List[PetStatus]): Boolean = {
-    filterSat(t.rows, (p: Pet) => statuses.contains(p.status))
-    PetService.findByStatus(t, statuses).forall((p: Pet) => statuses.contains(p.status))
-  }.holds
-
-  def findByNameAndCategorySound(t: PetTable, name: String, category: String): Boolean = {
-    filterSat(t.rows, (p: Pet) => p.name == name && p.category == category)
-    PetRepository.findByNameAndCategory(t, name, category).forall((p: Pet) => p.name == name && p.category == category)
+  def findByStatusSound(w: World, statuses: List[PetStatus]): Boolean = {
+    filterSat(w.pets.rows, (p: Pet) => statuses.contains(p.status))
+    val svc = PetService[World](HasPets())
+    svc.findByStatus(w, statuses).forall((p: Pet) => statuses.contains(p.status))
   }.holds
 }

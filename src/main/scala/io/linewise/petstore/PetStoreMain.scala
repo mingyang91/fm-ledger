@@ -1,63 +1,65 @@
 package io.linewise.petstore
 
 import io.linewise.petstore.generated.PetStoreModel.*
+import io.linewise.petstore.generated.{World, HasPets, HasOrders, HasUsers}
+import io.linewise.petstore.generated.{PetRepository, OrderRepository, UserRepository}
+import io.linewise.petstore.generated.{PetService, OrderService, UserService}
 
 /* =============================================================================
- * PET-STORE DEMO — the translated scala-pet-store driven end-to-end with NO
- * cats-effect and NO http4s. The SERVICE layer (PetService/OrderService/
- * UserService) composes the verified validation over plain-JDBC repositories on
- * the isomorphic tables. Exercises every service capability.
+ * PET-STORE DEMO — the World + Has-lens design, driven end-to-end with NO
+ * cats-effect and NO http4s. Each service is polymorphic in the world W and wired
+ * by a lens; here W is the in-memory `World` value, threaded through the calls.
+ * Every PetService/OrderService/UserService capability is exercised.
  *
  * Run: ./mill runMain io.linewise.petstore.PetStoreMain
  * ========================================================================== */
 object PetStoreMain:
   def main(args: Array[String]): Unit =
-    val conn    = Jdbc.h2("petstore_demo")
-    val petRepo = JdbcPetRepository(conn); petRepo.initSchema()
-    val pets    = PetService(petRepo)
-    val users   = UserService(JdbcUserRepository(conn))
-    val orders  = OrderService(JdbcOrderRepository(conn))
+    var w: World = World(PetRepository(Nil), OrderRepository(Nil), UserRepository(Nil))
+    val users  = UserService[World](HasUsers())
+    val pets   = PetService[World](HasPets())
+    val orders = OrderService[World](HasOrders())
+
+    var nextId = 1L
+    def fresh(): Long = { val id = nextId; nextId += 1; id }
 
     def line(s: String): Unit = println(s)
     def rule(): Unit = println("-" * 78)
 
     line("=" * 78)
-    line("SCALA-PET-STORE, TRANSLATED TO STAINLESS  (no cats-effect, no http4s)")
-    line("  Service layer (PetService/OrderService/UserService) -> verified validation")
-    line("  -> Repository layer (in-memory verified core | plain-JDBC isomorphic tables)")
+    line("SCALA-PET-STORE — WORLD + Has-lens design  (no cats-effect, no http4s)")
+    line("  service[W](has: Has[W,Repo]) reads has.get(w), writes has(w).write(_.save(..))")
+    line("  W = the in-memory World value, threaded through the calls")
     line("=" * 78)
-    line("DDL: created PET, USERS, ORDERS, JWT (the post-migration schema, verbatim).")
+
+    val (w1, ra) = users.createUser(w, User("alice", "Alice", "Smith", "a@x", "h1", "555", None, Customer), fresh()); w = w1
+    val (w2, rb) = users.createUser(w, User("bob", "Bob", "Stone", "b@x", "h2", "666", None, Admin), fresh()); w = w2
+    val (w3, rd) = users.createUser(w, User("alice", "Al", "S", "a2@x", "h", "0", None, Customer), fresh()); w = w3
+    line(s"UserService:  createUser(alice)=${shortU(ra)}  createUser(bob)=${shortU(rb)}")
+    line(s"              createUser(alice again) -> ${shortU(rd)}  (validation)")
+    line(s"              getUserByName(bob)=${shortU(users.getUserByName(w, "bob"))}  list=${users.list(w, 10, 0).length}")
     rule()
 
-    val alice = users.createUser(User("alice", "Alice", "Smith", "alice@x", "hash1", "555", None, Customer))
-    val bob   = users.createUser(User("bob", "Bob", "Stone", "bob@x", "hash2", "666", None, Admin))
-    val dupU  = users.createUser(User("alice", "Al", "S", "a2@x", "h", "0", None, Customer))
-    line(s"UserService:  createUser(alice)=${shortU(alice)}  createUser(bob)=${shortU(bob)}")
-    line(s"              createUser(alice again) -> ${shortU(dupU)}  (validation)")
-    line(s"              getUserByName(bob)=${shortU(users.getUserByName("bob"))}  list=${users.list(10, 0).length}")
+    val (w4, rp) = pets.create(w, Pet("Rex", "Dog", "good boy", Available, List("friendly"), List("u1"), None), fresh()); w = w4
+    val (w5, rc) = pets.create(w, Pet("Whiskers", "Cat", "aloof", Pending, List("indoor"), Nil, None), fresh()); w = w5
+    val (w6, rdp) = pets.create(w, Pet("Rex", "Dog", "good boy", Adopted, Nil, Nil, None), fresh()); w = w6
+    line(s"PetService:   create(Rex)=${shortP(rp)}  create(Whiskers)=${shortP(rc)}")
+    line(s"              create(Rex again) -> ${shortP(rdp)}  (validation)")
+    line(s"              findByStatus([Available])=${pets.findByStatus(w, List(Available)).map(_.name).mkString(",")}")
+    line(s"              findByTag([indoor])=${pets.findByTag(w, List("indoor")).map(_.name).mkString(",")}")
     rule()
 
-    val rex  = pets.create(Pet("Rex", "Dog", "good boy", Available, List("friendly", "trained"), List("u1"), None))
-    val cat  = pets.create(Pet("Whiskers", "Cat", "aloof", Pending, List("indoor"), Nil, None))
-    val dupP = pets.create(Pet("Rex", "Dog", "good boy", Adopted, Nil, Nil, None))
-    line(s"PetService:   create(Rex)=${shortP(rex)}  create(Whiskers)=${shortP(cat)}")
-    line(s"              create(Rex again) -> ${shortP(dupP)}  (validation)")
-    line(s"              findByStatus([Available])=${pets.findByStatus(List(Available)).map(_.name).mkString(",")}")
-    line(s"              findByTag([indoor])=${pets.findByTag(List("indoor")).map(_.name).mkString(",")}")
+    val (w7, order) = orders.placeOrder(w, Order(4L, Some(1700000000000L), Placed, false, None, Some(1L)), fresh()); w = w7
+    line(s"OrderService: placeOrder(pet=4, user=1)=${shortO(order)}")
+    line(s"              get(${order.id.getOrElse(0L)})=${shortOE(orders.get(w, order.id.getOrElse(0L)))}  get(99)=${orders.get(w, 99L)}")
+    val w8 = orders.delete(w, order.id.getOrElse(0L)); w = w8
+    line(s"              after delete: get=${orders.get(w, order.id.getOrElse(0L))}")
     rule()
 
-    val order = orders.placeOrder(Order(1L, Some(1700000000000L), Placed, false, None, Some(1L)))
-    line(s"OrderService: placeOrder(pet=1, user=1)=${shortO(order)}")
-    line(s"              get(1)=${shortOE(orders.get(1L))}  get(99)=${orders.get(99L)}")
-    orders.delete(1L)
-    line(s"              after delete(1): get(1)=${orders.get(1L)}")
-    rule()
-
-    val ok =
-      alice.isRight && bob.isRight && dupU.isLeft &&
-      rex.isRight && dupP.isLeft && order.id == Some(1L) && orders.get(1L) == Left(OrderNotFoundError)
-    line(s"RESULT: every PetService/OrderService/UserService capability ran on the")
-    line(s"        isomorphic tables with no cats-effect/http4s -> ${if ok then "OK" else "WRONG"}")
+    val ok = ra.isRight && rb.isRight && rd.isLeft && rp.isRight && rdp.isLeft &&
+      orders.get(w, order.id.getOrElse(0L)) == Left(OrderNotFoundError)
+    line(s"RESULT: every service capability ran by threading the World through lenses,")
+    line(s"        no cats-effect/http4s -> ${if ok then "OK" else "WRONG"}")
 
   private def shortP(e: Either[ValidationError, Pet]): String = e match
     case Right(p) => s"Pet#${p.id.getOrElse(0L)}(${p.name})"

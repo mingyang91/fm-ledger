@@ -4,45 +4,49 @@ import stainless.lang._
 import stainless.collection._
 import io.linewise.verify.effect.{FMInt, FMLong}
 import PetStoreModel._
-import UserRepository.UserTable
 
 /* =============================================================================
- * USER — THE SERVICE LAYER (UserService). Composes validation + repository, method
- * names mirroring the original (createUser/getUser/getUserByName/update/deleteUser/
- * deleteByUserName/list). EitherT/OptionT flatten to pure Either/Option — no
- * cats-effect. The id source is the trusted `freshId` parameter. Transpile-clean.
+ * USER — THE SERVICE LAYER, polymorphic in W via a Has lens. Composes validation
+ * with the repository reached through the lens. Write ops return (W, result);
+ * reads return the result. Transpile-clean.
  * ========================================================================== */
-object UserService {
+case class UserService[W](has: Has[W, UserRepository]) {
 
-  def createUser(t: UserTable, user: User, freshId: FMLong): Either[ValidationError, (UserTable, User)] =
-    if UserValidation.doesNotExist(t, user) then
-      Right[ValidationError, (UserTable, User)](UserRepository.create(t, user, freshId))
+  def createUser(w: W, user: User, freshId: FMLong): (W, Either[ValidationError, User]) = {
+    val repo = has.get(w)
+    if UserValidation.doesNotExist(repo, user) then
+      val saved = user.copy(id = Some[FMLong](freshId))
+      val w1 = has(w).write((r: UserRepository) => r.save(saved))
+      (w1, Right[ValidationError, User](saved))
     else
-      Left[ValidationError, (UserTable, User)](UserAlreadyExistsError(user))
+      (w, Left[ValidationError, User](UserAlreadyExistsError(user)))
+  }
 
-  def getUser(t: UserTable, id: FMLong): Either[ValidationError, User] =
-    UserRepository.get(t, id) match
+  def getUser(w: W, id: FMLong): Either[ValidationError, User] =
+    has.get(w).get(id) match
       case Some(u) => Right[ValidationError, User](u)
       case _       => Left[ValidationError, User](UserNotFoundError)
 
-  def getUserByName(t: UserTable, userName: String): Either[ValidationError, User] =
-    UserRepository.findByUserName(t, userName) match
+  def getUserByName(w: W, userName: String): Either[ValidationError, User] =
+    has.get(w).findByUserName(userName) match
       case Some(u) => Right[ValidationError, User](u)
       case _       => Left[ValidationError, User](UserNotFoundError)
 
-  def update(t: UserTable, user: User): Either[ValidationError, (UserTable, User)] =
-    if UserValidation.existsOpt(t, user.id) then
-      UserRepository.update(t, user) match
-        case (t2, Some(u)) => Right[ValidationError, (UserTable, User)]((t2, u))
-        case _             => Left[ValidationError, (UserTable, User)](UserNotFoundError)
-    else Left[ValidationError, (UserTable, User)](UserNotFoundError)
+  def update(w: W, user: User): (W, Either[ValidationError, User]) = {
+    val repo = has.get(w)
+    if UserValidation.existsOpt(repo, user.id) then
+      val w1 = has(w).write((r: UserRepository) => r.update(user))
+      (w1, Right[ValidationError, User](user))
+    else
+      (w, Left[ValidationError, User](UserNotFoundError))
+  }
 
-  def deleteUser(t: UserTable, id: FMLong): UserTable =
-    UserRepository.delete(t, id)._1
+  def deleteUser(w: W, id: FMLong): W =
+    has(w).write((r: UserRepository) => r.delete(id))
 
-  def deleteByUserName(t: UserTable, userName: String): UserTable =
-    UserRepository.deleteByUserName(t, userName)._1
+  def deleteByUserName(w: W, userName: String): W =
+    has(w).write((r: UserRepository) => r.deleteByUserName(userName))
 
-  def list(t: UserTable, pageSize: FMInt, offset: FMInt): List[User] =
-    UserRepository.list(t, pageSize, offset)
+  def list(w: W, pageSize: FMInt, offset: FMInt): List[User] =
+    has.get(w).list(pageSize, offset)
 }

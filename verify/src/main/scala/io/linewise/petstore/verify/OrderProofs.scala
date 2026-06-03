@@ -5,11 +5,10 @@ import stainless.annotation._
 import stainless.collection._
 import io.linewise.verify.effect.FMLong
 import PetStoreModel._
-import OrderRepository.OrderTable
 
 /* =============================================================================
- * ORDER PROOFS — VERIFY-ONLY. Every OrderService capability proven over the
- * Repository / Service layers, plus the distinct-id store invariant.
+ * ORDER PROOFS — VERIFY-ONLY. Every OrderService capability proven over the World
+ * + HasOrders lens, plus the distinct-id invariant.
  * ========================================================================== */
 object OrderProofs {
 
@@ -25,7 +24,7 @@ object OrderProofs {
       case Nil()      => true
       case Cons(h, t) => !t.contains(h) && distinctL(t)
 
-  def tableInv(t: OrderTable): Boolean = distinctL(orderIds(t.rows))
+  def repoInv(repo: OrderRepository): Boolean = distinctL(orderIds(repo.rows))
 
   @opaque @inlineOnce
   def deleteRemovesLemma(rows: List[Order], id: FMLong): Unit = {
@@ -35,28 +34,27 @@ object OrderProofs {
   }.ensuring(_ =>
     rows.filter((o: Order) => o.id != Some[FMLong](id)).find((o: Order) => o.id == Some[FMLong](id)) == None[Order]())
 
-  def placeThenGet(t: OrderTable, order: Order, freshId: FMLong): Boolean = {
-    val (t2, saved) = OrderService.placeOrder(t, order, freshId)
-    saved.id == Some[FMLong](freshId) && OrderRepository.get(t2, freshId) == Some[Order](saved)
+  def placeThenGet(w: World, order: Order, freshId: FMLong): Boolean = {
+    val svc = OrderService[World](HasOrders())
+    val (w1, saved) = svc.placeOrder(w, order, freshId)
+    saved.id == Some[FMLong](freshId) && svc.get(w1, freshId) == Right[ValidationError, Order](saved)
   }.holds
 
-  def getMissingFails(t: OrderTable, id: FMLong): Boolean = {
-    require(OrderRepository.get(t, id) == None[Order]())
-    OrderService.get(t, id) == Left[ValidationError, Order](OrderNotFoundError)
+  def getMissingFails(w: World, id: FMLong): Boolean = {
+    require(w.orders.get(id) == None[Order]())
+    val svc = OrderService[World](HasOrders())
+    svc.get(w, id) == Left[ValidationError, Order](OrderNotFoundError)
   }.holds
 
-  def getPresentSucceeds(t: OrderTable, id: FMLong, o: Order): Boolean = {
-    require(OrderRepository.get(t, id) == Some[Order](o))
-    OrderService.get(t, id) == Right[ValidationError, Order](o)
+  def deleteRemoves(w: World, id: FMLong): Boolean = {
+    deleteRemovesLemma(w.orders.rows, id)
+    val svc = OrderService[World](HasOrders())
+    svc.get(svc.delete(w, id), id) == Left[ValidationError, Order](OrderNotFoundError)
   }.holds
 
-  def deleteRemoves(t: OrderTable, id: FMLong): Boolean = {
-    deleteRemovesLemma(t.rows, id)
-    OrderRepository.get(OrderService.delete(t, id), id) == None[Order]()
-  }.holds
-
-  def placePreservesDistinct(t: OrderTable, order: Order, freshId: FMLong): Boolean = {
-    require(tableInv(t) && !orderIds(t.rows).contains(freshId))
-    tableInv(OrderService.placeOrder(t, order, freshId)._1)
+  def placePreservesDistinct(w: World, order: Order, freshId: FMLong): Boolean = {
+    require(repoInv(w.orders) && !orderIds(w.orders.rows).contains(freshId))
+    val svc = OrderService[World](HasOrders())
+    repoInv(svc.placeOrder(w, order, freshId)._1.orders)
   }.holds
 }

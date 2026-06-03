@@ -4,49 +4,51 @@ import stainless.lang._
 import stainless.collection._
 import io.linewise.verify.effect.{FMInt, FMLong}
 import PetStoreModel._
-import PetRepository.PetTable
 
 /* =============================================================================
- * PET — THE SERVICE LAYER (PetService). The domain entry point: it COMPOSES the
- * validation and the repository, exactly as the original PetService does. Method
- * names mirror the original (create/update/get/delete/list/findByStatus/findByTag).
- * `EitherT[F, E, A]` becomes pure `Either[ValidationError, (PetTable, A)]` — no
- * cats-effect. The id source is the trusted `freshId` parameter. Transpile-clean.
+ * PET — THE SERVICE LAYER, polymorphic in the world W and wired by a Has lens.
+ * It composes the validation with the repository it reaches THROUGH the lens:
+ *   - reads:  has.get(w)
+ *   - writes: has(w).write(repo => repo.save(...))  -> a new world
+ * Write ops return (W, result); read ops return the result. No cats-effect; the
+ * id source is the trusted `freshId`. Transpile-clean; transpiler input.
  * ========================================================================== */
-object PetService {
+case class PetService[W](has: Has[W, PetRepository]) {
 
-  // create = validate doesNotExist, then repository.create.
-  def create(t: PetTable, pet: Pet, freshId: FMLong): Either[ValidationError, (PetTable, Pet)] =
-    if PetValidation.doesNotExist(t, pet) then
-      Right[ValidationError, (PetTable, Pet)](PetRepository.create(t, pet, freshId))
+  def create(w: W, pet: Pet, freshId: FMLong): (W, Either[ValidationError, Pet]) = {
+    val repo = has.get(w)
+    if PetValidation.doesNotExist(repo, pet) then
+      val saved = pet.copy(id = Some[FMLong](freshId))
+      val w1 = has(w).write((r: PetRepository) => r.save(saved))
+      (w1, Right[ValidationError, Pet](saved))
     else
-      Left[ValidationError, (PetTable, Pet)](PetAlreadyExistsError(pet))
+      (w, Left[ValidationError, Pet](PetAlreadyExistsError(pet)))
+  }
 
-  // update = validate exists, then repository.update (PetNotFoundError otherwise).
-  def update(t: PetTable, pet: Pet): Either[ValidationError, (PetTable, Pet)] =
-    if PetValidation.existsOpt(t, pet.id) then
-      PetRepository.update(t, pet) match
-        case (t2, Some(p)) => Right[ValidationError, (PetTable, Pet)]((t2, p))
-        case _             => Left[ValidationError, (PetTable, Pet)](PetNotFoundError)
-    else Left[ValidationError, (PetTable, Pet)](PetNotFoundError)
+  def update(w: W, pet: Pet): (W, Either[ValidationError, Pet]) = {
+    val repo = has.get(w)
+    if PetValidation.existsOpt(repo, pet.id) then
+      val w1 = has(w).write((r: PetRepository) => r.update(pet))
+      (w1, Right[ValidationError, Pet](pet))
+    else
+      (w, Left[ValidationError, Pet](PetNotFoundError))
+  }
 
-  def get(t: PetTable, id: FMLong): Either[ValidationError, Pet] =
-    PetRepository.get(t, id) match
+  def get(w: W, id: FMLong): Either[ValidationError, Pet] =
+    has.get(w).get(id) match
       case Some(p) => Right[ValidationError, Pet](p)
       case _       => Left[ValidationError, Pet](PetNotFoundError)
 
-  // delete is idempotent; the original PetService.delete returns Unit -> we yield
-  // the post-state table.
-  def delete(t: PetTable, id: FMLong): PetTable =
-    PetRepository.delete(t, id)._1
+  // delete is idempotent; returns the new world (PetService.delete is Unit-y).
+  def delete(w: W, id: FMLong): W =
+    has(w).write((r: PetRepository) => r.delete(id))
 
-  // list / findByStatus / findByTag delegate to the repository (no validation).
-  def list(t: PetTable, pageSize: FMInt, offset: FMInt): List[Pet] =
-    PetRepository.list(t, pageSize, offset)
+  def list(w: W, pageSize: FMInt, offset: FMInt): List[Pet] =
+    has.get(w).list(pageSize, offset)
 
-  def findByStatus(t: PetTable, statuses: List[PetStatus]): List[Pet] =
-    PetRepository.findByStatus(t, statuses)
+  def findByStatus(w: W, statuses: List[PetStatus]): List[Pet] =
+    has.get(w).findByStatus(statuses)
 
-  def findByTag(t: PetTable, tags: List[String]): List[Pet] =
-    PetRepository.findByTag(t, tags)
+  def findByTag(w: W, tags: List[String]): List[Pet] =
+    has.get(w).findByTag(tags)
 }
