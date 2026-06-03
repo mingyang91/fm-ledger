@@ -63,11 +63,15 @@ object JdbcRepositoryPattern {
   @extern @pure def fmFromLong(l: Long): FMLong = FMLong(BigInt(l.toString))
   @extern @pure def longOfFM(f: FMLong): Long = f.value.toLong
 
-  case class JdbcRepo(conn: Conn, @ghost ghostRows: List[Item]) extends Repo {
-    @ghost def rows: List[Item] = ghostRows
+  // JdbcRepo holds ONLY the connection — NO ghost constructor param (which would
+  // survive transpilation as a real field and re-materialize the list). `rows` is a
+  // ghost stub: the DB is the true state, and the contract is algebraic (it never
+  // reads `rows`), so this placeholder is erased in production by the transpiler.
+  case class JdbcRepo(conn: Conn) extends Repo {
+    @ghost def rows: List[Item] = Nil[Item]()
 
     // REAL per-op SELECT — binds id, extracts the row via the shim. (havoc'd by
-    // @extern; kept by the transpiler as the production read; @ghost rows erased.)
+    // @extern; kept by the transpiler as the production read; the ghost stub erased.)
     @extern @pure
     def get(id: FMLong): Option[Item] = {
       val ps = conn.underlying.prepareStatement("SELECT id, payload FROM item WHERE id = ?")
@@ -84,7 +88,7 @@ object JdbcRepositoryPattern {
       ps.setLong(1, longOfFM(item.id))
       ps.setLong(2, longOfFM(item.payload))
       ps.executeUpdate()
-      JdbcRepo(conn, item :: ghostRows)
+      JdbcRepo(conn)
     }.ensuring((res: Repo) =>
       res.get(item.id) == Some[Item](item) &&
       forall((id: FMLong) => id == item.id || res.get(id) == get(id)))

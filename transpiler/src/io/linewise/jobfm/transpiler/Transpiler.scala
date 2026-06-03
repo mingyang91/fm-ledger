@@ -172,6 +172,7 @@ object Transpiler {
     var s = input
     s = importsRule(s)
     s = packageRule(s, targetPkg)
+    s = ghostMembersRule(s)   // before annotationsRule: drop @ghost/@law members whole
     s = annotationsRule(s)
     s = holdsDefsRule(s)
     s = statementsRule(s)
@@ -215,6 +216,27 @@ object Transpiler {
   // --- R2: rewrite the (outermost) package ref to the target package ---------
   private def packageRule(s: String, targetPkg: String): String = astRule(s) {
     case Pkg(ref, _) => List(Edit(ref.pos.start, ref.pos.end, targetPkg))
+  }
+
+  // --- GHOST-ERASURE: drop whole members annotated @ghost or @law -------------
+  // These are spec/verification-only and must NOT appear (even de-annotated) in
+  // production: a @ghost `rows` model would otherwise materialize a real field, and
+  // @law axioms are pure proof obligations. Runs BEFORE annotationsRule (which would
+  // strip the @ghost/@law token and hide them). Drops Defn.Def/Decl.Def/Defn.Val
+  // (and Decl.Val) carrying the annotation, by line span. The @extern/@pure ops are
+  // NOT @ghost/@law, so their real-JDBC bodies survive (annotationsRule strips only
+  // their @extern/@pure tokens).
+  private val erasedMemberAnnots = Set("ghost", "law")
+  private def ghostMembersRule(s: String): String = astRule(s) {
+    case d: Defn.Def if hasErasedAnnot(d.mods) => val (a, b) = lineSpan(s, d); List(Edit(a, b, ""))
+    case d: Decl.Def if hasErasedAnnot(d.mods) => val (a, b) = lineSpan(s, d); List(Edit(a, b, ""))
+    case d: Defn.Val if hasErasedAnnot(d.mods) => val (a, b) = lineSpan(s, d); List(Edit(a, b, ""))
+    case d: Decl.Val if hasErasedAnnot(d.mods) => val (a, b) = lineSpan(s, d); List(Edit(a, b, ""))
+  }
+
+  private def hasErasedAnnot(mods: List[Mod]): Boolean = mods.exists {
+    case a: Mod.Annot => annotName(a).exists(erasedMemberAnnots.contains)
+    case _            => false
   }
 
   // --- R7: strip stainless annotations (the @<name> token + trailing space) --
