@@ -69,6 +69,7 @@ object `package` extends SbtModule {
     // verify-only and never transpiled.
     Task.Sources(
       base / "PetStoreModel.scala", base / "Has.scala", base / "World.scala",
+      base / "JdbcSupport.scala",
       base / "PetRepository.scala", base / "PetValidation.scala", base / "PetService.scala",
       base / "OrderRepository.scala", base / "OrderService.scala",
       base / "UserRepository.scala", base / "UserValidation.scala", base / "UserService.scala",
@@ -98,7 +99,7 @@ object `package` extends SbtModule {
               if {
                 val t = l.trim
                 val isComment = t.startsWith("*") || t.startsWith("//") || t.startsWith("/*")
-                !isComment && (t.contains("Nil(") || t.contains("Cons(") || t.contains(".holds"))
+                !isComment && (t.contains("Nil(") || t.contains("Nil[") || t.contains("Cons(") || t.contains(".holds"))
               } =>
             s"  ${i + 1}: ${l.trim}"
         }

@@ -308,14 +308,21 @@ object Transpiler {
     case t @ Type.Name("FMLong") => List(Edit(t.pos.start, t.pos.end, "Long"))
   }
 
-  // --- R4: drop Option type applications -------------------------------------
-  //   None[T]()  -> None   (whole apply)      Some[T]  -> Some  (just the type args)
+  // --- R4: drop Option/List type applications --------------------------------
+  //   None[T]() -> None ; Nil[T]() -> Nil  (whole apply)
+  //   Some[T] -> Some ; None[T] -> None ; Nil[T] -> Nil  (just the type args)
+  // Nil[T]() appears in real @extern realization bodies (a typed empty accumulator);
+  // scala's `Nil` is List[Nothing] and takes no type args, so erase them like Option's.
   private def optionTypeArgsRule(s: String): String = astRule(s) {
     case t @ Term.Apply(Term.ApplyType(Term.Name("None"), _), args) if args.isEmpty =>
       List(Edit(t.pos.start, t.pos.end, "None"))
+    case t @ Term.Apply(Term.ApplyType(Term.Name("Nil"), _), args) if args.isEmpty =>
+      List(Edit(t.pos.start, t.pos.end, "Nil"))
     case t @ Term.ApplyType(Term.Name("Some"), _) =>
       List(Edit(t.pos.start, t.pos.end, "Some"))
     case t @ Term.ApplyType(Term.Name("None"), _) =>
       List(Edit(t.pos.start, t.pos.end, "None"))
+    case t @ Term.ApplyType(Term.Name("Nil"), _) =>
+      List(Edit(t.pos.start, t.pos.end, "Nil"))
   }
 }

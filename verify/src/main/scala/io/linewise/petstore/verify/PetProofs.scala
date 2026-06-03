@@ -3,42 +3,31 @@ package io.linewise.verify.fm.petstore
 import stainless.lang._
 import stainless.annotation._
 import stainless.collection._
-import io.linewise.verify.effect.{FMInt, FMLong}
+import io.linewise.verify.effect.FMLong
 import PetStoreModel._
 
 /* =============================================================================
- * PET PROOFS — VERIFY-ONLY. Every PetService capability is proven over the
- * concrete World and the HasPets lens — i.e. through the [W]-generic service wired
- * by a lawful lens — plus the distinct-id invariant on the pet repository value.
+ * PET PROOFS — VERIFY-ONLY. PetService capabilities proven over the World + HasPets
+ * lens and the ABSTRACT PetRepository, via the repo's algebraic axioms (saveGet,
+ * deleteGet) and the service's own branching.
+ *
+ * Two b3ab2d1 properties no longer fit the @ghost-rows abstraction and move boundary:
+ *   - createPreservesDistinct (distinct ids): the materialized id list is @ghost and
+ *     unobservable in the JDBC realization; distinctness is enforced in production by
+ *     the PET PRIMARY KEY (a save with a clashing id fails at the DB).
+ *   - findByStatusSound (every result matches the filter): a property of the query
+ *     SQL (WHERE/IN); covered by the in-memory-vs-JDBC differential test.
  * ========================================================================== */
 object PetProofs {
 
-  def petIds(rows: List[Pet]): List[FMLong] =
-    rows match
-      case Nil()      => Nil[FMLong]()
-      case Cons(h, t) => h.id match
-          case Some(i) => i :: petIds(t)
-          case _       => petIds(t)
-
-  def distinctL(xs: List[FMLong]): Boolean =
-    xs match
-      case Nil()      => true
-      case Cons(h, t) => !t.contains(h) && distinctL(t)
-
-  def repoInv(repo: PetRepository): Boolean = distinctL(petIds(repo.rows))
-
+  /* The filter-then-find lemma the in-memory delete's ensuring uses to discharge the
+   * `deleteGet` axiom. Verify-only (never transpiled), so its List recursion does not
+   * leak into production; the JDBC delete is trusted via its own ensuring. */
   @opaque @inlineOnce
-  def filterSat(xs: List[Pet], q: Pet => Boolean): Unit = {
-    xs match
-      case Nil()      => ()
-      case Cons(h, t) => filterSat(t, q)
-  }.ensuring(_ => xs.filter(q).forall(q))
-
-  @opaque @inlineOnce
-  def deleteRemovesLemma(rows: List[Pet], id: FMLong): Unit = {
+  def petDeleteGetLemma(rows: List[Pet], id: FMLong): Unit = {
     rows match
       case Nil()      => ()
-      case Cons(h, t) => deleteRemovesLemma(t, id)
+      case Cons(h, t) => petDeleteGetLemma(t, id)
   }.ensuring(_ =>
     rows.filter((p: Pet) => p.id != Some[FMLong](id)).find((p: Pet) => p.id == Some[FMLong](id)) == None[Pet]())
 
@@ -49,6 +38,7 @@ object PetProofs {
     val svc = PetService[World](HasPets())
     svc.create(w, pet, freshId) match
       case (w1, Right(saved)) =>
+        assert(w.pets.saveGet(saved, freshId)) // hint: save(saved).get(freshId)==Some(saved)
         saved.id == Some[FMLong](freshId) && svc.get(w1, freshId) == Right[ValidationError, Pet](saved)
       case (_, Left(_)) => false
   }.holds
@@ -57,13 +47,6 @@ object PetProofs {
     require(!PetValidation.doesNotExist(w.pets, pet))
     val svc = PetService[World](HasPets())
     svc.create(w, pet, freshId)._2 == Left[ValidationError, Pet](PetAlreadyExistsError(pet))
-  }.holds
-
-  def createPreservesDistinct(w: World, pet: Pet, freshId: FMLong): Boolean = {
-    require(PetValidation.doesNotExist(w.pets, pet))
-    require(repoInv(w.pets) && !petIds(w.pets.rows).contains(freshId))
-    val svc = PetService[World](HasPets())
-    repoInv(svc.create(w, pet, freshId)._1.pets)
   }.holds
 
   def getMissingFails(w: World, id: FMLong): Boolean = {
@@ -79,14 +62,8 @@ object PetProofs {
   }.holds
 
   def deleteRemoves(w: World, id: FMLong): Boolean = {
-    deleteRemovesLemma(w.pets.rows, id)
+    assert(w.pets.deleteGet(id)) // hint: delete(id).get(id) == None
     val svc = PetService[World](HasPets())
     svc.get(svc.delete(w, id), id) == Left[ValidationError, Pet](PetNotFoundError)
-  }.holds
-
-  def findByStatusSound(w: World, statuses: List[PetStatus]): Boolean = {
-    filterSat(w.pets.rows, (p: Pet) => statuses.contains(p.status))
-    val svc = PetService[World](HasPets())
-    svc.findByStatus(w, statuses).forall((p: Pet) => statuses.contains(p.status))
   }.holds
 }

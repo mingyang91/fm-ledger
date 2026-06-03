@@ -2,7 +2,7 @@ package io.linewise.petstore
 
 import io.linewise.petstore.generated.PetStoreModel.*
 import io.linewise.petstore.generated.{World, HasPets, HasOrders, HasUsers}
-import io.linewise.petstore.generated.{PetRepository, OrderRepository, UserRepository}
+import io.linewise.petstore.generated.{InMemPetRepository, InMemOrderRepository, InMemUserRepository}
 import io.linewise.petstore.generated.{PetService, OrderService, UserService}
 
 /* =============================================================================
@@ -15,7 +15,7 @@ import io.linewise.petstore.generated.{PetService, OrderService, UserService}
  * ========================================================================== */
 object PetStoreMain:
   def main(args: Array[String]): Unit =
-    var w: World = World(PetRepository(Nil), OrderRepository(Nil), UserRepository(Nil))
+    var w: World = World(InMemPetRepository(Nil), InMemOrderRepository(Nil), InMemUserRepository(Nil))
     val users  = UserService[World](HasUsers())
     val pets   = PetService[World](HasPets())
     val orders = OrderService[World](HasOrders())
