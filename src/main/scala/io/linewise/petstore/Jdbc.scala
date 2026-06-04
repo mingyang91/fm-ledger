@@ -17,8 +17,17 @@ import scala.collection.mutable.ListBuffer
  * ========================================================================== */
 object Jdbc:
 
+  private def h2Url(name: String): String =
+    s"jdbc:h2:mem:$name;MODE=PostgreSQL;DB_CLOSE_DELAY=-1"
+
   def h2(name: String): Connection =
-    DriverManager.getConnection(s"jdbc:h2:mem:$name;MODE=PostgreSQL;DB_CLOSE_DELAY=-1", "sa", "")
+    DriverManager.getConnection(h2Url(name), "sa", "")
+
+  /** A pooled DataSource over the same in-memory H2 — borrow a fresh connection per
+    * request so concurrent handlers never share one (non-thread-safe) java.sql.Connection.
+    * DB_CLOSE_DELAY=-1 keeps the in-mem schema alive for the JVM even when the pool is idle. */
+  def dataSource(name: String): javax.sql.DataSource =
+    org.h2.jdbcx.JdbcConnectionPool.create(h2Url(name), "sa", "")
 
   /** The final, post-migration scala-pet-store schema (V1 InitialDatabaseSetup +
     * V2 PASSWORD->HASH + V3 Authentication: JWT table, ORDERS.USER_ID, USERS.ROLE).

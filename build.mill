@@ -37,7 +37,11 @@ object `package` extends SbtModule {
     mvn"org.tpolecat::doobie-core:1.0.0-RC12",
     mvn"com.h2database:h2:2.3.232",
     mvn"org.typelevel::cats-effect:3.6.3",
-    mvn"ch.epfl.lamp::gears:0.2.0"
+    mvn"ch.epfl.lamp::gears:0.2.0",
+    // pet-store web server: direct-style (Ox/Identity) tapir + single-derivation JSON.
+    // tapir 1.13.x targets ox 1.0.x (matches our ox 1.0.4); 1.11/1.12 pin ox 0.7.1.
+    mvn"com.softwaremill.sttp.tapir::tapir-netty-server-sync:1.13.19",
+    mvn"com.softwaremill.sttp.tapir::tapir-json-pickler:1.13.19"
   )
 
   // The verified sources of truth that the production code is generated FROM.
@@ -127,7 +131,16 @@ object `package` extends SbtModule {
     * (ox/doobie/h2/cats + the generated sources) and adds munit. `./mill test`. */
   object test extends SbtTests with TestModule.Munit {
     def scalacOptions = Seq("-release", "21", "-experimental")
-    def mvnDeps = Seq(mvn"org.scalameta::munit:1.0.0")
+    def mvnDeps = Seq(
+      mvn"org.scalameta::munit:1.0.0",
+      mvn"org.scalameta::munit-scalacheck:1.0.0",
+      // in-memory endpoint testing (no port bound) + sttp4 sync client + the tapir
+      // client interpreter (client & server share endpoint codecs), for the
+      // translated scala-pet-store endpoint specs.
+      mvn"com.softwaremill.sttp.tapir::tapir-sttp-stub4-server:1.13.19",
+      mvn"com.softwaremill.sttp.tapir::tapir-sttp-client4:1.13.19",
+      mvn"com.softwaremill.sttp.client4::core:4.0.23"
+    )
   }
 
   /* The build-time transpiler tool. scalameta parses the verified Scala-3
