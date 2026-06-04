@@ -5,26 +5,24 @@ import stainless.annotation._
 import stainless.collection._
 import io.linewise.verify.effect.{FMInt, FMLong}
 import PetStoreModel._
-import JdbcSupport.{fmFromLong, longOfFM}
-import io.linewise.petstore.ConnProvider
-import io.linewise.petstore.Jdbc.{encodeList, decodeList}
+import io.linewise.petstore.Db
 
 /* =============================================================================
  * PET — THE REPOSITORY LAYER as a sealed abstract type with a @ghost `rows` model.
  *
  *   - InMemPetRepository: a real list (the verification ORACLE / differential ref).
- *   - JdbcPetRepository: FIELD-LESS (so it stays immutable — a stored Conn would
+ *   - JdbcPetRepository: FIELD-LESS (so it stays immutable — a stored handle would
  *     taint the abstract hierarchy and the World mutable, which the Has lens forbids);
- *     `rows` is an erased ghost stub; each op is @extern @pure REAL PER-OPERATION SQL
- *     (no whole-table load) that fetches the ambient connection from ConnProvider
- *     INSIDE its havoc'd body. TRUSTED by the algebraic axioms it carries on its
- *     ensurings; the in-memory-vs-JDBC differential test is the machine-checked guard.
+ *     `rows` is an erased ghost stub; each op is @extern @pure and delegates to the
+ *     production `Db` facade (Quill, over a pooled DataSource). Quill is not on the
+ *     verify classpath, so it cannot live in the verified source; the @extern body is
+ *     havoc'd anyway, so it delegates to `Db` (a verify-only stub here; real Quill DAO
+ *     in production). TRUSTED via the axioms it carries on its ensurings; the
+ *     in-memory-vs-JDBC differential test is the machine-checked guard.
  *
- * Axioms (head-match, so the in-memory oracle discharges them; the JDBC realization
- * is trusted via ensurings): saveGet (a saved row is gotten back by its id) and
- * deleteGet (a deleted id is no longer gotten). The queries (findByNameAndCategory /
- * findByStatus / findByTag / list) and update are checked by the differential test;
- * the distinct-id invariant is enforced in production by the PET primary key.
+ * Axioms (head-match, so the in-memory oracle discharges them; the JDBC realization is
+ * trusted via ensurings): saveGet, deleteGet. The query ops and update are checked by
+ * the differential test; the distinct-id invariant is the PET primary key in production.
  * ========================================================================== */
 sealed abstract class PetRepository {
   @ghost def rows: List[Pet]
@@ -61,102 +59,34 @@ case class InMemPetRepository(items: List[Pet]) extends PetRepository {
     items.filter((p: Pet) => tags.exists((tag: String) => p.tags.contains(tag)))
 }
 
-/* JDBC realization — FIELD-LESS (immutable); real per-op SQL against the ambient
- * connection; @ghost stub rows; trusted via the axioms. */
+/* JDBC realization — FIELD-LESS (immutable); each op @extern, delegating to the
+ * production Quill `Db` facade; @ghost stub rows; trusted via the axioms. */
 case class JdbcPetRepository() extends PetRepository {
   @ghost def rows: List[Pet] = Nil[Pet]()
 
   @extern @pure
-  def save(pet: Pet): PetRepository = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "INSERT INTO PET (ID, NAME, CATEGORY, BIO, STATUS, PHOTO_URLS, TAGS) VALUES (?,?,?,?,?,?,?)")
-    ps.setLong(1, longOfFM(pet.id.getOrElse(FMLong(BigInt(0)))))
-    ps.setString(2, pet.name); ps.setString(3, pet.category); ps.setString(4, pet.bio)
-    ps.setString(5, petStatusToStr(pet.status))
-    ps.setString(6, encodeList(pet.photoUrls)); ps.setString(7, encodeList(pet.tags))
-    ps.executeUpdate()
-    JdbcPetRepository()
-  }.ensuring((res: PetRepository) =>
+  def save(pet: Pet): PetRepository = { Db.insertPet(pet); JdbcPetRepository() }.ensuring((res: PetRepository) =>
     forall((id: FMLong) => (pet.id == Some[FMLong](id)) ==> (res.get(id) == Some[Pet](pet))))
 
   @extern @pure
-  def get(id: FMLong): Option[Pet] = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "SELECT ID, NAME, CATEGORY, BIO, STATUS, PHOTO_URLS, TAGS FROM PET WHERE ID = ?")
-    ps.setLong(1, longOfFM(id))
-    val rs = ps.executeQuery()
-    if rs.next() then Some[Pet](rowToPet(rs)) else None[Pet]()
-  }
+  def get(id: FMLong): Option[Pet] = Db.petById(id)
 
   @extern @pure
-  def update(pet: Pet): PetRepository = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "UPDATE PET SET NAME=?, CATEGORY=?, BIO=?, STATUS=?, PHOTO_URLS=?, TAGS=? WHERE ID=?")
-    ps.setString(1, pet.name); ps.setString(2, pet.category); ps.setString(3, pet.bio)
-    ps.setString(4, petStatusToStr(pet.status))
-    ps.setString(5, encodeList(pet.photoUrls)); ps.setString(6, encodeList(pet.tags))
-    ps.setLong(7, longOfFM(pet.id.getOrElse(FMLong(BigInt(0)))))
-    ps.executeUpdate()
-    JdbcPetRepository()
-  }
+  def update(pet: Pet): PetRepository = { Db.updatePet(pet); JdbcPetRepository() }
 
   @extern @pure
-  def delete(id: FMLong): PetRepository = {
-    val ps = ConnProvider.conn().underlying.prepareStatement("DELETE FROM PET WHERE ID = ?")
-    ps.setLong(1, longOfFM(id)); ps.executeUpdate()
-    JdbcPetRepository()
-  }.ensuring((res: PetRepository) => res.get(id) == None[Pet]())
+  def delete(id: FMLong): PetRepository =
+    { Db.deletePet(id); JdbcPetRepository() }.ensuring((res: PetRepository) => res.get(id) == None[Pet]())
 
   @extern @pure
-  def findByNameAndCategory(name: String, category: String): List[Pet] = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "SELECT ID, NAME, CATEGORY, BIO, STATUS, PHOTO_URLS, TAGS FROM PET WHERE NAME = ? AND CATEGORY = ?")
-    ps.setString(1, name); ps.setString(2, category)
-    drainPets(ps.executeQuery())
-  }
+  def findByNameAndCategory(name: String, category: String): List[Pet] = Db.petsByNameAndCategory(name, category)
 
   @extern @pure
-  def list(pageSize: FMInt, offset: FMInt): List[Pet] = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "SELECT ID, NAME, CATEGORY, BIO, STATUS, PHOTO_URLS, TAGS FROM PET ORDER BY ID DESC LIMIT ? OFFSET ?")
-    ps.setLong(1, longOfFM(pageSize.toLong)); ps.setLong(2, longOfFM(offset.toLong))
-    drainPets(ps.executeQuery())
-  }
+  def list(pageSize: FMInt, offset: FMInt): List[Pet] = Db.petsList(pageSize, offset)
 
   @extern @pure
-  def findByStatus(statuses: List[PetStatus]): List[Pet] = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "SELECT ID, NAME, CATEGORY, BIO, STATUS, PHOTO_URLS, TAGS FROM PET")
-    drainPets(ps.executeQuery()).filter((p: Pet) => statuses.contains(p.status))
-  }
+  def findByStatus(statuses: List[PetStatus]): List[Pet] = Db.petsByStatus(statuses)
 
   @extern @pure
-  def findByTag(tags: List[String]): List[Pet] = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "SELECT ID, NAME, CATEGORY, BIO, STATUS, PHOTO_URLS, TAGS FROM PET")
-    drainPets(ps.executeQuery()).filter((p: Pet) => tags.exists((tag: String) => p.tags.contains(tag)))
-  }
-
-  @extern @pure
-  private def drainPets(rs: java.sql.ResultSet): List[Pet] = {
-    var acc: List[Pet] = Nil[Pet]()
-    while rs.next() do acc = rowToPet(rs) :: acc
-    acc
-  }
-
-  @extern @pure
-  private def rowToPet(rs: java.sql.ResultSet): Pet =
-    Pet(rs.getString("NAME"), rs.getString("CATEGORY"), rs.getString("BIO"),
-      strToPetStatus(rs.getString("STATUS")), decodeList(rs.getString("TAGS")),
-      decodeList(rs.getString("PHOTO_URLS")), Some[FMLong](fmFromLong(rs.getLong("ID"))))
+  def findByTag(tags: List[String]): List[Pet] = Db.petsByTag(tags)
 }
-
-/* Pure status <-> VARCHAR converters (real logic; transpiled). Used inside the JDBC
- * @extern bodies; total so verification accepts them. */
-def petStatusToStr(s: PetStatus): String = s match
-  case Available => "Available"
-  case Pending   => "Pending"
-  case Adopted   => "Adopted"
-
-def strToPetStatus(s: String): PetStatus =
-  if s == "Available" then Available else if s == "Pending" then Pending else Adopted

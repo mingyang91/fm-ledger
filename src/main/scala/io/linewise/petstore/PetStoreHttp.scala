@@ -15,7 +15,6 @@ import io.linewise.petstore.generated.{World, HasPets, HasOrders, HasUsers}
 import io.linewise.petstore.generated.{PetService, OrderService, UserService}
 import io.linewise.petstore.generated.{InMemPetRepository, InMemOrderRepository, InMemUserRepository}
 import io.linewise.petstore.generated.{JdbcPetRepository, JdbcOrderRepository, JdbcUserRepository}
-import io.linewise.petstore.generated.JdbcSupport.Conn
 
 /* =============================================================================
  * PET-STORE WEB SERVER — direct-style (Ox / Identity) tapir, mirroring the original
@@ -93,18 +92,15 @@ final class InMemBackend extends Backend:
   }
   def mutate(f: World => World): Unit = synchronized { ref.set(f(ref.get())) }
 
-/** JDBC backing: a fresh field-less World per call. Each operation BORROWS its own
-  * connection from the pool and binds it for the duration (java.sql.Connection is not
-  * thread-safe, so connections must never be shared across the sync server's request
-  * threads). The new World a write returns is discarded — the durable state is the DB. */
-final class JdbcBackend(ds: javax.sql.DataSource) extends Backend:
+/** JDBC backing: a fresh field-less World whose repositories delegate to the ambient
+  * Quill `Db` (bind it once with `Db.init(dataSource)` before serving). Quill owns and
+  * pools the connections and binds one per `run`, so this backend just threads the World
+  * — there is no shared connection and no per-request connection plumbing here. */
+final class JdbcBackend extends Backend:
   private val world = World(JdbcPetRepository(), JdbcOrderRepository(), JdbcUserRepository())
-  private def run[A](body: => A): A =
-    val c = ds.getConnection()
-    try ConnProvider.withConn(new Conn(c))(body) finally c.close()
-  def read[A](f: World => A): A = run(f(world))
-  def write[A](f: World => (World, A)): A = run(f(world)._2)
-  def mutate(f: World => World): Unit = run { f(world); () }
+  def read[A](f: World => A): A = f(world)
+  def write[A](f: World => (World, A)): A = f(world)._2
+  def mutate(f: World => World): Unit = { f(world); () }
 
 class PetStoreApi(backend: Backend):
   import PetStoreJson.given

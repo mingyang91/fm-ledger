@@ -5,24 +5,23 @@ import stainless.annotation._
 import stainless.collection._
 import io.linewise.verify.effect.{FMInt, FMLong}
 import PetStoreModel._
-import JdbcSupport.{fmFromLong, longOfFM}
-import io.linewise.petstore.ConnProvider
+import io.linewise.petstore.Db
 
 /* =============================================================================
  * USER — THE REPOSITORY LAYER as a sealed abstract type with a @ghost `rows` model.
  *
  *   - InMemUserRepository: a real list (the verification ORACLE / differential ref).
- *   - JdbcUserRepository: FIELD-LESS (so it stays immutable — a stored Conn would
+ *   - JdbcUserRepository: FIELD-LESS (so it stays immutable — a stored handle would
  *     taint the abstract hierarchy and the World mutable, which the Has lens forbids);
- *     `rows` is an erased ghost stub; each op is @extern @pure REAL PER-OPERATION SQL
- *     (no whole-table load) that fetches the ambient connection from ConnProvider
- *     INSIDE its havoc'd body. TRUSTED by the algebraic axioms it carries on `save`'s
- *     ensuring; the in-memory-vs-JDBC differential test is the machine-checked guard.
+ *     `rows` is an erased ghost stub; each op is @extern @pure and delegates to the
+ *     production `Db` facade (Quill, over a pooled DataSource). Quill is a third-party
+ *     macro library NOT on the verify classpath, so it CANNOT live in the verified
+ *     source; the @extern body is havoc'd in verification anyway, so it delegates to
+ *     `Db` (a verify-only stub here; the real Quill DAO in production). TRUSTED by the
+ *     algebraic axioms it carries on its ensurings; the differential test is the guard.
  *
- * Axioms (head-match, so the in-memory oracle discharges them automatically; the
- * JDBC realization is trusted via save's ensuring): saveGet (a saved row is gotten
- * back by its id) and saveFindName (gotten back by its userName). delete/update/
- * list correctness is checked by the differential test, not an axiom.
+ * Axioms (head-match, so the in-memory oracle discharges them; the JDBC realization is
+ * trusted via its ensurings): saveGet, saveFindName, deleteGet.
  * ========================================================================== */
 sealed abstract class UserRepository {
   @ghost def rows: List[User]
@@ -57,82 +56,32 @@ case class InMemUserRepository(items: List[User]) extends UserRepository {
   def list(pageSize: FMInt, offset: FMInt): List[User] = items.drop(offset.value).take(pageSize.value)
 }
 
-/* JDBC realization — FIELD-LESS (immutable); real per-op SQL against the ambient
- * connection; @ghost stub rows; trusted via the axioms. */
+/* JDBC realization — FIELD-LESS (immutable); each op @extern, delegating to the
+ * production Quill `Db` facade; @ghost stub rows; trusted via the axioms. */
 case class JdbcUserRepository() extends UserRepository {
   @ghost def rows: List[User] = Nil[User]()
 
   @extern @pure
-  def save(u: User): UserRepository = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "INSERT INTO USERS (ID, USER_NAME, FIRST_NAME, LAST_NAME, EMAIL, HASH, PHONE, ROLE) VALUES (?,?,?,?,?,?,?,?)")
-    ps.setLong(1, longOfFM(u.id.getOrElse(FMLong(BigInt(0)))))
-    ps.setString(2, u.userName); ps.setString(3, u.firstName); ps.setString(4, u.lastName)
-    ps.setString(5, u.email); ps.setString(6, u.hash); ps.setString(7, u.phone)
-    ps.setString(8, u.role.roleRepr)
-    ps.executeUpdate()
-    JdbcUserRepository()
-  }.ensuring((res: UserRepository) =>
+  def save(u: User): UserRepository = { Db.insertUser(u); JdbcUserRepository() }.ensuring((res: UserRepository) =>
     forall((id: FMLong) => (u.id == Some[FMLong](id)) ==> (res.get(id) == Some[User](u))) &&
     res.findByUserName(u.userName) == Some[User](u))
 
   @extern @pure
-  def get(id: FMLong): Option[User] = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "SELECT ID, USER_NAME, FIRST_NAME, LAST_NAME, EMAIL, HASH, PHONE, ROLE FROM USERS WHERE ID = ?")
-    ps.setLong(1, longOfFM(id))
-    val rs = ps.executeQuery()
-    if rs.next() then Some[User](rowToUser(rs)) else None[User]()
-  }
+  def get(id: FMLong): Option[User] = Db.userById(id)
 
   @extern @pure
-  def findByUserName(name: String): Option[User] = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "SELECT ID, USER_NAME, FIRST_NAME, LAST_NAME, EMAIL, HASH, PHONE, ROLE FROM USERS WHERE USER_NAME = ?")
-    ps.setString(1, name)
-    val rs = ps.executeQuery()
-    if rs.next() then Some[User](rowToUser(rs)) else None[User]()
-  }
+  def findByUserName(name: String): Option[User] = Db.userByName(name)
 
   @extern @pure
-  def update(u: User): UserRepository = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "UPDATE USERS SET USER_NAME=?, FIRST_NAME=?, LAST_NAME=?, EMAIL=?, HASH=?, PHONE=?, ROLE=? WHERE ID=?")
-    ps.setString(1, u.userName); ps.setString(2, u.firstName); ps.setString(3, u.lastName)
-    ps.setString(4, u.email); ps.setString(5, u.hash); ps.setString(6, u.phone)
-    ps.setString(7, u.role.roleRepr); ps.setLong(8, longOfFM(u.id.getOrElse(FMLong(BigInt(0)))))
-    ps.executeUpdate()
-    JdbcUserRepository()
-  }
+  def update(u: User): UserRepository = { Db.updateUser(u); JdbcUserRepository() }
 
   @extern @pure
-  def delete(id: FMLong): UserRepository = {
-    val ps = ConnProvider.conn().underlying.prepareStatement("DELETE FROM USERS WHERE ID = ?")
-    ps.setLong(1, longOfFM(id)); ps.executeUpdate()
-    JdbcUserRepository()
-  }.ensuring((res: UserRepository) => res.get(id) == None[User]())
+  def delete(id: FMLong): UserRepository =
+    { Db.deleteUser(id); JdbcUserRepository() }.ensuring((res: UserRepository) => res.get(id) == None[User]())
 
   @extern @pure
-  def deleteByUserName(name: String): UserRepository = {
-    val ps = ConnProvider.conn().underlying.prepareStatement("DELETE FROM USERS WHERE USER_NAME = ?")
-    ps.setString(1, name); ps.executeUpdate()
-    JdbcUserRepository()
-  }
+  def deleteByUserName(name: String): UserRepository = { Db.deleteUserByName(name); JdbcUserRepository() }
 
   @extern @pure
-  def list(pageSize: FMInt, offset: FMInt): List[User] = {
-    val ps = ConnProvider.conn().underlying.prepareStatement(
-      "SELECT ID, USER_NAME, FIRST_NAME, LAST_NAME, EMAIL, HASH, PHONE, ROLE FROM USERS ORDER BY ID DESC LIMIT ? OFFSET ?")
-    ps.setLong(1, longOfFM(pageSize.toLong)); ps.setLong(2, longOfFM(offset.toLong))
-    val rs = ps.executeQuery()
-    var acc: List[User] = Nil[User]()
-    while rs.next() do acc = rowToUser(rs) :: acc
-    acc
-  }
-
-  @extern @pure
-  private def rowToUser(rs: java.sql.ResultSet): User =
-    User(rs.getString("USER_NAME"), rs.getString("FIRST_NAME"), rs.getString("LAST_NAME"),
-      rs.getString("EMAIL"), rs.getString("HASH"), rs.getString("PHONE"),
-      Some[FMLong](fmFromLong(rs.getLong("ID"))), Role(rs.getString("ROLE")))
+  def list(pageSize: FMInt, offset: FMInt): List[User] = Db.usersList(pageSize, offset)
 }

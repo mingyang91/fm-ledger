@@ -41,7 +41,11 @@ object `package` extends SbtModule {
     // pet-store web server: direct-style (Ox/Identity) tapir + single-derivation JSON.
     // tapir 1.13.x targets ox 1.0.x (matches our ox 1.0.4); 1.11/1.12 pin ox 0.7.1.
     mvn"com.softwaremill.sttp.tapir::tapir-netty-server-sync:1.13.19",
-    mvn"com.softwaremill.sttp.tapir::tapir-json-pickler:1.13.19"
+    mvn"com.softwaremill.sttp.tapir::tapir-json-pickler:1.13.19",
+    // pet-store persistence: Quill (protoquill, synchronous JDBC context). The
+    // @extern repository realizations delegate to this; queries compile to SQL at
+    // compile time. 4.8.6 targets scala3-library 3.3.4 (forward-compatible with 3.8.1).
+    mvn"io.getquill::quill-jdbc:4.8.6"
   )
 
   // The verified sources of truth that the production code is generated FROM.
@@ -73,7 +77,6 @@ object `package` extends SbtModule {
     // verify-only and never transpiled.
     Task.Sources(
       base / "PetStoreModel.scala", base / "Has.scala", base / "World.scala",
-      base / "JdbcSupport.scala",
       base / "PetRepository.scala", base / "PetValidation.scala", base / "PetService.scala",
       base / "OrderRepository.scala", base / "OrderService.scala",
       base / "UserRepository.scala", base / "UserValidation.scala", base / "UserService.scala",

@@ -1,30 +1,27 @@
 package io.linewise.petstore
 
-import java.sql.{Connection, DriverManager, PreparedStatement, ResultSet, Statement}
-import scala.collection.mutable.ListBuffer
+import java.sql.Connection
 
 /* =============================================================================
- * PLAIN-JDBC SUPPORT — no cats-effect, no doobie, no http4s. Direct java.sql.
- *
- * Holds the isomorphic DDL (the scala-pet-store schema after migrations V1..V3)
- * and small query/update helpers. The repositories (PetRepo/OrderRepo/UserRepo)
- * persist through these and delegate all business logic to the verified,
- * transpiler-generated cores — so the only trusted thing here is persistence.
+ * SCHEMA + persistence support for the pet store (no cats-effect, no doobie, no
+ * http4s). Since the migration to Quill, this object holds ONLY: the isomorphic DDL
+ * (the scala-pet-store schema after migrations V1..V3), a pooled DataSource factory,
+ * schema bootstrap, and the List[String] <-> VARCHAR codec reused by the Quill DAO
+ * (PetStoreDb) for the tags / photo_urls columns. All querying is done by Quill.
  *
  * H2 runs in PostgreSQL compatibility mode so the original Postgres DDL
  * (BIGSERIAL / INT8 / BOOLEAN / TIMESTAMP / REFERENCES ... ON DELETE CASCADE) is
- * accepted verbatim — the table structures are byte-for-byte the originals.
+ * accepted verbatim — the table structures are byte-for-byte the originals. Ids are
+ * assigned by the application (PetStoreHttp.freshId); the BIGSERIAL identity sequence
+ * is intentionally unused (every INSERT supplies an explicit id).
  * ========================================================================== */
 object Jdbc:
 
   private def h2Url(name: String): String =
     s"jdbc:h2:mem:$name;MODE=PostgreSQL;DB_CLOSE_DELAY=-1"
 
-  def h2(name: String): Connection =
-    DriverManager.getConnection(h2Url(name), "sa", "")
-
-  /** A pooled DataSource over the same in-memory H2 — borrow a fresh connection per
-    * request so concurrent handlers never share one (non-thread-safe) java.sql.Connection.
+  /** A pooled DataSource over an in-memory H2 — Quill borrows a fresh connection per
+    * run (so concurrent handlers never share one non-thread-safe java.sql.Connection).
     * DB_CLOSE_DELAY=-1 keeps the in-mem schema alive for the JVM even when the pool is idle. */
   def dataSource(name: String): javax.sql.DataSource =
     org.h2.jdbcx.JdbcConnectionPool.create(h2Url(name), "sa", "")
@@ -76,37 +73,10 @@ object Jdbc:
       finally st.close()
     }
 
-  /** A collection field (tags / photo_urls) <-> a single VARCHAR column, joined on
-    * a control-char delimiter (the column holds the whole collection, as in the
-    * original's VARCHAR encoding). */
+  /** A collection field (tags / photo_urls) <-> a single VARCHAR column. Each element
+    * is TERMINATED by a control-char delimiter (not merely joined), so the empty list
+    * `Nil` encodes to "" while `List("")` encodes to a lone delimiter — the two stay
+    * distinguishable on round-trip (a plain join would collapse both to ""). */
   private val Delim = ""
-  def encodeList(xs: List[String]): String = xs.mkString(Delim)
-  def decodeList(s: String): List[String] = if s.isEmpty then Nil else s.split(Delim, -1).toList
-
-  /** Run a SELECT, mapping each row. */
-  def query[A](c: Connection, sql: String)(set: PreparedStatement => Unit)(map: ResultSet => A): List[A] =
-    val ps = c.prepareStatement(sql)
-    try
-      set(ps)
-      val rs = ps.executeQuery()
-      val out = ListBuffer.empty[A]
-      while rs.next() do out += map(rs)
-      out.toList
-    finally ps.close()
-
-  /** Run an INSERT/UPDATE/DELETE; return affected row count. */
-  def update(c: Connection, sql: String)(set: PreparedStatement => Unit): Int =
-    val ps = c.prepareStatement(sql)
-    try { set(ps); ps.executeUpdate() }
-    finally ps.close()
-
-  /** INSERT and return the generated BIGSERIAL key (the id source). */
-  def insertReturningId(c: Connection, sql: String)(set: PreparedStatement => Unit): Long =
-    val ps = c.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)
-    try
-      set(ps)
-      ps.executeUpdate()
-      val keys = ps.getGeneratedKeys
-      keys.next()
-      keys.getLong(1)
-    finally ps.close()
+  def encodeList(xs: List[String]): String = if xs.isEmpty then "" else xs.mkString("", Delim, Delim)
+  def decodeList(s: String): List[String] = if s.isEmpty then Nil else s.split(Delim, -1).toList.init
