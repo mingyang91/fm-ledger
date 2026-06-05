@@ -1,20 +1,9 @@
 // Mill single-file Scala script: ./mill verify.scala [files...]
 //
-// Runs Stainless formal verification in Docker container.
-// If no files specified, verifies all stainless-lib + the JobProofs proofs.
-//
-// EvolutionConflict.scala is the deliberately-INVALID counterexample file (it
-// asserts the broken DAG is covered, which is FALSE). It is EXCLUDED from the
-// default no-args run so the headline run reports 0 invalid. To see the
-// counterexample, pass it explicitly:
-//   ./mill verify.scala verify/src/main/scala/io/linewise/jobfm/verify/EvolutionConflict.scala \
-//                       verify/src/main/scala/io/linewise/jobfm/verify/JobProofs.scala
-//
-// OverflowCounterexample.scala is the Tier-1 INVALID companion: an UNGUARDED
-// FMInt `+` whose no-overflow precondition cannot be discharged. Also excluded
-// from the headline run; to see it fail, pass it with FMTypes:
-//   ./mill verify.scala verify/stainless-lib/FMTypes.scala \
-//                       verify/src/main/scala/io/linewise/jobfm/verify/OverflowCounterexample.scala
+// Runs Stainless formal verification in a Docker container.
+// If no files are specified, verifies all of stainless-lib + every pet-store verify
+// source (auto-discovered under verify/src/main/scala). The pet store has no INVALID
+// counterexample files, so the headline no-args run reports 0 invalid.
 //
 // The Stainless VC cache is persisted to verify/.stainless-cache (gitignored) via the
 // /work mount, so structurally-identical VCs are not re-solved across runs: a warm
@@ -53,10 +42,6 @@ def main(args: String*): Unit =
         if os.exists(verifyBase) then
           os.walk(verifyBase)
             .filter(_.ext == "scala")
-            // exclude the intentional INVALID counterexamples from the headline run
-            .filter(_.last != "EvolutionConflict.scala")
-            .filter(_.last != "OverflowCounterexample.scala")
-            .filter(_.last != "ConservationConflict.scala")
             .map: p =>
               s"/work/src/main/scala/${p.relativeTo(verifyBase)}"
         else Seq.empty

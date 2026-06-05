@@ -10,13 +10,14 @@ import mill._, scalalib._
  *   - `transpiler` is a separate ScalaModule (scalameta 4.13.4) holding the
  *     Stainless->Ox transpiler. It is a BUILD-TIME tool, not shipped.
  *   - The root module registers a `generatedSources` entry produced by the
- *     `transpile` task. `transpile` runs the transpiler over
- *       verify/src/main/scala/io/linewise/jobfm/verify/JobModel.scala
- *     and writes
- *       <generatedSources>/io/linewise/jobfm/generated/JobModel.scala
+ *     `transpile` task. `transpile` runs the transpiler over the verified
+ *     pet-store cores under
+ *       verify/src/main/scala/io/linewise/petstore/verify/
+ *     and writes the production core under
+ *       <generatedSources>/io/linewise/petstore/generated/
  *   - Because `generatedSources` feeds `allSourceFiles`, `./mill compile`
  *     (and `run`) AUTOMATICALLY regenerates the production core from the
- *     verified source first. There is no hand-written core.scala anymore.
+ *     verified source first. There is no hand-written core.
  *   - `./mill transpile` can also be invoked directly to (re)generate on demand.
  * ========================================================================== */
 
@@ -24,22 +25,18 @@ object `package` extends SbtModule {
 
   def scalaVersion = "3.8.1"
 
-  // Ox virtual threads need a JDK 21+ class-file target. Host JDK is 26, which
-  // runs JDK-21-targeted bytecode fine. `-experimental` enables the Gears API
-  // (ch.epfl.lamp::gears is published @experimental), used by the ledger's
-  // concurrent posting race (GearsLedgerRace).
-  def scalacOptions = Seq("-release", "21", "-experimental")
+  // Ox virtual threads (pulled in transitively by tapir-netty-server-sync) need a
+  // JDK 21+ class-file target. Host JDK is 26, which runs JDK-21-targeted bytecode fine.
+  def scalacOptions = Seq("-release", "21")
 
-  def mainClass = Some("io.linewise.jobfm.Main")
+  def mainClass = Some("io.linewise.petstore.PetStoreServer")
 
   def mvnDeps = Seq(
+    // ox: direct-style concurrency. The pet-store tapir server runs on ox virtual
+    // threads; tapir 1.13.x targets ox 1.0.x (1.11/1.12 pin ox 0.7.1).
     mvn"com.softwaremill.ox::core:1.0.4",
-    mvn"org.tpolecat::doobie-core:1.0.0-RC12",
     mvn"com.h2database:h2:2.3.232",
-    mvn"org.typelevel::cats-effect:3.6.3",
-    mvn"ch.epfl.lamp::gears:0.2.0",
     // pet-store web server: direct-style (Ox/Identity) tapir + single-derivation JSON.
-    // tapir 1.13.x targets ox 1.0.x (matches our ox 1.0.4); 1.11/1.12 pin ox 0.7.1.
     mvn"com.softwaremill.sttp.tapir::tapir-netty-server-sync:1.13.19",
     mvn"com.softwaremill.sttp.tapir::tapir-json-pickler:1.13.19",
     // pet-store persistence: Quill (protoquill, synchronous JDBC context). The
@@ -48,33 +45,13 @@ object `package` extends SbtModule {
     mvn"io.getquill::quill-jdbc:4.8.6"
   )
 
-  // The verified sources of truth that the production code is generated FROM.
-  // The transpiler input files are the PROOF-FREE executable cores; the
-  // lemmas/@law/.holds live in sibling verify-only files that are NEVER
-  // transpiled (StoreProofs/StoreLaw/WorkerProofs/SeqMirrorProofs).
-  def verifiedSources: T[Seq[PathRef]] = Task.Sources(
-    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "JobModel.scala",
-    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "StoreCore.scala",
-    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "SeqMirror.scala",
-    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "jobfm" / "verify" / "WorkerCore.scala"
-  )
-
-  // The ledger module's verified executable cores. Same transpiler, different
-  // target package (io.linewise.ledgerfm.generated); the proofs (LedgerProofs/
-  // LedgerLaw/ConservationConflict) are verify-only and never transpiled.
-  def ledgerVerifiedSources: T[Seq[PathRef]] = Task.Sources(
-    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "ledgerfm" / "verify" / "LedgerModel.scala",
-    moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "ledgerfm" / "verify" / "LedgerCore.scala"
-  )
-
-  // The scala-pet-store translation's verified executable cores (entities/DTOs +
-  // per-domain repository+service). Target package io.linewise.petstore.generated;
-  // the proofs (Pet/Order/User Proofs) are verify-only and never transpiled.
-  def petstoreVerifiedSources: T[Seq[PathRef]] =
+  // The verified sources of truth that the production core is generated FROM:
+  // the scala-pet-store translation's PROOF-FREE executable cores (entities/DTOs +
+  // the Has lens + the World + the three layers per domain — Repository value /
+  // Validation / [W]-polymorphic Service). Target package io.linewise.petstore.generated;
+  // the proofs (Pet/Order/User Proofs) are verify-only and NEVER transpiled.
+  def verifiedSources: T[Seq[PathRef]] =
     val base = moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "petstore" / "verify"
-    // the DTO model + the Has lens + the World + the three layers per domain
-    // (Repository value / Validation / [W]-polymorphic Service). The *Proofs are
-    // verify-only and never transpiled.
     Task.Sources(
       base / "PetStoreModel.scala", base / "Has.scala", base / "World.scala",
       base / "PetRepository.scala", base / "PetValidation.scala", base / "PetService.scala",
@@ -83,7 +60,7 @@ object `package` extends SbtModule {
     )
 
   /** Run the transpiler over each verified executable core and emit the
-    * production code into a generated-sources directory, one package per module.
+    * production code into a generated-sources directory under io.linewise.petstore.generated.
     * Registered in `generatedSources` below, so `./mill compile` regenerates
     * automatically. Also a standalone task: `./mill transpile`. A leak-guard fails
     * the build if any proof-only token (Nil()/Cons()/.holds) reaches generated output. */
@@ -116,9 +93,7 @@ object `package` extends SbtModule {
       }
     }
 
-    genInto(verifiedSources(), "io.linewise.jobfm.generated")
-    genInto(ledgerVerifiedSources(), "io.linewise.ledgerfm.generated")
-    genInto(petstoreVerifiedSources(), "io.linewise.petstore.generated")
+    genInto(verifiedSources(), "io.linewise.petstore.generated")
     PathRef(genRoot)
   }
 
@@ -128,12 +103,12 @@ object `package` extends SbtModule {
     super.generatedSources() :+ transpile()
   }
 
-  /** Differential test module: drives the verified-GENERATED ListStore and the
-    * TRUSTED doobie JdbcStore over the same scenarios and asserts they agree
-    * row-for-row — the machine-checked drift gate. Inherits the parent's deps
-    * (ox/doobie/h2/cats + the generated sources) and adds munit. `./mill test`. */
+  /** Test module: the translated scala-pet-store endpoint specs + the differential
+    * drift gate (the in-memory oracle vs the @extern-over-Quill JDBC realization,
+    * asserted equal). Inherits the parent's deps + the generated sources and adds
+    * munit + the tapir/sttp client for in-memory endpoint testing. `./mill test`. */
   object test extends SbtTests with TestModule.Munit {
-    def scalacOptions = Seq("-release", "21", "-experimental")
+    def scalacOptions = Seq("-release", "21")
     def mvnDeps = Seq(
       mvn"org.scalameta::munit:1.0.0",
       mvn"org.scalameta::munit-scalacheck:1.0.0",
