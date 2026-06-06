@@ -1,8 +1,7 @@
 package io.linewise.ledger
 
 import javax.sql.DataSource
-import java.sql.{Connection, PreparedStatement, ResultSet, SQLException, Statement, Timestamp}
-import java.util.concurrent.atomic.AtomicLong
+import java.sql.{Connection, PreparedStatement, ResultSet, SQLException, Statement}
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -27,10 +26,6 @@ object Accounts:
   def normalSide(account: String): String =
     if isUser(account) || account == WithdrawalClearing || account == Cash then "CR" else "DR"
 
-object Ids:
-  private val n = AtomicLong(0L)
-  def next(): Long = n.incrementAndGet()
-
 final case class TxWriteMeta(
     targetTxId: Option[Long] = None,
     withdrawalId: Option[Long] = None,
@@ -49,25 +44,64 @@ final class LedgerStore(ds: DataSource):
   private def using[A <: AutoCloseable, B](a: A)(f: A => B): B =
     try f(a) finally a.close()
 
+  // Ambient transaction scope (mirrors the asActor/withTxMeta ThreadLocals on `Db`).
+  // When a `transaction { ... }` is open on this thread, every conn{}/tx{} below joins
+  // its single Connection instead of opening its own, so a multi-write service call
+  // (reserve = ledger post + withdrawal put, credit = post + obligation realize, …)
+  // commits or rolls back as one unit. Nested transaction{} calls join the open one.
+  private val txConn = ThreadLocal.withInitial[Option[Connection]](() => None)
+
+  def transaction[A](body: => A): A =
+    txConn.get() match
+      case Some(_) => body
+      case None =>
+        val c = ds.getConnection()
+        try
+          c.setAutoCommit(false)   // inside try so a failure here still closes c in finally
+          txConn.set(Some(c))
+          val out = body
+          c.commit()
+          out
+        catch
+          case e: Throwable =>
+            try c.rollback() catch case _: Throwable => () // don't let a rollback failure mask e
+            throw e
+        finally
+          txConn.set(None)
+          try c.setAutoCommit(true) catch case _: Throwable => ()
+          c.close()
+
   private def conn[A](f: Connection => A): A =
-    val c = ds.getConnection()
-    try f(c) finally c.close()
+    txConn.get() match
+      case Some(c) => f(c)
+      case None =>
+        val c = ds.getConnection()
+        try f(c) finally c.close()
 
   private def tx[A](f: Connection => A): A =
-    val c = ds.getConnection()
-    val old = c.getAutoCommit
-    c.setAutoCommit(false)
-    try
-      val out = f(c)
-      c.commit()
-      out
-    catch
-      case e: Throwable =>
-        c.rollback()
-        throw e
-    finally
-      c.setAutoCommit(old)
-      c.close()
+    txConn.get() match
+      case Some(c) => f(c)
+      case None =>
+        val c = ds.getConnection()
+        val old = c.getAutoCommit
+        c.setAutoCommit(false)
+        try
+          val out = f(c)
+          c.commit()
+          out
+        catch
+          case e: Throwable =>
+            c.rollback()
+            throw e
+        finally
+          c.setAutoCommit(old)
+          c.close()
+
+  /** Allocate the next ledger entity id from the shared PostgreSQL sequence. Sequence
+    * values are never rolled back, so ids stay unique across aborted transactions and
+    * process restarts — unlike a process-local counter, which resets to 0 on restart. */
+  def nextId(): Long =
+    conn(c => one(c, "SELECT nextval('LEDGER_ID_SEQ') AS N")(_.getLong("N")).getOrElse(throw SQLException("no id from LEDGER_ID_SEQ")))
 
   private def optLong(rs: ResultSet, name: String): Option[Long] =
     val v = rs.getLong(name)
@@ -119,15 +153,15 @@ final class LedgerStore(ds: DataSource):
   private def signedDelta(account: String, direction: String, amount: Long): Long =
     if Accounts.normalSide(account) == direction then amount else -amount
 
+  // Atomic upsert: an UPDATE-then-INSERT-if-missing pair races two concurrent first-writes
+  // for the same account into a duplicate-key (23505) failure; ON CONFLICT folds both into
+  // one statement, so a new account's first delta never throws.
   private def applyBalanceDelta(c: Connection, account: String, direction: String, amount: Long): Unit =
     val delta = signedDelta(account, direction, amount)
-    val updated = execute(c,
-      "UPDATE ACCOUNT_BALANCE SET BALANCE = BALANCE + ?, UPDATED_AT = CURRENT_TIMESTAMP WHERE ACCOUNT_ID = ?",
-      delta, account)
-    if updated == 0 then
-      execute(c,
-        "INSERT INTO ACCOUNT_BALANCE (ACCOUNT_ID, BALANCE, UPDATED_AT) VALUES (?, ?, CURRENT_TIMESTAMP)",
-        account, delta)
+    execute(c,
+      """INSERT INTO ACCOUNT_BALANCE (ACCOUNT_ID, BALANCE, UPDATED_AT) VALUES (?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT (ACCOUNT_ID) DO UPDATE SET BALANCE = ACCOUNT_BALANCE.BALANCE + EXCLUDED.BALANCE, UPDATED_AT = CURRENT_TIMESTAMP""",
+      account, delta)
 
   private def latestWithdrawalStatus(c: Connection, id: Long): Option[String] =
     one(c,
@@ -148,12 +182,6 @@ final class LedgerStore(ds: DataSource):
     case "Rejected"      => "admin_rejected"
     case "Cancelled"     => "user_cancelled"
     case "Failed"        => "provider_failed"
-    case _               => "status_changed"
-
-  private def proposalReason(to: String): String = to match
-    case "PendingReview" => "admin_proposed"
-    case "Approved"      => "admin_approved"
-    case "Rejected"      => "admin_rejected"
     case _               => "status_changed"
 
   private def txFromId(c: Connection, id: Long): Option[LedgerTx] =
@@ -199,6 +227,29 @@ final class LedgerStore(ds: DataSource):
   }
 
   def ledgerBalanceOf(account: String): Long = conn { c => ledgerBalanceOf(c, account) }
+
+  /** Take a row lock on a user's materialized ACCOUNT_BALANCE row so concurrent debiting
+    * operations (withdrawal reserve, user-debiting adjustment approval) serialize on it; the
+    * sufficiency check must then read `balanceOf` (the locked ACCOUNT_BALANCE row), not the
+    * LEDGER_ENTRY sum, for the lock to actually serialize it. A no-op when the row does not
+    * exist yet — a user with no balance row has zero balance, so any positive debit fails the
+    * check anyway. Requires an open transaction, or the lock would release immediately. */
+  def lockUserBalance(account: String): Unit =
+    require(txConn.get().nonEmpty, "lockUserBalance must be called inside transaction { … }")
+    conn { c =>
+      one(c, "SELECT 1 AS L FROM ACCOUNT_BALANCE WHERE ACCOUNT_ID = ? FOR UPDATE", account)(_.getInt("L"))
+      ()
+    }
+
+  /** Take a row lock on a LEDGER_TX row (append-only, so FOR UPDATE is allowed — it is not an
+    * UPDATE/DELETE). Used to serialize concurrent rollback-reversal proposals for the same
+    * target so the AlreadyReversed check is race-free. Requires an open transaction. */
+  def lockTransaction(id: Long): Unit =
+    require(txConn.get().nonEmpty, "lockTransaction must be called inside transaction { … }")
+    conn { c =>
+      one(c, "SELECT 1 AS L FROM LEDGER_TX WHERE ID = ? FOR UPDATE", id)(_.getInt("L"))
+      ()
+    }
 
   private def ledgerBalanceOf(c: Connection, account: String): Long =
     one(c,
@@ -317,6 +368,14 @@ final class LedgerStore(ds: DataSource):
       enabled.toString, reason, actor, actor, actor)
     audit(c, "config.payouts_enabled", actor, "payouts_enabled", enabled.toString)
   }
+  /** Bootstrap-set an approved system config value directly (no two-person flow). Used at
+    * startup to load the webhook secret from LEDGER_WEBHOOK_SECRET into config. */
+  def setSystemConfig(key: String, value: String, reason: String, actor: String): Unit = tx { c =>
+    execute(c,
+      "INSERT INTO SYSTEM_CONFIG_CHANGE (CONFIG_KEY, CONFIG_VALUE, REASON, ACTOR, PROPOSED_BY, APPROVED_BY) VALUES (?, ?, ?, ?, ?, ?)",
+      key, value, reason, actor, actor, actor)
+    audit(c, "config.bootstrap", actor, key, "set")
+  }
   def proposeConfig(key: String, value: String, reason: String, proposedBy: String): ConfigProposalRecord = tx { c =>
     val id = insertGenerated(c,
       "INSERT INTO SYSTEM_CONFIG_PROPOSAL (CONFIG_KEY, CONFIG_VALUE, REASON, STATUS, PROPOSED_BY) VALUES (?, ?, ?, 'PendingReview', ?)",
@@ -370,7 +429,9 @@ final class LedgerStore(ds: DataSource):
     }
   }
 
-  def guardLedgerAmount(userUid: String, amount: Long, subject: String): Either[String, Unit] = conn { c =>
+  // Wrapped in `transaction` so the risk-event row and the payouts kill-switch write
+  // commit as one unit; otherwise risk(c,…) and setPayoutsEnabled open separate tx{}.
+  def guardLedgerAmount(userUid: String, amount: Long, subject: String): Either[String, Unit] = transaction { conn { c =>
     val single = configLong(c, "single_ledger_amount_limit_points", 100000L)
     val growth = configLong(c, "per_user_day_point_growth_limit_points", 50000L)
     val today = one(c,
@@ -387,18 +448,27 @@ final class LedgerStore(ds: DataSource):
       setPayoutsEnabled(false, "point growth hard limit", "system")
       Left("risk_limit")
     else Right(())
-  }
+  } }
 
-  def checkWithdrawalRisk(userUid: String, amount: Long): Either[String, Boolean] = conn { c =>
+  // A withdrawal counts toward payout rate limits only while it is live — i.e. its latest
+  // status is not terminal (Rejected/Cancelled/Failed). Otherwise a request-then-cancel
+  // would permanently burn the user's daily / monthly / system quota.
+  private val liveWithdrawalFilter =
+    " AND (SELECT sc.TO_STATUS FROM WITHDRAWAL_STATUS_CHANGE sc WHERE sc.WITHDRAWAL_ID = WITHDRAWAL.ID ORDER BY sc.ID DESC LIMIT 1) NOT IN ('Rejected','Cancelled','Failed')"
+
+  // Wrapped in `transaction` (and called OUTSIDE the reserve transaction) so the risk events
+  // and the system-day kill-switch it writes commit independently — a later failure in the
+  // withdrawal flow must not roll back a recorded risk signal.
+  def checkWithdrawalRisk(userUid: String, amount: Long): Either[String, Boolean] = transaction { conn { c =>
     if configString(c, "payouts_enabled", "true") != "true" then Left("payouts_disabled")
     else
       val single = configLong(c, "single_payout_limit_points", 50000L)
       val userDayLimit = configLong(c, "per_user_day_payout_limit_points", 100000L)
       val userMonthLimit = configLong(c, "per_user_month_payout_limit_points", 500000L)
       val systemDayLimit = configLong(c, "system_day_payout_limit_points", 10000000L)
-      val userDay = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'", userUid)(_.getLong("N")).getOrElse(0L)
-      val userMonth = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 month'", userUid)(_.getLong("N")).getOrElse(0L)
-      val systemDay = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'")(_.getLong("N")).getOrElse(0L)
+      val userDay = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'" + liveWithdrawalFilter, userUid)(_.getLong("N")).getOrElse(0L)
+      val userMonth = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 month'" + liveWithdrawalFilter, userUid)(_.getLong("N")).getOrElse(0L)
+      val systemDay = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'" + liveWithdrawalFilter)(_.getLong("N")).getOrElse(0L)
       if amount > single then { risk(c, "single_payout", userUid, s"amount=$amount limit=$single"); Left("risk_limit") }
       else if userDay + amount > userDayLimit then { risk(c, "user_day_payout", userUid, s"amount=${userDay + amount} limit=$userDayLimit"); Left("risk_limit") }
       else if userMonth + amount > userMonthLimit then { risk(c, "user_month_payout", userUid, s"amount=${userMonth + amount} limit=$userMonthLimit"); Left("risk_limit") }
@@ -409,21 +479,31 @@ final class LedgerStore(ds: DataSource):
         val forceReview = prior == 0L || todayCount >= 2L
         if forceReview then risk(c, "payout_anomaly", userUid, s"first=$prior today=$todayCount")
         Right(forceReview)
-  }
+  } }
 
-  def pendingWithdrawalClearing: Long = conn { c =>
+  def pendingWithdrawalClearing: Long =
     val live = Set("PendingReview", "Submitted")
     allWithdrawals.filter(w => live.contains(w.status.toString)).map(_.amount).sum
-  }
 
-  def recordProviderEvent(eventId: String, withdrawalId: Long, outcome: String): Boolean =
-    try
-      tx { c => execute(c, "INSERT INTO WITHDRAWAL_PROVIDER_EVENT (EVENT_ID, WITHDRAWAL_ID, OUTCOME) VALUES (?, ?, ?)", eventId, withdrawalId, outcome); () }
-      true
-    catch case _: SQLException => false
+  /** Insert the provider-event dedup row. RAW — a duplicate EVENT_ID raises a unique
+    * violation (SQLState 23505) which the caller maps to an idempotent replay; any other
+    * SQLException propagates (it is a real error, not "already processed"). Requires an open
+    * transaction (uses the ambient connection): the enclosing transaction owns commit/
+    * rollback, so a failed settle/fail rolls the event row back and the webhook stays
+    * retryable. Calling it standalone would auto-commit the row and defeat that, hence the
+    * require. */
+  def insertProviderEvent(eventId: String, withdrawalId: Long, outcome: String): Unit =
+    require(txConn.get().nonEmpty, "insertProviderEvent must be called inside transaction { … }")
+    conn(c => execute(c, "INSERT INTO WITHDRAWAL_PROVIDER_EVENT (EVENT_ID, WITHDRAWAL_ID, OUTCOME) VALUES (?, ?, ?)", eventId, withdrawalId, outcome))
+
+  // No shipped fallback secret: when stripe_webhook_secret is unset, sign with a secret
+  // randomised once per process. Production sets the real shared secret from env at startup
+  // (LedgerServer); this fallback keeps signing self-consistent within the process (so tests
+  // pass) without baking in a known constant an attacker could forge against on a fresh deploy.
+  private val ephemeralWebhookSecret: String = java.util.UUID.randomUUID.toString + java.util.UUID.randomUUID.toString
 
   def webhookSignature(eventId: String, withdrawalId: Long, outcome: String): String = conn { c =>
-    val secret = configString(c, "stripe_webhook_secret", "test-secret")
+    val secret = configString(c, "stripe_webhook_secret", ephemeralWebhookSecret)
     val mac = Mac.getInstance("HmacSHA256")
     mac.init(SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256"))
     mac.doFinal(s"$eventId:$withdrawalId:$outcome".getBytes("UTF-8")).map(b => f"$b%02x").mkString
@@ -448,12 +528,16 @@ object Db:
     try body finally metaLocal.set(old)
 
   def init(ds: DataSource): Unit = { store = LedgerStore(ds) }
+  def transaction[A](body: => A): A = store.transaction(body)
+  def nextId(): Long = store.nextId()
   def insertTx(tx: LedgerTx): Unit = store.insert(tx)
   def txById(id: Long): Option[LedgerTx] = store.byId(id)
   def txBySource(kind: String, id: String): Option[LedgerTx] = store.bySource(kind, id)
   def allTxs: List[LedgerTx] = store.all
   def balanceOf(account: String): Long = store.balanceOf(account)
   def ledgerBalanceOf(account: String): Long = store.ledgerBalanceOf(account)
+  def lockUserBalance(account: String): Unit = store.lockUserBalance(account)
+  def lockTransaction(id: Long): Unit = store.lockTransaction(id)
   def balanceDrifts: List[BalanceDrift] = store.balanceDrifts
   def withdrawalPut(wd: Withdrawal): Unit = store.withdrawalPut(wd)
   def withdrawalById(id: Long): Option[Withdrawal] = store.withdrawalById(id)
@@ -472,6 +556,7 @@ object Db:
   def rejectConfig(id: Long, rejecter: String): Either[String, ConfigProposalRecord] = store.rejectConfig(id, rejecter)
   def allConfigProposals: List[ConfigProposalRecord] = store.allConfigProposals
   def setPayoutsEnabled(enabled: Boolean, reason: String, actor: String): Unit = store.setPayoutsEnabled(enabled, reason, actor)
+  def setSystemConfig(key: String, value: String, reason: String, actor: String): Unit = store.setSystemConfig(key, value, reason, actor)
   def payoutsEnabled: Boolean = store.payoutsEnabled
   def audit(action: String, actor: String, subject: String, detail: String): Unit = store.audit(action, actor, subject, detail)
   def auditLogs: List[AuditLogRecord] = store.auditLogs
@@ -479,5 +564,5 @@ object Db:
   def riskEvents: List[RiskEventRecord] = store.riskEvents
   def guardLedgerAmount(userUid: String, amount: Long, subject: String): Either[String, Unit] = store.guardLedgerAmount(userUid, amount, subject)
   def checkWithdrawalRisk(userUid: String, amount: Long): Either[String, Boolean] = store.checkWithdrawalRisk(userUid, amount)
-  def recordProviderEvent(eventId: String, withdrawalId: Long, outcome: String): Boolean = store.recordProviderEvent(eventId, withdrawalId, outcome)
+  def insertProviderEvent(eventId: String, withdrawalId: Long, outcome: String): Unit = store.insertProviderEvent(eventId, withdrawalId, outcome)
   def webhookSignature(eventId: String, withdrawalId: Long, outcome: String): String = store.webhookSignature(eventId, withdrawalId, outcome)

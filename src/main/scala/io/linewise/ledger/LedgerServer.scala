@@ -11,6 +11,9 @@ import sttp.tapir.server.netty.sync.NettySyncServer
  *   LEDGER_DB_USER       default postgres
  *   LEDGER_DB_PASSWORD   default postgres
  *   LEDGER_DB_SCHEMA     optional schema, created on startup when set
+ *   LEDGER_WEBHOOK_SECRET           shared HMAC secret for the payout webhook (no default;
+ *                                   absent it falls back to a per-process random secret)
+ *   LEDGER_PRINT_BOOTSTRAP_TOKEN=1  mint and print a one-off admin bearer token (dev only)
  *
  * Run: ./mill runMain io.linewise.ledger.LedgerServer
  * ========================================================================== */
@@ -20,8 +23,14 @@ object LedgerServer:
     val c0 = ds.getConnection()
     try Jdbc.initSchema(c0) finally c0.close()
     Db.init(ds) // bind the JDBC store the generated @extern repository delegates to
-    val api   = LedgerApi()
-    val admin = api.adminToken("bootstrap")
+    // Load the webhook secret from the environment into config; never ship a known one.
+    sys.env.get("LEDGER_WEBHOOK_SECRET").foreach(s =>
+      Db.setSystemConfig("stripe_webhook_secret", s, "bootstrap from env", "system"))
+    if sys.env.get("LEDGER_WEBHOOK_SECRET").isEmpty then
+      System.err.println("WARNING: LEDGER_WEBHOOK_SECRET unset — payout webhook verification uses an ephemeral per-process secret")
+    val api = LedgerApi()
     println("Ledger microservice (direct-style Ox tapir, Stainless-verified core) on http://localhost:8081  — Ctrl-C to stop")
-    println(s"Bootstrap admin bearer token: $admin")
+    // A bootstrap admin token is a permanent credential; only mint+print it on request.
+    if sys.env.get("LEDGER_PRINT_BOOTSTRAP_TOKEN").contains("1") then
+      println(s"Bootstrap admin bearer token: ${api.adminToken("bootstrap")}")
     NettySyncServer().host("localhost").port(8081).addEndpoints(api.serverEndpoints).startAndWait()

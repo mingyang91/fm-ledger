@@ -24,10 +24,21 @@ case class AdjustmentService[W](ledgerLens: Has[W, LedgerRepository], pLens: Has
       amount: FMLong, reason: String, proposedBy: String, freshPid: FMLong,
       targetTxId: Option[FMLong]): (W, Either[LedgerError, Proposal]) =
     if !(amount > FMLong(BigInt(0))) then (w, Left[LedgerError, Proposal](NonPositiveAmount))
+    else if alreadyReversed(pLens.get(w), kind, targetTxId) then
+      (w, Left[LedgerError, Proposal](AlreadyReversed))
     else
       val p = Proposal(freshPid, kind, userUid, debitAccount, creditAccount, amount, reason, proposedBy,
         ProposalStatus.PendingReview, None[FMLong](), targetTxId)
       (pLens(w).write((r: ProposalRepository) => r.put(p)), Right[LedgerError, Proposal](p))
+
+  /** A rollback reversal may target a transaction at most once: refuse a second proposal
+    * that targets the same tx unless the prior one was rejected. Manual adjustments carry
+    * no target, so they are never blocked here. This is the verified source of the
+    * AlreadyReversed error (the shell no longer re-checks it). */
+  def alreadyReversed(repo: ProposalRepository, kind: TxKind, targetTxId: Option[FMLong]): Boolean =
+    kind == TxKind.RollbackReversal && (targetTxId match
+      case Some(t) => repo.all.exists((p: Proposal) => p.targetTxId == Some[FMLong](t) && p.status != ProposalStatus.Rejected)
+      case _       => false)
 
   def approve(w: W, id: FMLong, expectedStatus: ProposalStatus, approver: String, freshTxId: FMLong): (W, Either[LedgerError, Proposal]) =
     pLens.get(w).get(id) match

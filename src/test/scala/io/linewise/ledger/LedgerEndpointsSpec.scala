@@ -1,87 +1,17 @@
 package io.linewise.ledger
 
-import java.util.UUID
-import scala.sys.process.*
-import scala.util.control.NonFatal
-
-import sttp.client4.*
-import sttp.model.{StatusCode, Uri}
-import sttp.tapir.Endpoint
-import sttp.tapir.client.sttp4.SttpClientInterpreter
-import sttp.tapir.server.stub4.TapirSyncStubInterpreter
+import sttp.model.StatusCode
 
 import io.linewise.ledger.LedgerEndpoints as E
-import io.linewise.ledger.generated.LedgerModel.TxKind
-import io.linewise.ledger.generated.{World, HasLedger, HasWithdrawals, HasProposals, HasObligations}
-import io.linewise.ledger.generated.{LedgerService, WithdrawalService, AdjustmentService, ObligationService}
-import io.linewise.ledger.generated.{JdbcLedgerRepository, JdbcWithdrawalRepository, JdbcProposalRepository, JdbcObligationRepository}
-import io.linewise.ledger.generated.{InMemLedgerRepository, InMemWithdrawalRepository, InMemProposalRepository, InMemObligationRepository}
 
 /* =============================================================================
- * Endpoint spec for the ledger microservice. Each test binds a fresh PostgreSQL
- * schema to the `Db` facade, stands up a LedgerApi, wraps its server endpoints in a
- * tapir sync stub (no port bound), and drives them with a typed sttp client from the
- * same bare endpoints. Every business decision inside runs the Stainless-transpiled
- * LedgerService through the generated JDBC repository. Tests are sequential
- * (munit default), each resetting the global Db to a fresh schema.
+ * Example-style endpoint spec for the ledger microservice. The shared test harness
+ * stands up a Testcontainers PostgreSQL instance, gives each test a fresh schema, and
+ * drives the tapir endpoints through a sync stub client. This suite keeps the
+ * narrative flows readable; property tests (including the differential drift gate) live
+ * in LedgerPropertiesSpec.
  * ========================================================================== */
-class LedgerEndpointsSpec extends munit.FunSuite:
-  private val baseUri: Uri = uri"http://test.local"
-  private val client = SttpClientInterpreter()
-  System.setProperty("java.net.useSystemProxies", "false")
-  System.clearProperty("socksProxyHost")
-  System.clearProperty("socksProxyPort")
-  private var containerId: String = ""
-  private var jdbcUrl: String = ""
-
-  override def beforeAll(): Unit =
-    containerId = Seq(
-      "docker", "run", "-d", "--rm",
-      "-e", "POSTGRES_PASSWORD=postgres",
-      "-e", "POSTGRES_DB=ledger_test",
-      "-p", "127.0.0.1::5432",
-      "postgres:16-alpine"
-    ).!!.trim
-    val binding = Seq("docker", "port", containerId, "5432/tcp").!!.linesIterator.next().trim
-    val port = binding.substring(binding.lastIndexOf(':') + 1)
-    jdbcUrl = s"jdbc:postgresql://127.0.0.1:$port/ledger_test"
-    waitForPostgres()
-
-  override def afterAll(): Unit =
-    if containerId.nonEmpty then Seq("docker", "rm", "-f", containerId).!
-
-  private def waitForPostgres(): Unit =
-    var last: Throwable = RuntimeException("PostgreSQL did not start")
-    var i = 0
-    while i < 80 do
-      try
-        val ds = Jdbc.dataSource(jdbcUrl, "postgres", "postgres")
-        val c = ds.getConnection()
-        try return
-        finally c.close()
-      catch
-        case NonFatal(e) =>
-          last = e
-          Thread.sleep(500)
-          i += 1
-    throw last
-
-  private def freshDs(prefix: String) =
-    val schema = s"${prefix}_${UUID.randomUUID.toString.replace("-", "")}"
-    Jdbc.dataSource(jdbcUrl, "postgres", "postgres", schema)
-
-  private def freshApi(): LedgerApi =
-    val ds = freshDs("ledger")
-    val c0 = ds.getConnection()
-    try Jdbc.initSchema(c0) finally c0.close()
-    Db.init(ds)
-    LedgerApi()
-
-  private def stubOf(api: LedgerApi): SyncBackend =
-    TapirSyncStubInterpreter().whenServerEndpointsRunLogic(api.serverEndpoints).backend()
-
-  private def secure[A, I, EE, O](ep: Endpoint[A, I, EE, O, Any], be: SyncBackend, token: A, in: I): Response[Either[EE, O]] =
-    client.toSecureRequestThrowDecodeFailures(ep, Some(baseUri))(token)(in).send(be)
+class LedgerEndpointsSpec extends LedgerHttpSuite:
 
   test("incentive credit mints (DR expense / CR user), is idempotent, and the balance reflects it") {
     val api = freshApi(); val be = stubOf(api); val tok = api.adminToken("svc")
@@ -221,50 +151,20 @@ class LedgerEndpointsSpec extends munit.FunSuite:
     assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-2", "bad")).code, StatusCode.Unauthorized)
   }
 
-  // --- the drift gate: in-memory ORACLE vs the @extern-over-JDBC PostgreSQL realization ---
-  // Kept in this suite (not a separate one) so it shares the sequential schedule that
-  // guards the global `Db` singleton against the other Db-binding tests above.
-  private val ledgerSvc = LedgerService[World](HasLedger())
-  private val wSvc = WithdrawalService[World](HasLedger(), HasWithdrawals())
-  private val aSvc = AdjustmentService[World](HasLedger(), HasProposals())
-  private val oSvc = ObligationService[World](HasObligations())
-
-  test("drift gate: the InMem oracle and the @extern-over-JDBC PostgreSQL realization agree row-for-row") {
-    val ds = freshDs("ldiff")
-    val c0 = ds.getConnection(); try Jdbc.initSchema(c0) finally c0.close()
-    Db.init(ds)
-    val jdbcW: World = World(JdbcLedgerRepository(), JdbcWithdrawalRepository(), JdbcProposalRepository(), JdbcObligationRepository())
-    var memW: World = World(InMemLedgerRepository(Nil), InMemWithdrawalRepository(Nil), InMemProposalRepository(Nil), InMemObligationRepository(Nil))
-
-    def credit(uid: String, amount: Long, fid: Long, sk: String, si: String): Unit =
-      val (mw, mr) = ledgerSvc.credit(memW, Accounts.IncentiveExpense, Accounts.user(uid), uid, amount, fid, sk, si); memW = mw
-      assertEquals(mr, ledgerSvc.credit(jdbcW, Accounts.IncentiveExpense, Accounts.user(uid), uid, amount, fid, sk, si)._2, "credit verdict diverged")
-    def openObl(sk: String, si: String, uid: String): Unit =
-      val (mw, mr) = oSvc.open(memW, sk, si, uid, "", "", "", 600L); memW = mw
-      assertEquals(mr, oSvc.open(jdbcW, sk, si, uid, "", "", "", 600L)._2, "obligation open verdict diverged")
-    def reserve(uid: String, amount: Long, creq: String, wid: Long, txid: Long): Unit =
-      val (mw, mr) = wSvc.request(memW, uid, amount, creq, wid, txid, Accounts.user(uid), Accounts.WithdrawalClearing); memW = mw
-      assertEquals(mr, wSvc.request(jdbcW, uid, amount, creq, wid, txid, Accounts.user(uid), Accounts.WithdrawalClearing)._2, "withdrawal request verdict diverged")
-    def propose(uid: String, amount: Long, pid: Long): Unit =
-      val (mw, mr) = aSvc.propose(memW, TxKind.ManualAdjustment, uid, Accounts.Adjustment, Accounts.user(uid), amount, "bonus", "alice", pid, None); memW = mw
-      assertEquals(mr, aSvc.propose(jdbcW, TxKind.ManualAdjustment, uid, Accounts.Adjustment, Accounts.user(uid), amount, "bonus", "alice", pid, None)._2, "proposal verdict diverged")
-
-    credit("u1", 1500L, 1L, "annotation_job", "job-1")
-    credit("u1", 1500L, 1L, "annotation_job", "job-1") // duplicate source: both -> Left(DuplicateSource)
-    credit("u2", 800L, 2L, "annotation_job", "job-2")
-    openObl("annotation_job", "job-9", "u1")
-    reserve("u1", 500L, "cr-1", 100L, 101L)
-    propose("u1", 200L, 200L)
-
-    assertEquals(ledgerSvc.all(memW).sortBy(_.id), ledgerSvc.all(jdbcW).sortBy(_.id), "ledger txs diverged")
-    assertEquals(ledgerSvc.get(memW, 1L), ledgerSvc.get(jdbcW, 1L), "tx get diverged")
-    assertEquals(ledgerSvc.get(memW, 999L), ledgerSvc.get(jdbcW, 999L), "missing tx get diverged")
-    assertEquals(oSvc.bySource(memW, "annotation_job", "job-9"), oSvc.bySource(jdbcW, "annotation_job", "job-9"), "obligation diverged")
-    assertEquals(oSvc.openObligations(memW).sortBy(_.sourceId), oSvc.openObligations(jdbcW).sortBy(_.sourceId), "open obligations diverged")
-    assertEquals(wSvc.get(memW, 100L), wSvc.get(jdbcW, 100L), "withdrawal diverged")
-    assertEquals(aSvc.get(memW, 200L), aSvc.get(jdbcW, 200L), "proposal diverged")
+  test("F2: a settled webhook before approval is rejected but NOT consumed; the same event id settles after approval") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "f2-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "f2-cr")).body.toOption.get
+    val sig = Db.webhookSignature("evt-f2", w.id, "settled")
+    // the provider reports "settled" while the withdrawal is still PendingReview: the
+    // transition fails (409) and, crucially, the event id is rolled back — not consumed.
+    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-f2", sig)).code, StatusCode.Conflict)
+    assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 0L)
+    // approve, then RETRY the very same event id -> it now settles and moves cash exactly once
+    secure(E.approveWithdrawal, be, svc, (w.id, DecisionRequest("PendingReview")))
+    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-f2", sig)).body.toOption.get.status, "Settled")
+    assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 300L)
   }
-
 
   test("a transaction cannot be reversed twice (already_reversed)") {
     val api = freshApi(); val be = stubOf(api); val alice = api.adminToken("alice"); val bob = api.adminToken("bob")
@@ -285,7 +185,69 @@ class LedgerEndpointsSpec extends munit.FunSuite:
       st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (1, 'user:u1', 'CR', 100)")
       intercept[java.sql.SQLException](st.execute("UPDATE LEDGER_TX SET USER_UID = 'u2' WHERE ID = 1")) // append-only: UPDATE rejected
       intercept[java.sql.SQLException](st.execute("DELETE FROM LEDGER_ENTRY WHERE TX_ID = 1"))          // append-only: DELETE rejected
+      intercept[java.sql.SQLException](st.execute("TRUNCATE LEDGER_ENTRY"))                             // append-only: TRUNCATE rejected
+      intercept[java.sql.SQLException](st.execute("TRUNCATE LEDGER_TX CASCADE"))                        // append-only: TRUNCATE rejected
       intercept[java.sql.SQLException](st.execute(                                                    // CHECK: credit needs a source
         "INSERT INTO LEDGER_TX (ID, KIND, USER_UID) VALUES (2, 'IncentiveCredit', 'u1')"))
     finally c.close()
+  }
+
+  test("withdrawal reject and owner-cancel both return the reserve; my/list withdrawals enumerate them") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "wr-fund"))
+    val w1 = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "wr-1")).body.toOption.get
+    assertEquals(secure(E.rejectWithdrawal, be, svc, (w1.id, DecisionRequest("PendingReview"))).body.toOption.get.status, "Rejected")
+    assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 1000L) // reserve returned
+    val w2 = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(200, "wr-2")).body.toOption.get
+    assertEquals(secure(E.cancelWithdrawal, be, uTok, (w2.id, DecisionRequest("PendingReview"))).body.toOption.get.status, "Cancelled")
+    assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 1000L)
+    assertEquals(secure(E.myWithdrawals, be, uTok, ()).body.toOption.get.size, 2)
+    assertEquals(secure(E.listWithdrawals, be, svc, ()).body.toOption.get.size, 2)
+  }
+
+  test("webhook failed outcome returns the reserve to the user (the refund leg), cash untouched") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "wf-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(400, "wf-1")).body.toOption.get
+    secure(E.approveWithdrawal, be, svc, (w.id, DecisionRequest("PendingReview")))
+    val sig = Db.webhookSignature("evt-fail", w.id, "failed")
+    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "failed", "evt-fail", sig)).body.toOption.get.status, "Failed")
+    assertEquals(secure(E.accountBalance, be, svc, "system:withdrawal_clearing").body.toOption.get.balancePoints, 0L)
+    assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 0L)
+    assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 1000L)
+  }
+
+  test("cross-user: a user cannot cancel another user's withdrawal (403)") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc")
+    val u1 = api.userToken("u1"); val u2 = api.userToken("u2")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "xu-fund"))
+    val w = secure(E.requestWithdrawal, be, u1, WithdrawalRequestBody(300, "xu-1")).body.toOption.get
+    assertEquals(secure(E.cancelWithdrawal, be, u2, (w.id, DecisionRequest("PendingReview"))).code, StatusCode.Forbidden)
+  }
+
+  test("adjustments: list and get round-trip; a rejected proposal cannot be approved") {
+    val api = freshApi(); val be = stubOf(api); val alice = api.adminToken("alice"); val bob = api.adminToken("bob")
+    secure(E.incentiveCredit, be, alice, CreditRequest("u1", 1000, "annotation_job", "adj-fund"))
+    val p = secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", "CREDIT", 100, "bonus")).body.toOption.get
+    assert(secure(E.listAdjustments, be, alice, ()).body.toOption.get.exists(_.id == p.id))
+    assertEquals(secure(E.getAdjustment, be, alice, p.id).body.toOption.get.id, p.id)
+    assertEquals(secure(E.rejectAdjustment, be, bob, (p.id, DecisionRequest("PendingReview"))).body.toOption.get.status, "Rejected")
+    assertEquals(secure(E.approveAdjustment, be, alice, (p.id, DecisionRequest("PendingReview"))).code, StatusCode.Conflict)
+    assertEquals(secure(E.getAdjustment, be, alice, 999999L).code, StatusCode.NotFound)
+  }
+
+  test("submit, user-transactions, obligation cancel, invariants run, and config-proposal listing") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "sub-fund"))
+    assert(secure(E.userTransactions, be, svc, "u1").body.toOption.get.nonEmpty)
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "sub-1")).body.toOption.get
+    assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "bank", "acct-1"))).body.toOption.get.status, "Submitted")
+    secure(E.openObligation, be, svc, ObligationOpenBody("annotation_job", "ob-x", "u2", 500))
+    assertEquals(secure(E.cancelObligation, be, svc, ObligationCancelBody("annotation_job", "ob-x")).body.toOption.get.status, "Cancelled")
+    val run = secure(E.invariantsCheck, be, svc, ()).body.toOption.get
+    assert(run.allPassed, run.toString)
+    assertEquals(secure(E.invariantsLatest, be, svc, ()).body.toOption.get.runId, run.runId)
+    assertEquals(secure(E.invariantById, be, svc, run.runId).body.toOption.get.runId, run.runId)
+    val cp = secure(E.proposeConfig, be, svc, ConfigProposalRequest("single_payout_limit_points", "70000", "raise")).body.toOption.get
+    assert(secure(E.listConfigProposals, be, svc, ()).body.toOption.get.exists(_.id == cp.id))
   }

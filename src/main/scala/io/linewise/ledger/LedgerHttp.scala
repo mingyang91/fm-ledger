@@ -2,6 +2,8 @@ package io.linewise.ledger
 
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.nio.charset.StandardCharsets.UTF_8
+import java.security.MessageDigest
 
 import sttp.model.StatusCode
 import sttp.monad.{IdentityMonad, MonadError}
@@ -12,6 +14,15 @@ import sttp.tapir.server.ServerEndpoint
 
 import io.linewise.ledger.generated.LedgerModel.*
 import io.linewise.ledger.generated.{World, HasLedger, HasWithdrawals, HasProposals, HasObligations, LedgerService, WithdrawalService, AdjustmentService, ObligationService, JdbcLedgerRepository, JdbcWithdrawalRepository, JdbcProposalRepository, JdbcObligationRepository, Withdrawal, Proposal, Obligation}
+
+// Thrown inside a webhook `Db.transaction` to force a rollback when the settle/fail
+// transition fails, so the provider-event dedup row is NOT persisted and the event stays
+// retryable. Carries the HTTP error to return after the rollback.
+private final case class WebhookAbort(err: (StatusCode, String)) extends RuntimeException
+// Thrown ONLY when the provider-event PK insert itself hits a 23505 (a genuine duplicate
+// event id), so a 23505 from any other write in the same transaction is NOT misread as a
+// replay and propagates as a real error.
+private final case class DuplicateEvent() extends RuntimeException
 
 /* =============================================================================
  * LEDGER WEB SERVER — direct-style (Ox / Identity) tapir over PostgreSQL-backed JDBC.
@@ -249,6 +260,7 @@ class LedgerApi:
     case ProposalNotFound   => (StatusCode.NotFound, "proposal not found")
     case TwoPersonViolation => (StatusCode.Conflict, "two_person_violation")
     case StatusConflict     => (StatusCode.Conflict, "status_conflict")
+    case AlreadyReversed    => (StatusCode.Conflict, "already_reversed")
     case NonPositiveAmount  => (StatusCode.BadRequest, "non_positive_amount")
     case _                  => (StatusCode.BadRequest, "bad request")
   /** Approve a proposal (adjustment or reversal), guarding a user-debiting approval
@@ -257,24 +269,34 @@ class LedgerApi:
     parsePStatus(expectedStatus) match
       case None => Left(statusConflict)
       case Some(es) =>
-        Db.proposalById(id) match
-          case Some(p) if Accounts.isUser(p.debitAccount) && Db.ledgerBalanceOf(p.debitAccount) < p.amount =>
-            Left((StatusCode.UnprocessableEntity, "would_violate_balance_invariant"))
-          case Some(p) =>
-            val txId = Ids.next()
-            Db.asActor(admin) {
-              Db.withTxMeta(TxWriteMeta(targetTxId = p.targetTxId, proposalId = Some(id), rawInput = Some(s"proposal=$id;reason=${p.reason}"))) {
-                aservice.approve(world, id, es, admin, txId)._2
-              }
-            } match
-              case Right(p2) =>
-                Db.audit("proposal.approve", admin, id.toString, p2.kind.toString)
-                Right(proposalResponse(p2))
-              case Left(e)  => Left(pErr(e))
-          case None =>
-            aservice.approve(world, id, es, admin, Ids.next())._2 match
-              case Right(p) => Right(proposalResponse(p))
-              case Left(e)  => Left(pErr(e))
+        // One transaction: the balance read, the FOR-UPDATE lock on the debited user
+        // account, the ledger post, and the proposal flip all commit or roll back together.
+        Db.transaction {
+          Db.proposalById(id) match
+            case Some(p) if Accounts.isUser(p.debitAccount) =>
+              Db.lockUserBalance(p.debitAccount)
+              // read the LOCKED materialized balance, so the lock actually serializes the check
+              if Db.balanceOf(p.debitAccount) < p.amount then
+                Left((StatusCode.UnprocessableEntity, "would_violate_balance_invariant"))
+              else approveProposalWrite(id, es, admin, p)
+            case Some(p) => approveProposalWrite(id, es, admin, p)
+            case None =>
+              aservice.approve(world, id, es, admin, Db.nextId())._2 match
+                case Right(p) => Right(proposalResponse(p))
+                case Left(e)  => Left(pErr(e))
+        }
+
+  private def approveProposalWrite(id: Long, es: ProposalStatus, admin: String, p: Proposal): Either[Err, ProposalResponse] =
+    val txId = Db.nextId()
+    Db.asActor(admin) {
+      Db.withTxMeta(TxWriteMeta(targetTxId = p.targetTxId, proposalId = Some(id), rawInput = Some(s"proposal=$id;reason=${p.reason}"))) {
+        aservice.approve(world, id, es, admin, txId)._2
+      }
+    } match
+      case Right(p2) =>
+        Db.audit("proposal.approve", admin, id.toString, p2.kind.toString)
+        Right(proposalResponse(p2))
+      case Left(e)  => Left(pErr(e))
 
   def serverEndpoints: List[SE] = List(
     incentiveCredit.handleSecurity(resolveAdmin).handle(admin => (req: CreditRequest) =>
@@ -284,33 +306,38 @@ class LedgerApi:
           Db.guardLedgerAmount(req.userUid, req.amountPoints, s"${req.sourceKind}:${req.sourceId}") match
             case Left(_) => Left((StatusCode.UnprocessableEntity, "risk_limit"))
             case Right(_) =>
-              Db.asActor(admin) {
-                Db.withTxMeta(TxWriteMeta(incentiveTraceId = req.incentiveTraceId, incentiveModule = req.incentiveModule, rawInput = Some(s"incentiveTraceId=${req.incentiveTraceId.getOrElse("")};module=${req.incentiveModule.getOrElse("")}"))) {
-                  service.credit(world, Accounts.IncentiveExpense, Accounts.user(req.userUid), req.userUid,
-                    req.amountPoints, Ids.next(), req.sourceKind, req.sourceId)._2
-                }
-              } match
-                case Right(tx) =>
-                  oservice.realize(world, req.sourceKind, req.sourceId, req.userUid, "", "", "", 0L, tx.id)
-                  Db.audit("ledger.incentive_credit", admin, s"${req.sourceKind}:${req.sourceId}", s"amount=${req.amountPoints};trace=${req.incentiveTraceId.getOrElse("")}")
-                  Right(txResponse(tx))
-                case Left(NonPositiveAmount) => Left((StatusCode.BadRequest, "non_positive_amount"))
-                case Left(DuplicateSource)   =>
-                  Db.txBySource(req.sourceKind, req.sourceId) match
-                    case Some(tx) => Right(txResponse(tx))
-                    case None     => Left((StatusCode.Conflict, "duplicate_source"))
-                case Left(_)                 => Left((StatusCode.BadRequest, "bad request"))),
+              // Credit + obligation realize + audit commit as one unit.
+              Db.transaction {
+                Db.asActor(admin) {
+                  Db.withTxMeta(TxWriteMeta(incentiveTraceId = req.incentiveTraceId, incentiveModule = req.incentiveModule, rawInput = Some(s"incentiveTraceId=${req.incentiveTraceId.getOrElse("")};module=${req.incentiveModule.getOrElse("")}"))) {
+                    service.credit(world, Accounts.IncentiveExpense, Accounts.user(req.userUid), req.userUid,
+                      req.amountPoints, Db.nextId(), req.sourceKind, req.sourceId)._2
+                  }
+                } match
+                  case Right(tx) =>
+                    oservice.realize(world, req.sourceKind, req.sourceId, req.userUid, "", "", "", 0L, tx.id)
+                    Db.audit("ledger.incentive_credit", admin, s"${req.sourceKind}:${req.sourceId}", s"amount=${req.amountPoints};trace=${req.incentiveTraceId.getOrElse("")}")
+                    Right(txResponse(tx))
+                  case Left(NonPositiveAmount) => Left((StatusCode.BadRequest, "non_positive_amount"))
+                  case Left(DuplicateSource)   =>
+                    Db.txBySource(req.sourceKind, req.sourceId) match
+                      case Some(tx) => Right(txResponse(tx))
+                      case None     => Left((StatusCode.Conflict, "duplicate_source"))
+                  case Left(_)                 => Left((StatusCode.BadRequest, "bad request"))
+              }),
 
 
     proposeAdjustment.handleSecurity(resolveAdmin).handle(admin => (req: AdjustProposeBody) =>
       val (dr, cr) =
         if req.direction == "CREDIT" then (Accounts.Adjustment, Accounts.user(req.userUid))
         else (Accounts.user(req.userUid), Accounts.Adjustment)
-      Db.asActor(admin) {
-        aservice.propose(world, TxKind.ManualAdjustment, req.userUid, dr, cr, req.amountPoints, req.reason, admin, Ids.next(), None)._2
-      } match
-        case Right(p) => Db.audit("proposal.adjustment.propose", admin, p.id.toString, req.reason); Right(proposalResponse(p))
-        case Left(e)  => Left(pErr(e))),
+      Db.transaction {
+        Db.asActor(admin) {
+          aservice.propose(world, TxKind.ManualAdjustment, req.userUid, dr, cr, req.amountPoints, req.reason, admin, Db.nextId(), None)._2
+        } match
+          case Right(p) => Db.audit("proposal.adjustment.propose", admin, p.id.toString, req.reason); Right(proposalResponse(p))
+          case Left(e)  => Left(pErr(e))
+      }),
 
     listAdjustments.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
       Right(aservice.all(world).filter(_.kind == TxKind.ManualAdjustment).map(proposalResponse))),
@@ -327,22 +354,28 @@ class LedgerApi:
       parsePStatus(in._2.expectedStatus) match
         case None     => Left(statusConflict)
         case Some(es) =>
-          Db.asActor(admin) { aservice.reject(world, in._1, es)._2 } match
-            case Right(p) => Db.audit("proposal.adjustment.reject", admin, in._1.toString, ""); Right(proposalResponse(p))
-            case Left(e)  => Left(pErr(e))),
+          Db.transaction {
+            Db.asActor(admin) { aservice.reject(world, in._1, es)._2 } match
+              case Right(p) => Db.audit("proposal.adjustment.reject", admin, in._1.toString, ""); Right(proposalResponse(p))
+              case Left(e)  => Left(pErr(e))
+          }),
 
     proposeReversal.handleSecurity(resolveAdmin).handle(admin => (req: ReversalProposeBody) =>
       Db.txById(req.targetTxId) match
         case None                                     => Left((StatusCode.NotFound, "target transaction not found"))
         case Some(t) if t.kind == TxKind.RollbackReversal => Left((StatusCode.Conflict, "cannot reverse a reversal"))
-        case Some(_) if Db.allProposals.exists(p => p.targetTxId.contains(req.targetTxId) && p.status != ProposalStatus.Rejected) =>
-          Left((StatusCode.Conflict, "already_reversed"))
+        // already-reversed is enforced by the verified AdjustmentService.propose (returns
+        // AlreadyReversed -> 409 via pErr); the FOR-UPDATE lock on the target tx row
+        // serializes concurrent reversals of the same tx so that verified check is race-free.
         case Some(t) =>
-          Db.asActor(admin) {
-            aservice.propose(world, TxKind.RollbackReversal, t.userUid, t.creditAccount, t.debitAccount, t.amount, req.reason, admin, Ids.next(), Some(req.targetTxId))._2
-          } match
-            case Right(p) => Db.audit("proposal.reversal.propose", admin, p.id.toString, req.reason); Right(proposalResponse(p))
-            case Left(e)  => Left(pErr(e))),
+          Db.transaction {
+            Db.lockTransaction(req.targetTxId)
+            Db.asActor(admin) {
+              aservice.propose(world, TxKind.RollbackReversal, t.userUid, t.creditAccount, t.debitAccount, t.amount, req.reason, admin, Db.nextId(), Some(req.targetTxId))._2
+            } match
+              case Right(p) => Db.audit("proposal.reversal.propose", admin, p.id.toString, req.reason); Right(proposalResponse(p))
+              case Left(e)  => Left(pErr(e))
+          }),
 
     approveReversal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, DecisionRequest)) =>
       approveProposal(in._1, in._2.expectedStatus, admin)),
@@ -351,9 +384,11 @@ class LedgerApi:
       parsePStatus(in._2.expectedStatus) match
         case None     => Left(statusConflict)
         case Some(es) =>
-          Db.asActor(admin) { aservice.reject(world, in._1, es)._2 } match
-            case Right(p) => Db.audit("proposal.reversal.reject", admin, in._1.toString, ""); Right(proposalResponse(p))
-            case Left(e)  => Left(pErr(e))),
+          Db.transaction {
+            Db.asActor(admin) { aservice.reject(world, in._1, es)._2 } match
+              case Right(p) => Db.audit("proposal.reversal.reject", admin, in._1.toString, ""); Right(proposalResponse(p))
+              case Left(e)  => Left(pErr(e))
+          }),
 
     getTx.handleSecurity(resolveAdmin).handle(_ => (id: Long) =>
       service.get(world, id) match
@@ -387,22 +422,33 @@ class LedgerApi:
       Db.withdrawalByClientReq(uid, req.clientRequestId) match
         case Some(wd) => Right(withdrawalResponse(wd))
         case None =>
-          if Db.ledgerBalanceOf(Accounts.user(uid)) < req.amountPoints then Left((StatusCode.BadRequest, "insufficient_balance"))
+          // Fast-path sufficiency (also keeps the 400-before-risk ordering for an obvious
+          // over-balance). checkWithdrawalRisk runs OUTSIDE the reserve transaction so its
+          // risk events / kill-switch commit independently of the reserve's success.
+          if Db.balanceOf(Accounts.user(uid)) < req.amountPoints then Left((StatusCode.BadRequest, "insufficient_balance"))
           else
             Db.checkWithdrawalRisk(uid, req.amountPoints) match
               case Left("payouts_disabled") => Left((StatusCode.ServiceUnavailable, "payouts_disabled"))
               case Left(_)                  => Left((StatusCode.UnprocessableEntity, "risk_limit"))
               case Right(_) =>
-                val wid = Ids.next()
-                val reserveTxId = Ids.next()
-                Db.asActor(uid) {
-                  Db.withTxMeta(TxWriteMeta(withdrawalId = Some(wid), rawInput = Some(s"clientRequestId=${req.clientRequestId}"))) {
-                    wservice.request(world, uid, req.amountPoints, req.clientRequestId, wid, reserveTxId,
-                      Accounts.user(uid), Accounts.WithdrawalClearing)._2
-                  }
-                } match
-                  case Right(wd) => Db.audit("withdrawal.request", uid, wid.toString, req.amountPoints.toString); Right(withdrawalResponse(wd))
-                  case Left(e)   => Left(wErr(e))),
+                // One transaction: lock the user's balance row, RE-CHECK sufficiency on the
+                // locked materialized balance, and post the reserve — so two concurrent
+                // reserves for the same user serialize instead of both passing (the TOCTOU).
+                Db.transaction {
+                  Db.lockUserBalance(Accounts.user(uid))
+                  if Db.balanceOf(Accounts.user(uid)) < req.amountPoints then Left((StatusCode.BadRequest, "insufficient_balance"))
+                  else
+                    val wid = Db.nextId()
+                    val reserveTxId = Db.nextId()
+                    Db.asActor(uid) {
+                      Db.withTxMeta(TxWriteMeta(withdrawalId = Some(wid), rawInput = Some(s"clientRequestId=${req.clientRequestId}"))) {
+                        wservice.request(world, uid, req.amountPoints, req.clientRequestId, wid, reserveTxId,
+                          Accounts.user(uid), Accounts.WithdrawalClearing)._2
+                      }
+                    } match
+                      case Right(wd) => Db.audit("withdrawal.request", uid, wid.toString, req.amountPoints.toString); Right(withdrawalResponse(wd))
+                      case Left(e)   => Left(wErr(e))
+                }),
 
     myWithdrawals.handleSecurity(resolveUser).handle(uid => (_: Unit) =>
       Right(wservice.all(world).filter(_.userUid == uid).map(withdrawalResponse))),
@@ -414,13 +460,15 @@ class LedgerApi:
           parseWStatus(in._2.expectedStatus) match
             case None     => Left(statusConflict)
             case Some(es) =>
-              Db.asActor(uid) {
-                Db.withTxMeta(TxWriteMeta(withdrawalId = Some(in._1), rawInput = Some("cancel"))) {
-                  wservice.cancel(world, in._1, es, Ids.next(), Accounts.WithdrawalClearing, userAcctOf(in._1))._2
-                }
-              } match
-                case Right(wd) => Db.audit("withdrawal.cancel", uid, in._1.toString, ""); Right(withdrawalResponse(wd))
-                case Left(e)   => Left(wErr(e))),
+              Db.transaction {
+                Db.asActor(uid) {
+                  Db.withTxMeta(TxWriteMeta(withdrawalId = Some(in._1), rawInput = Some("cancel"))) {
+                    wservice.cancel(world, in._1, es, Db.nextId(), Accounts.WithdrawalClearing, userAcctOf(in._1))._2
+                  }
+                } match
+                  case Right(wd) => Db.audit("withdrawal.cancel", uid, in._1.toString, ""); Right(withdrawalResponse(wd))
+                  case Left(e)   => Left(wErr(e))
+              }),
 
     listWithdrawals.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
       Right(wservice.all(world).map(withdrawalResponse))),
@@ -429,41 +477,49 @@ class LedgerApi:
       parseWStatus(in._2.expectedStatus) match
         case None     => Left(statusConflict)
         case Some(es) =>
-          Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
-            case Right(wd) => Db.audit("withdrawal.approve", admin, in._1.toString, ""); Right(withdrawalResponse(wd))
-            case Left(e)   => Left(wErr(e))),
+          Db.transaction {
+            Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
+              case Right(wd) => Db.audit("withdrawal.approve", admin, in._1.toString, ""); Right(withdrawalResponse(wd))
+              case Left(e)   => Left(wErr(e))
+          }),
 
     submitWithdrawal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, PayoutSubmitRequest)) =>
       parseWStatus(in._2.expectedStatus) match
         case None     => Left(statusConflict)
         case Some(es) =>
-          Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
-            case Right(wd) => Db.audit("withdrawal.submit", admin, in._1.toString, s"${in._2.channel}:${in._2.destinationId}"); Right(withdrawalResponse(wd))
-            case Left(e)   => Left(wErr(e))),
+          Db.transaction {
+            Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
+              case Right(wd) => Db.audit("withdrawal.submit", admin, in._1.toString, s"${in._2.channel}:${in._2.destinationId}"); Right(withdrawalResponse(wd))
+              case Left(e)   => Left(wErr(e))
+          }),
 
     rejectWithdrawal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, DecisionRequest)) =>
       parseWStatus(in._2.expectedStatus) match
         case None     => Left(statusConflict)
         case Some(es) =>
-          Db.asActor(admin) {
-            Db.withTxMeta(TxWriteMeta(withdrawalId = Some(in._1), rawInput = Some("reject"))) {
-              wservice.reject(world, in._1, es, Ids.next(), Accounts.WithdrawalClearing, userAcctOf(in._1))._2
-            }
-          } match
-            case Right(wd) => Db.audit("withdrawal.reject", admin, in._1.toString, ""); Right(withdrawalResponse(wd))
-            case Left(e)   => Left(wErr(e))),
+          Db.transaction {
+            Db.asActor(admin) {
+              Db.withTxMeta(TxWriteMeta(withdrawalId = Some(in._1), rawInput = Some("reject"))) {
+                wservice.reject(world, in._1, es, Db.nextId(), Accounts.WithdrawalClearing, userAcctOf(in._1))._2
+              }
+            } match
+              case Right(wd) => Db.audit("withdrawal.reject", admin, in._1.toString, ""); Right(withdrawalResponse(wd))
+              case Left(e)   => Left(wErr(e))
+          }),
 
     settleWithdrawal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, DecisionRequest)) =>
       parseWStatus(in._2.expectedStatus) match
         case None     => Left(statusConflict)
         case Some(es) =>
-          Db.asActor(admin) {
-            Db.withTxMeta(TxWriteMeta(withdrawalId = Some(in._1), rawInput = Some("manual_settle"))) {
-              wservice.settle(world, in._1, es, Ids.next(), Accounts.WithdrawalClearing, Accounts.Cash)._2
-            }
-          } match
-            case Right(wd) => Db.audit("withdrawal.settle", admin, in._1.toString, "manual"); Right(withdrawalResponse(wd))
-            case Left(e)   => Left(wErr(e))),
+          Db.transaction {
+            Db.asActor(admin) {
+              Db.withTxMeta(TxWriteMeta(withdrawalId = Some(in._1), rawInput = Some("manual_settle"))) {
+                wservice.settle(world, in._1, es, Db.nextId(), Accounts.WithdrawalClearing, Accounts.Cash)._2
+              }
+            } match
+              case Right(wd) => Db.audit("withdrawal.settle", admin, in._1.toString, "manual"); Right(withdrawalResponse(wd))
+              case Left(e)   => Left(wErr(e))
+          }),
 
 
     openObligation.handleSecurity(resolveAdmin).handle(_ => (b: ObligationOpenBody) =>
@@ -487,30 +543,51 @@ class LedgerApi:
       Right(service.all(world).filter(t => t.debitAccount == acct || t.creditAccount == acct).map(txResponse))),
 
     stripeWebhook.handleSecurity(resolveAdmin).handle(_ => (b: StripeWebhookBody) =>
-      if b.signature != Db.webhookSignature(b.eventId, b.withdrawalId, b.outcome) then Left((StatusCode.Unauthorized, "bad_signature"))
+      // The endpoint stays admin-bearer-gated: it is fronted by a trusted internal relay
+      // that injects the token; the HMAC over (eventId:withdrawalId:outcome) is a second
+      // factor, compared in constant time. A real provider never calls this path directly.
+      val expected = Db.webhookSignature(b.eventId, b.withdrawalId, b.outcome)
+      if !MessageDigest.isEqual(b.signature.getBytes(UTF_8), expected.getBytes(UTF_8)) then
+        Left((StatusCode.Unauthorized, "bad_signature"))
+      else if b.outcome != "settled" && b.outcome != "failed" then
+        Left((StatusCode.BadRequest, "bad_outcome"))
       else Db.withdrawalById(b.withdrawalId) match
         case None => Left((StatusCode.NotFound, "withdrawal not found"))
-        case Some(existing) if !Db.recordProviderEvent(b.eventId, b.withdrawalId, b.outcome) =>
-          Right(withdrawalResponse(existing))
-        case Some(_) if b.outcome != "settled" && b.outcome != "failed" =>
-          Left((StatusCode.BadRequest, "bad_outcome"))
         case Some(_) =>
-          val res =
-            if b.outcome == "settled" then
-              Db.asActor("stripe") {
-                Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
-                  wservice.settle(world, b.withdrawalId, WithdrawalStatus.Submitted, Ids.next(), Accounts.WithdrawalClearing, Accounts.Cash)._2
-                }
-              }
-            else
-              Db.asActor("stripe") {
-                Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
-                  wservice.fail(world, b.withdrawalId, WithdrawalStatus.Submitted, Ids.next(), Accounts.WithdrawalClearing, userAcctOf(b.withdrawalId))._2
-                }
-              }
-          res match
-            case Right(wd) => Db.audit("withdrawal.webhook", "stripe", b.withdrawalId.toString, b.eventId); Right(withdrawalResponse(wd))
-            case Left(e)   => Left(wErr(e))),
+          try
+            val wd = Db.transaction {
+              // Dedup gate INSIDE the tx: a duplicate EVENT_ID trips the PK -> DuplicateEvent
+              // -> replay. Scoping the 23505 catch to THIS insert means a 23505 from any other
+              // write is a real error, not a misread replay. A failed transition throws
+              // WebhookAbort so the event row rolls back and stays retryable (no "consumed
+              // but unsettled" state).
+              try Db.insertProviderEvent(b.eventId, b.withdrawalId, b.outcome)
+              catch case e: java.sql.SQLException if e.getSQLState == "23505" => throw DuplicateEvent()
+              val res =
+                if b.outcome == "settled" then
+                  Db.asActor("stripe") {
+                    Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
+                      wservice.settle(world, b.withdrawalId, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, Accounts.Cash)._2
+                    }
+                  }
+                else
+                  Db.asActor("stripe") {
+                    Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
+                      wservice.fail(world, b.withdrawalId, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, userAcctOf(b.withdrawalId))._2
+                    }
+                  }
+              res match
+                case Right(w) => Db.audit("withdrawal.webhook", "stripe", b.withdrawalId.toString, b.eventId); withdrawalResponse(w)
+                case Left(e)  => throw WebhookAbort(wErr(e))
+            }
+            Right(wd)
+          catch
+            case WebhookAbort(err) => Left(err)
+            case _: DuplicateEvent =>
+              // duplicate event id -> already processed: idempotent replay of the outcome
+              Db.withdrawalById(b.withdrawalId) match
+                case Some(w) => Right(withdrawalResponse(w))
+                case None    => Left((StatusCode.NotFound, "withdrawal not found"))),
 
     riskEvents.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
       Right(Db.riskEvents.map(riskResponse))),

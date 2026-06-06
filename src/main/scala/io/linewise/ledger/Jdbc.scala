@@ -3,6 +3,7 @@ package io.linewise.ledger
 import java.sql.Connection
 import javax.sql.DataSource
 
+import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
 import org.postgresql.ds.PGSimpleDataSource
 
 /* =============================================================================
@@ -27,8 +28,24 @@ object Jdbc:
   private def requireSafeSchema(schema: String): Unit =
     require(schemaPattern.matches(schema), s"unsafe PostgreSQL schema name: $schema")
 
+  // Connection pool. PGSimpleDataSource opens a fresh TCP + auth round-trip on every
+  // getConnection, and one endpoint call opens several connections, so production must
+  // pool. minimumIdle=0 keeps the many short-lived per-schema pools the test harness
+  // creates from each pinning an idle connection. The pool is a HikariDataSource, so the
+  // owner (server / test harness) can `close()` it to release connections and threads.
+  private def pool(url: String, user: String, password: String, schema: Option[String]): HikariDataSource =
+    val cfg = HikariConfig()
+    cfg.setJdbcUrl(url)
+    cfg.setUsername(user)
+    cfg.setPassword(password)
+    cfg.setMaximumPoolSize(sys.env.get("LEDGER_DB_POOL_SIZE").flatMap(_.toIntOption).getOrElse(8))
+    cfg.setMinimumIdle(0)
+    schema.foreach(s => cfg.setPoolName(s"ledger-$s"))
+    schema.foreach(cfg.setSchema)
+    HikariDataSource(cfg)
+
   def dataSource(jdbcUrl: String, user: String, password: String): DataSource =
-    pg(jdbcUrl, user, password)
+    pool(jdbcUrl, user, password, None)
 
   def dataSource(jdbcUrl: String, user: String, password: String, schema: String): DataSource =
     requireSafeSchema(schema)
@@ -39,9 +56,7 @@ object Jdbc:
       try st.execute(s"CREATE SCHEMA IF NOT EXISTS $schema")
       finally st.close()
     finally c0.close()
-    val scoped = pg(jdbcUrl, user, password)
-    scoped.setCurrentSchema(schema)
-    scoped
+    pool(jdbcUrl, user, password, Some(schema))
 
   def dataSource(databaseName: String): DataSource =
     val env = sys.env
@@ -53,6 +68,10 @@ object Jdbc:
       case None         => dataSource(url, user, password)
 
   val ddl: List[String] = List(
+    // One shared sequence supplies every application-assigned id (LEDGER_TX / WITHDRAWAL /
+    // PROPOSAL). A DB sequence is monotone across process restarts, so ids never collide
+    // with already-persisted rows the way a process-local counter would.
+    "CREATE SEQUENCE LEDGER_ID_SEQ",
     """CREATE TABLE LEDGER_TX (
          ID BIGINT PRIMARY KEY,
          KIND VARCHAR NOT NULL,
@@ -82,6 +101,9 @@ object Jdbc:
        )""",
     "CREATE INDEX IX_LEDGER_ENTRY_TX ON LEDGER_ENTRY (TX_ID)",
     "CREATE INDEX IX_LEDGER_ENTRY_ACCOUNT ON LEDGER_ENTRY (ACCOUNT_ID)",
+    // ACCOUNT_BALANCE is the intentionally-MUTABLE materialized view of the ledger: every
+    // posting UPDATEs it, and `balanceDrifts` + the account_balance_matches_replay invariant
+    // reconcile it against replaying LEDGER_ENTRY. It deliberately has no append-only guard.
     """CREATE TABLE ACCOUNT_BALANCE (
          ACCOUNT_ID VARCHAR PRIMARY KEY,
          BALANCE BIGINT NOT NULL DEFAULT 0,
@@ -97,6 +119,10 @@ object Jdbc:
        $$""",
     "CREATE TRIGGER LEDGER_TX_NO_MUTATION BEFORE UPDATE OR DELETE ON LEDGER_TX FOR EACH ROW EXECUTE FUNCTION LEDGER_REJECT_MUTATION()",
     "CREATE TRIGGER LEDGER_ENTRY_NO_MUTATION BEFORE UPDATE OR DELETE ON LEDGER_ENTRY FOR EACH ROW EXECUTE FUNCTION LEDGER_REJECT_MUTATION()",
+    // Row-level triggers do not fire on TRUNCATE, so append-only also needs statement-level
+    // BEFORE TRUNCATE triggers, or the whole table could be wiped past the guard.
+    "CREATE TRIGGER LEDGER_TX_NO_TRUNCATE BEFORE TRUNCATE ON LEDGER_TX FOR EACH STATEMENT EXECUTE FUNCTION LEDGER_REJECT_MUTATION()",
+    "CREATE TRIGGER LEDGER_ENTRY_NO_TRUNCATE BEFORE TRUNCATE ON LEDGER_ENTRY FOR EACH STATEMENT EXECUTE FUNCTION LEDGER_REJECT_MUTATION()",
 
     """CREATE TABLE WITHDRAWAL (
          ID BIGINT PRIMARY KEY,
@@ -204,8 +230,10 @@ object Jdbc:
     "INSERT INTO SYSTEM_CONFIG_CHANGE (CONFIG_KEY, CONFIG_VALUE, REASON, ACTOR, APPROVED_BY) VALUES ('per_user_month_payout_limit_points', '500000', 'seed', 'system', 'system')",
     "INSERT INTO SYSTEM_CONFIG_CHANGE (CONFIG_KEY, CONFIG_VALUE, REASON, ACTOR, APPROVED_BY) VALUES ('system_day_payout_limit_points', '10000000', 'seed', 'system', 'system')",
     "INSERT INTO SYSTEM_CONFIG_CHANGE (CONFIG_KEY, CONFIG_VALUE, REASON, ACTOR, APPROVED_BY) VALUES ('single_ledger_amount_limit_points', '100000', 'seed', 'system', 'system')",
-    "INSERT INTO SYSTEM_CONFIG_CHANGE (CONFIG_KEY, CONFIG_VALUE, REASON, ACTOR, APPROVED_BY) VALUES ('per_user_day_point_growth_limit_points', '50000', 'seed', 'system', 'system')",
-    "INSERT INTO SYSTEM_CONFIG_CHANGE (CONFIG_KEY, CONFIG_VALUE, REASON, ACTOR, APPROVED_BY) VALUES ('stripe_webhook_secret', 'test-secret', 'seed', 'system', 'system')"
+    "INSERT INTO SYSTEM_CONFIG_CHANGE (CONFIG_KEY, CONFIG_VALUE, REASON, ACTOR, APPROVED_BY) VALUES ('per_user_day_point_growth_limit_points', '50000', 'seed', 'system', 'system')"
+    // No stripe_webhook_secret is seeded: production sets it from LEDGER_WEBHOOK_SECRET at
+    // startup; absent that, webhookSignature falls back to a per-process random secret
+    // (never a shipped constant). See LedgerStore.webhookSignature / LedgerServer.
   )
 
   def initSchema(c: Connection): Unit =
