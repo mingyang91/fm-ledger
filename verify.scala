@@ -1,9 +1,8 @@
 // Mill single-file Scala script: ./mill verify.scala [files...]
 //
 // Runs Stainless formal verification in a Docker container.
-// If no files are specified, verifies all of stainless-lib + every pet-store verify
-// source (auto-discovered under verify/src/main/scala). The pet store has no INVALID
-// counterexample files, so the headline no-args run reports 0 invalid.
+// If no files are specified, verifies all of stainless-lib + every verify source
+// auto-discovered under verify/src/main/scala.
 //
 // The Stainless VC cache is persisted to verify/.stainless-cache (gitignored) via the
 // /work mount, so structurally-identical VCs are not re-solved across runs: a warm

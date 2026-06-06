@@ -59,6 +59,19 @@ object `package` extends SbtModule {
       base / "UserRepository.scala", base / "UserValidation.scala", base / "UserService.scala",
     )
 
+  // The incentive-points ledger's verified executable core (transpiler input, same
+  // transpiler, target package io.linewise.ledger.generated). The proofs
+  // (LedgerProofs) are verify-only and never transpiled.
+  def ledgerVerifiedSources: T[Seq[PathRef]] =
+    val base = moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "ledger" / "verify"
+    Task.Sources(
+      base / "LedgerModel.scala", base / "Has.scala", base / "World.scala",
+      base / "LedgerRepository.scala", base / "LedgerValidation.scala", base / "LedgerService.scala",
+      base / "WithdrawalRepository.scala", base / "WithdrawalService.scala",
+      base / "ProposalRepository.scala", base / "AdjustmentService.scala",
+      base / "ObligationRepository.scala", base / "ObligationService.scala",
+    )
+
   /** Run the transpiler over each verified executable core and emit the
     * production code into a generated-sources directory under io.linewise.petstore.generated.
     * Registered in `generatedSources` below, so `./mill compile` regenerates
@@ -94,6 +107,7 @@ object `package` extends SbtModule {
     }
 
     genInto(verifiedSources(), "io.linewise.petstore.generated")
+    genInto(ledgerVerifiedSources(), "io.linewise.ledger.generated")
     PathRef(genRoot)
   }
 
