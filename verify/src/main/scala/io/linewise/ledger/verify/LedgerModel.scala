@@ -22,8 +22,7 @@ object LedgerModel {
 
   // Constrained values are sum types, not bare strings. Scala 3 enums auto-namespace
   // their cases, so the collisions across entities (PendingReview/Rejected/Cancelled)
-  // don't clash. They transpile verbatim (no FM types / annotations) and serialize as
-  // their case name via Pickler, exactly like the pet store's PetStatus.
+  // The status enums are top-level to keep generated case-object names stable.
   enum ObligationStatus { case Open, Realized, Cancelled }
   enum TxKind { case IncentiveCredit, ManualAdjustment, RollbackReversal, WithdrawalReserve, WithdrawalSettle, WithdrawalReturn }
   enum WithdrawalStatus { case PendingReview, Submitted, Settled, Rejected, Cancelled, Failed }

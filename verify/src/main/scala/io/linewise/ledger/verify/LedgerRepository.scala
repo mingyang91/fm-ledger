@@ -14,11 +14,10 @@ import io.linewise.ledger.Db
  *     discharges the postGet axiom by head-match.
  *   - JdbcLedgerRepository: FIELD-LESS (so it stays immutable — a stored handle would
  *     taint the World mutable, which the Has lens forbids); `rows` is an erased ghost
- *     stub; each op is @extern @pure and delegates to the production Quill `Db` facade.
- *     Quill is not on the verify classpath, so it cannot live in verified source; the
- *     @extern body is havoc'd, so it delegates to `Db` (a verify-only stub here, the
- *     real Quill DAO in production). TRUSTED via the axiom on its ensuring; the
- *     in-memory-vs-JDBC differential test is the machine-checked guard.
+ *     stub; each op is @extern @pure and delegates to the production PostgreSQL-backed
+ *     `Db` facade. The @extern body is havoc'd during verification. TRUSTED via the
+ *     axiom on its ensuring; the in-memory-vs-JDBC differential test is the
+ *     machine-checked guard.
  *
  * The ledger is APPEND-ONLY: `post` only ever adds; there is no update or delete. The
  * postGet axiom (post(tx).get(tx.id) == Some(tx)) is head-match dischargeable.
@@ -46,7 +45,7 @@ case class InMemLedgerRepository(items: List[LedgerTx]) extends LedgerRepository
 }
 
 /* JDBC realization — FIELD-LESS (immutable); each op @extern, delegating to the
- * production Quill `Db` facade; @ghost stub rows; trusted via the axiom. */
+ * production PostgreSQL-backed `Db` facade; @ghost stub rows; trusted via the axiom. */
 case class JdbcLedgerRepository() extends LedgerRepository {
   @ghost def rows: List[LedgerTx] = Nil[LedgerTx]()
 

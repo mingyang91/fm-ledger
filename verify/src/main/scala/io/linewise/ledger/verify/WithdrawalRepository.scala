@@ -15,9 +15,9 @@ import io.linewise.ledger.Db
  * is UPSERT-by-id (`put`), because a status transition rewrites the same withdrawal row
  * — the money movements themselves stay append-only in the ledger.
  *
- * Same shape as the ledger repo and the pet store repos: sealed abstract + @ghost rows
- * + a head-match @law (putGet) discharged by the InMem oracle and trusted on the
- * field-less @extern Jdbc realization that delegates to the production Quill `Db`.
+ * Same shape as the ledger repo: sealed abstract + @ghost rows + a head-match @law
+ * (putGet) discharged by the InMem oracle and trusted on the field-less @extern Jdbc
+ * realization that delegates to the production PostgreSQL-backed `Db`.
  * ========================================================================== */
 case class Withdrawal(
     id:              FMLong,

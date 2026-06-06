@@ -376,7 +376,7 @@ final class LedgerStore(ds: DataSource):
     val today = one(c,
       """SELECT COALESCE(SUM(E.AMOUNT), 0) AS N FROM LEDGER_TX T JOIN LEDGER_ENTRY E ON E.TX_ID = T.ID
          WHERE T.USER_UID = ? AND T.KIND = 'IncentiveCredit' AND E.DIRECTION = 'CR' AND E.ACCOUNT_ID = ?
-           AND T.CREATED_AT >= DATEADD('DAY', -1, CURRENT_TIMESTAMP)""",
+           AND T.CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'""",
       userUid, Accounts.user(userUid))(_.getLong("N")).getOrElse(0L)
     if amount > single then
       risk(c, "single_ledger_amount", subject, s"amount=$amount limit=$single")
@@ -396,16 +396,16 @@ final class LedgerStore(ds: DataSource):
       val userDayLimit = configLong(c, "per_user_day_payout_limit_points", 100000L)
       val userMonthLimit = configLong(c, "per_user_month_payout_limit_points", 500000L)
       val systemDayLimit = configLong(c, "system_day_payout_limit_points", 10000000L)
-      val userDay = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= DATEADD('DAY', -1, CURRENT_TIMESTAMP)", userUid)(_.getLong("N")).getOrElse(0L)
-      val userMonth = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= DATEADD('MONTH', -1, CURRENT_TIMESTAMP)", userUid)(_.getLong("N")).getOrElse(0L)
-      val systemDay = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE CREATED_AT >= DATEADD('DAY', -1, CURRENT_TIMESTAMP)")(_.getLong("N")).getOrElse(0L)
+      val userDay = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'", userUid)(_.getLong("N")).getOrElse(0L)
+      val userMonth = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 month'", userUid)(_.getLong("N")).getOrElse(0L)
+      val systemDay = one(c, "SELECT COALESCE(SUM(AMOUNT), 0) AS N FROM WITHDRAWAL WHERE CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'")(_.getLong("N")).getOrElse(0L)
       if amount > single then { risk(c, "single_payout", userUid, s"amount=$amount limit=$single"); Left("risk_limit") }
       else if userDay + amount > userDayLimit then { risk(c, "user_day_payout", userUid, s"amount=${userDay + amount} limit=$userDayLimit"); Left("risk_limit") }
       else if userMonth + amount > userMonthLimit then { risk(c, "user_month_payout", userUid, s"amount=${userMonth + amount} limit=$userMonthLimit"); Left("risk_limit") }
       else if systemDay + amount > systemDayLimit then { risk(c, "system_day_payout", "system", s"amount=${systemDay + amount} limit=$systemDayLimit"); setPayoutsEnabled(false, "system payout hard limit", "system"); Left("risk_limit") }
       else
         val prior = one(c, "SELECT COUNT(*) AS N FROM WITHDRAWAL WHERE USER_UID = ?", userUid)(_.getLong("N")).getOrElse(0L)
-        val todayCount = one(c, "SELECT COUNT(*) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= DATEADD('DAY', -1, CURRENT_TIMESTAMP)", userUid)(_.getLong("N")).getOrElse(0L)
+        val todayCount = one(c, "SELECT COUNT(*) AS N FROM WITHDRAWAL WHERE USER_UID = ? AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'", userUid)(_.getLong("N")).getOrElse(0L)
         val forceReview = prior == 0L || todayCount >= 2L
         if forceReview then risk(c, "payout_anomaly", userUid, s"first=$prior today=$todayCount")
         Right(forceReview)

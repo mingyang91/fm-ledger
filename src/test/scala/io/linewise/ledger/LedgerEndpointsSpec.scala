@@ -1,6 +1,8 @@
 package io.linewise.ledger
 
 import java.util.UUID
+import scala.sys.process.*
+import scala.util.control.NonFatal
 
 import sttp.client4.*
 import sttp.model.{StatusCode, Uri}
@@ -16,19 +18,60 @@ import io.linewise.ledger.generated.{JdbcLedgerRepository, JdbcWithdrawalReposit
 import io.linewise.ledger.generated.{InMemLedgerRepository, InMemWithdrawalRepository, InMemProposalRepository, InMemObligationRepository}
 
 /* =============================================================================
- * Endpoint spec for the ledger microservice — same shape as the pet store's specs.
- * Each test binds a fresh in-memory H2 to the `Db` facade, stands up a LedgerApi, wraps
- * its server endpoints in a tapir sync stub (no port bound), and drives them with a
- * typed sttp client from the SAME bare endpoints. Every business decision inside runs
- * the Stainless-transpiled LedgerService through the generated JDBC repository. Tests
- * are sequential (munit default), each resetting the global Db to a fresh schema.
+ * Endpoint spec for the ledger microservice. Each test binds a fresh PostgreSQL
+ * schema to the `Db` facade, stands up a LedgerApi, wraps its server endpoints in a
+ * tapir sync stub (no port bound), and drives them with a typed sttp client from the
+ * same bare endpoints. Every business decision inside runs the Stainless-transpiled
+ * LedgerService through the generated JDBC repository. Tests are sequential
+ * (munit default), each resetting the global Db to a fresh schema.
  * ========================================================================== */
 class LedgerEndpointsSpec extends munit.FunSuite:
   private val baseUri: Uri = uri"http://test.local"
   private val client = SttpClientInterpreter()
+  System.setProperty("java.net.useSystemProxies", "false")
+  System.clearProperty("socksProxyHost")
+  System.clearProperty("socksProxyPort")
+  private var containerId: String = ""
+  private var jdbcUrl: String = ""
+
+  override def beforeAll(): Unit =
+    containerId = Seq(
+      "docker", "run", "-d", "--rm",
+      "-e", "POSTGRES_PASSWORD=postgres",
+      "-e", "POSTGRES_DB=ledger_test",
+      "-p", "127.0.0.1::5432",
+      "postgres:16-alpine"
+    ).!!.trim
+    val binding = Seq("docker", "port", containerId, "5432/tcp").!!.linesIterator.next().trim
+    val port = binding.substring(binding.lastIndexOf(':') + 1)
+    jdbcUrl = s"jdbc:postgresql://127.0.0.1:$port/ledger_test"
+    waitForPostgres()
+
+  override def afterAll(): Unit =
+    if containerId.nonEmpty then Seq("docker", "rm", "-f", containerId).!
+
+  private def waitForPostgres(): Unit =
+    var last: Throwable = RuntimeException("PostgreSQL did not start")
+    var i = 0
+    while i < 80 do
+      try
+        val ds = Jdbc.dataSource(jdbcUrl, "postgres", "postgres")
+        val c = ds.getConnection()
+        try return
+        finally c.close()
+      catch
+        case NonFatal(e) =>
+          last = e
+          Thread.sleep(500)
+          i += 1
+    throw last
+
+  private def freshDs(prefix: String) =
+    val schema = s"${prefix}_${UUID.randomUUID.toString.replace("-", "")}"
+    Jdbc.dataSource(jdbcUrl, "postgres", "postgres", schema)
 
   private def freshApi(): LedgerApi =
-    val ds = Jdbc.dataSource(s"ledger_${UUID.randomUUID}")
+    val ds = freshDs("ledger")
     val c0 = ds.getConnection()
     try Jdbc.initSchema(c0) finally c0.close()
     Db.init(ds)
@@ -178,16 +221,16 @@ class LedgerEndpointsSpec extends munit.FunSuite:
     assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-2", "bad")).code, StatusCode.Unauthorized)
   }
 
-  // --- the drift gate: in-memory ORACLE vs the @extern-over-Quill JDBC realization ---
+  // --- the drift gate: in-memory ORACLE vs the @extern-over-JDBC PostgreSQL realization ---
   // Kept in this suite (not a separate one) so it shares the sequential schedule that
   // guards the global `Db` singleton against the other Db-binding tests above.
   private val ledgerSvc = LedgerService[World](HasLedger())
-  private val wSvc      = WithdrawalService[World](HasLedger(), HasWithdrawals())
-  private val aSvc      = AdjustmentService[World](HasLedger(), HasProposals())
-  private val oSvc      = ObligationService[World](HasObligations())
+  private val wSvc = WithdrawalService[World](HasLedger(), HasWithdrawals())
+  private val aSvc = AdjustmentService[World](HasLedger(), HasProposals())
+  private val oSvc = ObligationService[World](HasObligations())
 
-  test("drift gate: the InMem oracle and the @extern-over-Quill JDBC realization agree row-for-row") {
-    val ds = Jdbc.dataSource(s"ldiff_${UUID.randomUUID}")
+  test("drift gate: the InMem oracle and the @extern-over-JDBC PostgreSQL realization agree row-for-row") {
+    val ds = freshDs("ldiff")
     val c0 = ds.getConnection(); try Jdbc.initSchema(c0) finally c0.close()
     Db.init(ds)
     val jdbcW: World = World(JdbcLedgerRepository(), JdbcWithdrawalRepository(), JdbcProposalRepository(), JdbcObligationRepository())
@@ -232,7 +275,7 @@ class LedgerEndpointsSpec extends munit.FunSuite:
   }
 
   test("LEDGER_TX is append-only and a credit must carry a source (DB-enforced)") {
-    val ds = Jdbc.dataSource(s"ledgerao_${UUID.randomUUID}")
+    val ds = freshDs("ledgerao")
     val c = ds.getConnection()
     try
       Jdbc.initSchema(c)

@@ -1,21 +1,56 @@
 package io.linewise.ledger
 
 import java.sql.Connection
+import javax.sql.DataSource
+
+import org.postgresql.ds.PGSimpleDataSource
 
 /* =============================================================================
- * SCHEMA + persistence support for the ledger microservice. H2 runs in PostgreSQL
- * mode for tests and local serving. The schema now mirrors the module design: a
- * transaction header plus append-only entry legs, append-only lifecycle logs for
- * withdrawals/proposals, config/risk/audit logs, and a derived account_balance
- * table that can be rebuilt from the ledger.
+ * SCHEMA + persistence support for the ledger microservice. The production store is
+ * PostgreSQL. Tests use the same DDL against an isolated PostgreSQL schema, not H2
+ * compatibility mode, so trigger syntax, identity columns, intervals, and TEXT fields
+ * are all exercised on the target database.
  * ========================================================================== */
 object Jdbc:
 
-  private def h2Url(name: String): String =
-    s"jdbc:h2:mem:$name;MODE=PostgreSQL;DB_CLOSE_DELAY=-1"
+  private val defaultUser = "postgres"
+  private val defaultPassword = "postgres"
+  private val schemaPattern = "[A-Za-z_][A-Za-z0-9_]*".r
 
-  def dataSource(name: String): javax.sql.DataSource =
-    org.h2.jdbcx.JdbcConnectionPool.create(h2Url(name), "sa", "")
+  private def pg(url: String, user: String, password: String): PGSimpleDataSource =
+    val ds = PGSimpleDataSource()
+    ds.setURL(url)
+    ds.setUser(user)
+    ds.setPassword(password)
+    ds
+
+  private def requireSafeSchema(schema: String): Unit =
+    require(schemaPattern.matches(schema), s"unsafe PostgreSQL schema name: $schema")
+
+  def dataSource(jdbcUrl: String, user: String, password: String): DataSource =
+    pg(jdbcUrl, user, password)
+
+  def dataSource(jdbcUrl: String, user: String, password: String, schema: String): DataSource =
+    requireSafeSchema(schema)
+    val admin = pg(jdbcUrl, user, password)
+    val c0 = admin.getConnection()
+    try
+      val st = c0.createStatement()
+      try st.execute(s"CREATE SCHEMA IF NOT EXISTS $schema")
+      finally st.close()
+    finally c0.close()
+    val scoped = pg(jdbcUrl, user, password)
+    scoped.setCurrentSchema(schema)
+    scoped
+
+  def dataSource(databaseName: String): DataSource =
+    val env = sys.env
+    val url = env.getOrElse("LEDGER_JDBC_URL", s"jdbc:postgresql://localhost:5432/$databaseName")
+    val user = env.getOrElse("LEDGER_DB_USER", defaultUser)
+    val password = env.getOrElse("LEDGER_DB_PASSWORD", defaultPassword)
+    env.get("LEDGER_DB_SCHEMA") match
+      case Some(schema) => dataSource(url, user, password, schema)
+      case None         => dataSource(url, user, password)
 
   val ddl: List[String] = List(
     """CREATE TABLE LEDGER_TX (
@@ -29,7 +64,7 @@ object Jdbc:
          PROPOSAL_ID BIGINT,
          INCENTIVE_TRACE_ID VARCHAR,
          INCENTIVE_MODULE VARCHAR,
-         RAW_INPUT CLOB,
+         RAW_INPUT TEXT,
          CREATED_AT TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
          CONSTRAINT CK_CREDIT_HAS_SOURCE CHECK (KIND <> 'IncentiveCredit' OR (SOURCE_KIND IS NOT NULL AND SOURCE_ID IS NOT NULL))
        )""",
@@ -52,10 +87,16 @@ object Jdbc:
          BALANCE BIGINT NOT NULL DEFAULT 0,
          UPDATED_AT TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
        )""",
-    "CREATE TRIGGER LEDGER_TX_NO_UPDATE BEFORE UPDATE ON LEDGER_TX FOR EACH ROW CALL \"io.linewise.ledger.LedgerAppendOnlyTrigger\"",
-    "CREATE TRIGGER LEDGER_TX_NO_DELETE BEFORE DELETE ON LEDGER_TX FOR EACH ROW CALL \"io.linewise.ledger.LedgerAppendOnlyTrigger\"",
-    "CREATE TRIGGER LEDGER_ENTRY_NO_UPDATE BEFORE UPDATE ON LEDGER_ENTRY FOR EACH ROW CALL \"io.linewise.ledger.LedgerAppendOnlyTrigger\"",
-    "CREATE TRIGGER LEDGER_ENTRY_NO_DELETE BEFORE DELETE ON LEDGER_ENTRY FOR EACH ROW CALL \"io.linewise.ledger.LedgerAppendOnlyTrigger\"",
+    """CREATE OR REPLACE FUNCTION LEDGER_REJECT_MUTATION()
+       RETURNS trigger
+       LANGUAGE plpgsql
+       AS $$
+       BEGIN
+         RAISE EXCEPTION 'append-only ledger table % rejects %', TG_TABLE_NAME, TG_OP;
+       END;
+       $$""",
+    "CREATE TRIGGER LEDGER_TX_NO_MUTATION BEFORE UPDATE OR DELETE ON LEDGER_TX FOR EACH ROW EXECUTE FUNCTION LEDGER_REJECT_MUTATION()",
+    "CREATE TRIGGER LEDGER_ENTRY_NO_MUTATION BEFORE UPDATE OR DELETE ON LEDGER_ENTRY FOR EACH ROW EXECUTE FUNCTION LEDGER_REJECT_MUTATION()",
 
     """CREATE TABLE WITHDRAWAL (
          ID BIGINT PRIMARY KEY,
@@ -105,7 +146,6 @@ object Jdbc:
          CREATED_AT TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
        )""",
     "CREATE INDEX IX_PROPOSAL_STATUS_CHANGE_PROP ON PROPOSAL_STATUS_CHANGE (PROPOSAL_ID, ID)",
-
 
     """CREATE TABLE OBLIGATION (
          SOURCE_KIND VARCHAR NOT NULL,

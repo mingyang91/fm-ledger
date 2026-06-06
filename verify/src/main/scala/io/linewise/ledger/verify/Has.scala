@@ -4,8 +4,8 @@ import stainless.lang._
 import stainless.annotation._
 
 /* =============================================================================
- * Has[W, R] — the same LENS / capability the pet store uses, in the ledger package.
- * A service is polymorphic in the world type W and is handed a `Has[W, R]` to read
+ * Has[W, R] — a small LENS / capability for verified services. A service is
+ * polymorphic in the world type W and is handed a `Has[W, R]` to read
  * and write its slice R of W. The two lens laws are stated as @laws, so every
  * concrete lens (the World accessors) is checked lawful. The transpiler strips @law;
  * production keeps the plain interface.

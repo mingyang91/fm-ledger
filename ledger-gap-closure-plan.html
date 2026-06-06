@@ -611,7 +611,7 @@
               <div class="when">Phase 9</div><div class="dot-col"><div class="dot"></div></div>
               <div class="body">
                 <h3>Lock in the endpoint surface and tests</h3>
-                <p>Keep current reads. Move direct mutating operations behind two-person flows. Add Petstore-style property tests, JDBC-vs-in-memory drift tests, webhook replay tests, and failure-injection tests for lost Stripe responses.</p>
+                <p>Keep current reads. Move direct mutating operations behind two-person flows. Add ledger property tests, JDBC-vs-in-memory drift tests, webhook replay tests, and failure-injection tests for lost Stripe responses.</p>
               </div>
             </div>
           </div>
@@ -683,7 +683,7 @@
 
         <section id="s8">
           <div class="sec-head"><span class="num">08</span><h2>Testing plan</h2></div>
-          <p class="lead">Use the Petstore testing shape, but aim the properties at financial laws. Keep example tests for readable flows, then add generated cases around idempotency, state transitions, and invariants.</p>
+          <p class="lead">Use the same endpoint-plus-differential testing shape across the ledger, but aim the properties at financial laws. Keep example tests for readable flows, then add generated cases around idempotency, state transitions, and invariants.</p>
           <div class="grid-2">
             <div class="card">
               <h3>Property tests</h3>

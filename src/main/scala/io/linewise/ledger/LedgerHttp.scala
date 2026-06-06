@@ -14,10 +14,10 @@ import io.linewise.ledger.generated.LedgerModel.*
 import io.linewise.ledger.generated.{World, HasLedger, HasWithdrawals, HasProposals, HasObligations, LedgerService, WithdrawalService, AdjustmentService, ObligationService, JdbcLedgerRepository, JdbcWithdrawalRepository, JdbcProposalRepository, JdbcObligationRepository, Withdrawal, Proposal, Obligation}
 
 /* =============================================================================
- * LEDGER WEB SERVER — direct-style (Ox / Identity) tapir, same stack as the pet store.
+ * LEDGER WEB SERVER — direct-style (Ox / Identity) tapir over PostgreSQL-backed JDBC.
  * Every business decision is delegated to the STAINLESS-TRANSPILED LedgerService through
- * the [W] / Has lens (over a JDBC-backed World whose repository delegates to the Quill
- * `Db`); only the HTTP shell (routing, JSON, status mapping) and the backed-token auth
+ * the [W] / Has lens (over a JDBC-backed World whose repository delegates to `Db`);
+ * only the HTTP shell (routing, JSON, status mapping) and the backed-token auth
  * live here. Balances and the funds summary are production aggregates read from `Db`
  * (the verified core proves append-only + conservation-by-construction; the live SUM is
  * a read concern, guarded by the differential test).
@@ -148,8 +148,8 @@ class LedgerApi:
   type SE = ServerEndpoint[Any, Identity]
   type Err = (StatusCode, String)
 
-  // The JDBC-backed world: a field-less repository that delegates to the ambient Quill
-  // `Db` (bind it with Db.init(ds) before serving). The service is the generated one.
+  // The JDBC-backed world: field-less repositories delegate to the ambient `Db`
+  // facade (bind it with Db.init(ds) before serving). The service is generated.
   private val world    = World(JdbcLedgerRepository(), JdbcWithdrawalRepository(), JdbcProposalRepository(), JdbcObligationRepository())
   private val service  = LedgerService[World](HasLedger())
   private val wservice = WithdrawalService[World](HasLedger(), HasWithdrawals())

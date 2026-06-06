@@ -1,4 +1,4 @@
-package io.linewise.jobfm.transpiler
+package io.linewise.fm.transpiler
 
 import scala.meta._
 
@@ -30,7 +30,7 @@ import scala.meta._
  * THE RULES (each its own pass, in order):
  *   imports  drop `import stainless.*`, `import io.linewise.verify.effect.{FMInt,FMLong}`,
  *            `import *Proofs.*`; REDIRECT `io.linewise.verify.ox` -> `ox` and
- *            `io.linewise.verify.effect.SafeArith` -> `io.linewise.jobfm.SafeArith`
+ *            `io.linewise.verify.effect.SafeArith` -> `io.linewise.fm.SafeArith`
  *   R2       rewrite the package ref -> <targetPkg>
  *   R7       strip @law @opaque @inlineOnce @extern @ghost @pure @induct @partialEval
  *   R8       drop whole `def`s whose body contains `.holds`
@@ -64,10 +64,8 @@ object Transpiler {
        |""".stripMargin
 
   /** Full pipeline. Parse-validate input (Scala3), rewrite, parse-validate output.
-    * `targetPkg` is the production package the generated core lands in; it defaults
-    * to the job system's package so existing callers are unaffected, and the ledger
-    * passes `io.linewise.ledgerfm.generated`. */
-  def transpile(input: String, srcRel: String, targetPkg: String = "io.linewise.jobfm.generated"): String = {
+    * `targetPkg` is the production package the generated core lands in. */
+  def transpile(input: String, srcRel: String, targetPkg: String = "io.linewise.fm.generated"): String = {
     parseScala3(input).fold(
       err => throw new IllegalArgumentException(s"input is not valid Scala 3: $err"),
       _   => ()
@@ -168,7 +166,7 @@ object Transpiler {
   // RULES
   // ===========================================================================
 
-  def rewrite(input: String, targetPkg: String = "io.linewise.jobfm.generated"): String = {
+  def rewrite(input: String, targetPkg: String = "io.linewise.fm.generated"): String = {
     var s = input
     s = importsRule(s)
     s = packageRule(s, targetPkg)
@@ -187,7 +185,7 @@ object Transpiler {
   // --- imports: drop verification-only imports; redirect the two shadows -----
   // Each import here has a single importer. Classified once by its ref path:
   //   io.linewise.verify.ox               -> redirect ref to `ox`
-  //   io.linewise.verify.effect.SafeArith -> redirect ref to io.linewise.jobfm
+  //   io.linewise.verify.effect.SafeArith -> redirect ref to io.linewise.fm
   //   stainless.*                         -> drop the line
   //   io.linewise.verify.effect.{FMInt,FMLong} -> drop the line
   //   *Proofs.*                           -> drop the line
@@ -203,10 +201,10 @@ object Transpiler {
         redirect("ox")
       else if path.startsWith("io.linewise.verify.effect.SafeArith") then
         // `import io.linewise.verify.effect.SafeArith._` (SafeArith is the ref tail)
-        redirect(path.replace("io.linewise.verify.effect.SafeArith", "io.linewise.jobfm.SafeArith"))
+        redirect(path.replace("io.linewise.verify.effect.SafeArith", "io.linewise.fm.SafeArith"))
       else if path == "io.linewise.verify.effect" && importees.exists(_.contains("SafeArith")) then
         // `import io.linewise.verify.effect.SafeArith` (SafeArith is the importee)
-        redirect("io.linewise.jobfm")
+        redirect("io.linewise.fm")
       else if root == "stainless" then dropLine
       else if path == "io.linewise.verify.effect" then dropLine
       else if root.endsWith("Proofs") then dropLine

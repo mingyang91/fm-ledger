@@ -1,4 +1,4 @@
-package io.linewise.jobfm.transpiler
+package io.linewise.fm.transpiler
 
 import java.nio.file.{Files, Path, Paths}
 
@@ -20,7 +20,7 @@ object Main {
     val out: Path = Paths.get(args(1))
     val label     = if args.length >= 3 then args(2) else in.getFileName.toString
     // optional 4th arg: the production package the generated core lands in.
-    val targetPkg = if args.length >= 4 then args(3) else "io.linewise.jobfm.generated"
+    val targetPkg = if args.length >= 4 then args(3) else "io.linewise.fm.generated"
 
     val source    = Files.readString(in)
     val generated = Transpiler.transpile(source, label, targetPkg)
