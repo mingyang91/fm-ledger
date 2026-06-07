@@ -70,6 +70,7 @@ object LedgerModel {
   sealed trait LedgerError
   case object NonPositiveAmount extends LedgerError
   case object UnbalancedTx extends LedgerError
+  case object DuplicateTxId extends LedgerError
   case object DuplicateSource extends LedgerError
   case class TxNotFound(id: FMLong) extends LedgerError
   case object WithdrawalNotFound extends LedgerError

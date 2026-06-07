@@ -17,8 +17,17 @@ object LedgerValidation {
       hasDirection(tx.entries, EntryDirection.CR) &&
       sumDirection(tx.entries, EntryDirection.DR) == sumDirection(tx.entries, EntryDirection.CR)
 
+  def admissible(tx: LedgerTx): Boolean =
+    positiveAmount(tx) && balanced(tx)
+
+  def txIdFresh(repo: LedgerRepository, tx: LedgerTx): Boolean =
+    repo.get(tx.id).isEmpty
+
   def isFresh(repo: LedgerRepository, tx: LedgerTx): Boolean =
     (tx.sourceKind, tx.sourceId) match
       case (Some(k), Some(i)) => repo.findBySource(k, i).isEmpty
       case _                  => true
+
+  def admissibleFresh(repo: LedgerRepository, tx: LedgerTx): Boolean =
+    admissible(tx) && txIdFresh(repo, tx) && isFresh(repo, tx)
 }

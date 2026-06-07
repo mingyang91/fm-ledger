@@ -19,6 +19,8 @@ case class LedgerService[W](has: Has[W, LedgerRepository]) {
       (w, Left[LedgerError, LedgerTx](NonPositiveAmount))
     else if !LedgerValidation.balanced(tx) then
       (w, Left[LedgerError, LedgerTx](UnbalancedTx))
+    else if !LedgerValidation.txIdFresh(repo, tx) then
+      (w, Left[LedgerError, LedgerTx](DuplicateTxId))
     else if !LedgerValidation.isFresh(repo, tx) then
       (w, Left[LedgerError, LedgerTx](DuplicateSource))
     else

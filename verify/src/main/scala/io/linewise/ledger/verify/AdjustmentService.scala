@@ -36,6 +36,10 @@ case class AdjustmentService[W](ledgerLens: Has[W, LedgerRepository], pLens: Has
           (w, Left[LedgerError, Proposal](StatusConflict))
         else if p.proposedBy == approver then
           (w, Left[LedgerError, Proposal](TwoPersonViolation))
+        else if !(p.amount > FMLong(BigInt(0))) then
+          (w, Left[LedgerError, Proposal](NonPositiveAmount))
+        else if !ledgerLens.get(w).get(freshTxId).isEmpty then
+          (w, Left[LedgerError, Proposal](DuplicateTxId))
         else
           val tx = twoLegTx(freshTxId, p.kind, p.debitAccount, p.creditAccount, p.amount, None[String](), None[String](), p.userUid)
           val w1 = ledgerLens(w).write((r: LedgerRepository) => r.post(tx))

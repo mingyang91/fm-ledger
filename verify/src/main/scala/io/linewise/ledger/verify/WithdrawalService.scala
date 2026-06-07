@@ -21,6 +21,7 @@ case class WithdrawalService[W](ledgerLens: Has[W, LedgerRepository], wLens: Has
       case Some(existing) => (w, Right[LedgerError, Withdrawal](existing))
       case _ =>
         if !(amount > FMLong(BigInt(0))) then (w, Left[LedgerError, Withdrawal](NonPositiveAmount))
+        else if !ledgerLens.get(w).get(freshTxId).isEmpty then (w, Left[LedgerError, Withdrawal](DuplicateTxId))
         else
           val reserveTx = twoLegTx(freshTxId, TxKind.WithdrawalReserve, userAccount, clearingAccount, amount,
             None[String](), None[String](), userUid)
@@ -67,6 +68,10 @@ case class WithdrawalService[W](ledgerLens: Has[W, LedgerRepository], wLens: Has
       case Some(wd) =>
         if wd.status != expectedStatus || wd.status != requiredFrom then
           (w, Left[LedgerError, Withdrawal](StatusConflict))
+        else if !(wd.amount > FMLong(BigInt(0))) then
+          (w, Left[LedgerError, Withdrawal](NonPositiveAmount))
+        else if !ledgerLens.get(w).get(freshTxId).isEmpty then
+          (w, Left[LedgerError, Withdrawal](DuplicateTxId))
         else
           val tx = twoLegTx(freshTxId, txKind, debitAccount, creditAccount, wd.amount, None[String](), None[String](), wd.userUid)
           val w1 = ledgerLens(w).write((r: LedgerRepository) => r.post(tx))

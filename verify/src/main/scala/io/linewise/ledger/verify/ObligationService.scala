@@ -33,7 +33,7 @@ case class ObligationService[W](oLens: Has[W, ObligationRepository]) {
       case Some(o) =>
         if o.status == ObligationStatus.Realized then (w, Left[LedgerError, Obligation](SourceTerminal))
         else
-          val o2 = o.copy(status = ObligationStatus.Cancelled)
+          val o2 = o.copy(status = ObligationStatus.Cancelled, realizedTxId = None[FMLong]())
           (oLens(w).write((r: ObligationRepository) => r.put(o2)), Right[LedgerError, Obligation](o2))
       case _ =>
         val o = Obligation(sourceKind, sourceId, "", "", "", "", FMLong(BigInt(0)), ObligationStatus.Cancelled, None[FMLong]())

@@ -219,6 +219,7 @@ class LedgerApi:
     case StatusConflict     => (StatusCode.Conflict, "status_conflict")
     case NonPositiveAmount  => (StatusCode.BadRequest, "non_positive_amount")
     case UnbalancedTx       => (StatusCode.BadRequest, "unbalanced_tx")
+    case DuplicateTxId     => (StatusCode.Conflict, "duplicate_tx_id")
     case _                  => (StatusCode.BadRequest, "bad request")
 
   private def parseWStatus(s: String): Option[WithdrawalStatus] = WithdrawalStatus.values.find(_.toString == s)
@@ -294,6 +295,7 @@ class LedgerApi:
     case AlreadyReversed    => (StatusCode.Conflict, "already_reversed")
     case NonPositiveAmount  => (StatusCode.BadRequest, "non_positive_amount")
     case UnbalancedTx       => (StatusCode.BadRequest, "unbalanced_tx")
+    case DuplicateTxId     => (StatusCode.Conflict, "duplicate_tx_id")
     case _                  => (StatusCode.BadRequest, "bad request")
   /** Approve a proposal (adjustment or reversal), guarding a user-debiting approval
     * against driving the balance negative (a production fold, not a verified condition). */
@@ -331,6 +333,7 @@ class LedgerApi:
     case NonPositiveAmount => (StatusCode.BadRequest, "non_positive_amount")
     case UnbalancedTx      => (StatusCode.BadRequest, "unbalanced_tx")
     case DuplicateSource   => (StatusCode.Conflict, "duplicate_source")
+    case DuplicateTxId    => (StatusCode.Conflict, "duplicate_tx_id")
     case _                 => (StatusCode.BadRequest, "bad request")
 
   private def postLedgerTx(kind: TxKind, userUid: String, entries: List[LedgerEntry], meta: TxWriteMeta = TxWriteMeta()): Either[Err, LedgerTx] =
@@ -649,6 +652,8 @@ class LedgerApi:
         Left((StatusCode.Unauthorized, "bad_signature"))
       else if b.outcome != "settled" && b.outcome != "failed" then
         Left((StatusCode.BadRequest, "bad_outcome"))
+      else if b.providerFeeDebited < 0 then
+        Left((StatusCode.BadRequest, "bad_fee"))
       else Db.withdrawalById(b.withdrawalId) match
         case None => Left((StatusCode.NotFound, "withdrawal not found"))
         case Some(withdrawal) =>
