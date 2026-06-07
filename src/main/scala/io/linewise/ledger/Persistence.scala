@@ -7,7 +7,7 @@ import javax.crypto.spec.SecretKeySpec
 
 import com.augustnagro.magnum.*
 
-import io.linewise.ledger.generated.LedgerModel.{LedgerTx, TxKind, WithdrawalStatus, ProposalStatus, ObligationStatus}
+import io.linewise.ledger.generated.LedgerModel.{LedgerTx, LedgerEntry, TxKind, WithdrawalStatus, ProposalStatus, ObligationStatus, EntryDirection}
 import io.linewise.ledger.generated.Withdrawal
 import io.linewise.ledger.generated.Proposal
 import io.linewise.ledger.generated.Obligation
@@ -26,15 +26,23 @@ object Accounts:
   val WithdrawalClearing = "system:withdrawal_clearing"
   val Cash               = "system:cash"
   val Adjustment         = "system:adjustment"
+  val FeeRecovery       = "system:fee_recovery"
+  val ProviderPayoutFee = "system:provider_payout_fee"
+  def providerBalance(provider: String): String = s"system:provider_balance:$provider"
+  def knownSystem(code: String): Boolean =
+    code == IncentiveExpense || code == WithdrawalClearing || code == Cash || code == Adjustment ||
+      code == FeeRecovery || code == ProviderPayoutFee || code.startsWith("system:provider_balance:")
   def user(uid: String): String = s"user:$uid"
   def isUser(account: String): Boolean = account.startsWith("user:")
+  // Compatibility helper; the authoritative value now lives in ACCOUNT.NORMAL_SIDE.
   def normalSide(account: String): String =
-    if isUser(account) || account == WithdrawalClearing || account == Cash then "CR" else "DR"
+    if isUser(account) || account == WithdrawalClearing || account == Cash || account == FeeRecovery || account.startsWith("system:provider_balance:") then "CR" else "DR"
 
 final case class TxWriteMeta(
     targetTxId: Option[Long] = None,
     withdrawalId: Option[Long] = None,
     proposalId: Option[Long] = None,
+    payoutIntentId: Option[Long] = None,
     incentiveTraceId: Option[String] = None,
     incentiveModule: Option[String] = None,
     rawInput: Option[String] = None)
@@ -46,6 +54,10 @@ final case class AuditLogRecord(id: Long, action: String, actor: String, subject
 final case class ConfigEntry(key: String, value: String)
 final case class ConfigProposalRecord(id: Long, key: String, value: String, reason: String, status: String, proposedBy: String, approvedBy: Option[String], rejectedBy: Option[String]) derives DbCodec
 final case class BalanceDrift(account: String, materialized: Long, replayed: Long)
+final case class AccountRecord(code: String, category: String, normalSide: String, ownerType: Option[String], ownerId: Option[String], postable: Boolean, systemManaged: Boolean) derives DbCodec
+final case class PayoutIntentRecord(id: Long, withdrawalId: Long, userUid: String, provider: String, routeCode: String, destinationId: String, grossAmount: Long, quotedProviderFee: Long, expectedRecipientNet: Long, quoteRef: Option[String], providerTransferRef: Option[String]) derives DbCodec
+final case class ProviderEventRecord(eventId: String, provider: String, providerTransferRef: Option[String], outcome: String, providerFeeDebited: Option[Long]) derives DbCodec
+final case class PayoutReconciliationRecord(payoutIntentId: Long, providerEventId: Option[String], expectedFee: Long, observedFee: Option[Long], result: String, note: Option[String]) derives DbCodec
 
 final class LedgerStore(ds: DataSource):
 
@@ -54,10 +66,11 @@ final class LedgerStore(ds: DataSource):
   private given DbCodec[WithdrawalStatus] = DbCodec[String].biMap(WithdrawalStatus.valueOf, _.toString)
   private given DbCodec[ProposalStatus]   = DbCodec[String].biMap(ProposalStatus.valueOf, _.toString)
   private given DbCodec[ObligationStatus] = DbCodec[String].biMap(ObligationStatus.valueOf, _.toString)
+  private given DbCodec[EntryDirection]     = DbCodec[String].biMap(EntryDirection.valueOf, _.toString)
 
   // Row shapes for multi-column reads (the compact verified types are then assembled from these).
   private case class TxHeaderRow(id: Long, kind: TxKind, sourceKind: Option[String], sourceId: Option[String], userUid: String) derives DbCodec
-  private case class EntryRow(accountId: String, direction: String, amount: Long) derives DbCodec
+  private case class EntryRow(lineNo: Int, accountId: String, direction: EntryDirection, amount: Long) derives DbCodec
   private case class WithdrawalRow(id: Long, userUid: String, amount: Long, clientRequestId: String, reserveTxId: Long) derives DbCodec
   private case class ProposalRow(id: Long, kind: TxKind, userUid: String, debitAccount: String, creditAccount: String, amount: Long, reason: String, proposedBy: String, targetTxId: Option[Long]) derives DbCodec
   private case class ObligationRow(sourceKind: String, sourceId: String, userUid: String, estimatedPoints: Long, status: ObligationStatus, realizedTxId: Option[Long]) derives DbCodec
@@ -110,9 +123,43 @@ final class LedgerStore(ds: DataSource):
 
   // --- pure helpers ---
   private def signedDelta(account: String, direction: String, amount: Long): Long =
-    if Accounts.normalSide(account) == direction then amount else -amount
+    if accountNormalSide(account) == direction then amount else -amount
 
   private def currentActor: String = Db.currentActor
+  private final case class AccountSpec(category: String, normalSide: String, ownerType: Option[String], ownerId: Option[String], postable: Boolean = true, systemManaged: Boolean = true)
+  private val normalSideCache = java.util.concurrent.ConcurrentHashMap[String, String]()
+
+  private def accountSpec(code: String): AccountSpec =
+    if Accounts.isUser(code) then
+      AccountSpec("user_liability", "CR", Some("User"), Some(code.stripPrefix("user:")))
+    else code match
+      case Accounts.IncentiveExpense   => AccountSpec("expense", "DR", Some("System"), Some("incentive"))
+      case Accounts.WithdrawalClearing => AccountSpec("clearing", "CR", Some("System"), Some("withdrawal_clearing"))
+      case Accounts.Cash               => AccountSpec("settlement", "CR", Some("System"), Some("cash"))
+      case Accounts.Adjustment         => AccountSpec("adjustment", "DR", Some("System"), Some("adjustment"))
+      case Accounts.FeeRecovery        => AccountSpec("revenue", "CR", Some("System"), Some("fee_recovery"))
+      case Accounts.ProviderPayoutFee  => AccountSpec("expense", "DR", Some("System"), Some("provider_payout_fee"))
+      case c if c.startsWith("system:provider_balance:") =>
+        AccountSpec("settlement", "CR", Some("Provider"), Some(c.stripPrefix("system:provider_balance:")))
+      case other => throw IllegalArgumentException(s"unknown ledger account code: $other")
+
+  private def ensureAccount(code: String): Unit =
+    val spec = accountSpec(code)
+    sql"""INSERT INTO ACCOUNT (CODE, CATEGORY, NORMAL_SIDE, UNIT, OWNER_TYPE, OWNER_ID, POSTABLE, SYSTEM_MANAGED, STATUS)
+          VALUES ($code, ${spec.category}, ${spec.normalSide}, 'PTS', ${spec.ownerType}, ${spec.ownerId}, ${spec.postable}, ${spec.systemManaged}, 'active')
+          ON CONFLICT (CODE) DO NOTHING"""
+      .update.run()(using dbc)
+    normalSideCache.put(code, spec.normalSide)
+
+  def accountNormalSide(code: String): String =
+    Option(normalSideCache.get(code)).getOrElse {
+      def load(): String =
+        sql"SELECT NORMAL_SIDE FROM ACCOUNT WHERE CODE = $code".query[String].run()(using dbc).headOption
+          .getOrElse(accountSpec(code).normalSide)
+      val side = if current.isBound then load() else readOnly { load() }
+      normalSideCache.put(code, side)
+      side
+    }
 
   private def withdrawalReason(to: String): String = to match
     case "PendingReview" => "user_submitted"
@@ -143,23 +190,24 @@ final class LedgerStore(ds: DataSource):
   private def txFromId(id: Long): Option[LedgerTx] =
     sql"SELECT ID, KIND, SOURCE_KIND, SOURCE_ID, USER_UID FROM LEDGER_TX WHERE ID = $id"
       .query[TxHeaderRow].run()(using dbc).headOption.map { h =>
-        val entries = sql"SELECT ACCOUNT_ID, DIRECTION, AMOUNT FROM LEDGER_ENTRY WHERE TX_ID = $id ORDER BY ID"
+        val entries = sql"SELECT LINE_NO, ACCOUNT_ID, DIRECTION, AMOUNT FROM LEDGER_ENTRY WHERE TX_ID = $id ORDER BY LINE_NO"
           .query[EntryRow].run()(using dbc)
-        val debit  = entries.find(_.direction == "DR").getOrElse(EntryRow("", "DR", 0L))
-        val credit = entries.find(_.direction == "CR").getOrElse(EntryRow("", "CR", debit.amount))
-        LedgerTx(h.id, h.kind, debit.accountId, credit.accountId, debit.amount, h.sourceKind, h.sourceId, h.userUid)
+          .toList
+          .map(r => LedgerEntry(r.accountId, r.direction, r.amount))
+        LedgerTx(h.id, h.kind, entries, h.sourceKind, h.sourceId, h.userUid)
       }
 
   def insert(t: LedgerTx): Unit = transaction {
     val meta = Db.currentTxMeta
+    t.entries.foreach(e => ensureAccount(e.account))
     sql"""INSERT INTO LEDGER_TX
-          (ID, KIND, SOURCE_KIND, SOURCE_ID, USER_UID, TARGET_TX_ID, WITHDRAWAL_ID, PROPOSAL_ID, INCENTIVE_TRACE_ID, INCENTIVE_MODULE, RAW_INPUT)
-          VALUES (${t.id}, ${t.kind}, ${t.sourceKind}, ${t.sourceId}, ${t.userUid}, ${meta.targetTxId}, ${meta.withdrawalId}, ${meta.proposalId}, ${meta.incentiveTraceId}, ${meta.incentiveModule}, ${meta.rawInput})"""
+          (ID, KIND, SOURCE_KIND, SOURCE_ID, USER_UID, TARGET_TX_ID, WITHDRAWAL_ID, PROPOSAL_ID, PAYOUT_INTENT_ID, INCENTIVE_TRACE_ID, INCENTIVE_MODULE, RAW_INPUT)
+          VALUES (${t.id}, ${t.kind}, ${t.sourceKind}, ${t.sourceId}, ${t.userUid}, ${meta.targetTxId}, ${meta.withdrawalId}, ${meta.proposalId}, ${meta.payoutIntentId}, ${meta.incentiveTraceId}, ${meta.incentiveModule}, ${meta.rawInput})"""
       .update.run()(using dbc)
-    sql"INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (${t.id}, ${t.debitAccount}, 'DR', ${t.amount})".update.run()(using dbc)
-    sql"INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (${t.id}, ${t.creditAccount}, 'CR', ${t.amount})".update.run()(using dbc)
-    applyBalanceDelta(t.debitAccount, "DR", t.amount)
-    applyBalanceDelta(t.creditAccount, "CR", t.amount)
+    t.entries.zipWithIndex.foreach { case (e, idx) =>
+      sql"INSERT INTO LEDGER_ENTRY (TX_ID, LINE_NO, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (${t.id}, ${idx + 1}, ${e.account}, ${e.direction}, ${e.amount})".update.run()(using dbc)
+      applyBalanceDelta(e.account, e.direction.toString, e.amount)
+    }
   }
 
   def byId(id: Long): Option[LedgerTx] = readOnly { txFromId(id) }
@@ -176,8 +224,16 @@ final class LedgerStore(ds: DataSource):
     sql"SELECT BALANCE FROM ACCOUNT_BALANCE WHERE ACCOUNT_ID = $account".query[Long].run()(using dbc).headOption.getOrElse(0L)
   }
 
+  def categoryBalance(category: String): Long = readOnly {
+    sql"""SELECT COALESCE(SUM(B.BALANCE), 0)
+          FROM ACCOUNT_BALANCE B
+          JOIN ACCOUNT A ON A.CODE = B.ACCOUNT_ID
+         WHERE A.CATEGORY = $category"""
+      .query[Long].run()(using dbc).head
+  }
+
   def ledgerBalanceOf(account: String): Long = readOnly {
-    val ns = Accounts.normalSide(account)
+    val ns = accountNormalSide(account)
     sql"SELECT COALESCE(SUM(CASE WHEN DIRECTION = $ns THEN AMOUNT ELSE -AMOUNT END), 0) FROM LEDGER_ENTRY WHERE ACCOUNT_ID = $account"
       .query[Long].run()(using dbc).head
   }
@@ -190,6 +246,43 @@ final class LedgerStore(ds: DataSource):
     require(current.isBound, "lockUserBalance must be called inside transaction { … }")
     sql"SELECT 1 FROM ACCOUNT_BALANCE WHERE ACCOUNT_ID = $account FOR UPDATE".query[Int].run()(using dbc)
     ()
+
+  // --- payout intents / provider settlement / reconciliation ---
+  def payoutIntentPut(p: PayoutIntentRecord): Unit = transaction {
+    sql"""INSERT INTO PAYOUT_INTENT
+          (ID, WITHDRAWAL_ID, USER_UID, PROVIDER, ROUTE_CODE, DESTINATION_ID, GROSS_AMOUNT, QUOTED_PROVIDER_FEE, EXPECTED_RECIPIENT_NET, QUOTE_REF, PROVIDER_TRANSFER_REF)
+          VALUES (${p.id}, ${p.withdrawalId}, ${p.userUid}, ${p.provider}, ${p.routeCode}, ${p.destinationId}, ${p.grossAmount}, ${p.quotedProviderFee}, ${p.expectedRecipientNet}, ${p.quoteRef}, ${p.providerTransferRef})"""
+      .update.run()(using dbc)
+  }
+
+  def payoutIntentByWithdrawal(withdrawalId: Long): Option[PayoutIntentRecord] = readOnly {
+    sql"""SELECT ID, WITHDRAWAL_ID, USER_UID, PROVIDER, ROUTE_CODE, DESTINATION_ID, GROSS_AMOUNT, QUOTED_PROVIDER_FEE, EXPECTED_RECIPIENT_NET, QUOTE_REF, PROVIDER_TRANSFER_REF
+          FROM PAYOUT_INTENT WHERE WITHDRAWAL_ID = $withdrawalId"""
+      .query[PayoutIntentRecord].run()(using dbc).headOption
+  }
+
+  def payoutReconciliationPut(r: PayoutReconciliationRecord): Unit = transaction {
+    sql"""INSERT INTO PAYOUT_RECONCILIATION
+          (PAYOUT_INTENT_ID, PROVIDER_EVENT_ID, EXPECTED_FEE, OBSERVED_FEE, RESULT, NOTE)
+          VALUES (${r.payoutIntentId}, ${r.providerEventId}, ${r.expectedFee}, ${r.observedFee}, ${r.result}, ${r.note})"""
+      .update.run()(using dbc)
+  }
+
+  def payoutReconciliationByWithdrawal(withdrawalId: Long): Option[PayoutReconciliationRecord] = readOnly {
+    sql"""SELECT R.PAYOUT_INTENT_ID, R.PROVIDER_EVENT_ID, R.EXPECTED_FEE, R.OBSERVED_FEE, R.RESULT, R.NOTE
+          FROM PAYOUT_RECONCILIATION R
+          JOIN PAYOUT_INTENT P ON P.ID = R.PAYOUT_INTENT_ID
+         WHERE P.WITHDRAWAL_ID = $withdrawalId"""
+      .query[PayoutReconciliationRecord].run()(using dbc).headOption
+  }
+
+  def providerEventsByWithdrawal(withdrawalId: Long): List[ProviderEventRecord] = readOnly {
+    sql"""SELECT EVENT_ID, PROVIDER, PROVIDER_TRANSFER_REF, OUTCOME, PROVIDER_FEE_DEBITED
+          FROM WITHDRAWAL_PROVIDER_EVENT
+         WHERE WITHDRAWAL_ID = $withdrawalId
+         ORDER BY ID"""
+      .query[ProviderEventRecord].run()(using dbc).toList
+  }
 
   /** Lock a LEDGER_TX row (append-only, so FOR UPDATE is allowed) to serialize concurrent
     * rollback-reversal proposals for the same target, making the AlreadyReversed check
@@ -404,24 +497,25 @@ final class LedgerStore(ds: DataSource):
     val live = Set("PendingReview", "Submitted")
     allWithdrawals.filter(w => live.contains(w.status.toString)).map(_.amount).sum
 
-  /** Insert the provider-event dedup row. A duplicate EVENT_ID raises a unique violation (the
-    * caller maps it to an idempotent replay); any other error propagates. Requires an open
-    * transaction — the enclosing transaction owns commit/rollback, so a failed settle/fail rolls
-    * the event row back and the webhook stays retryable. */
-  def insertProviderEvent(eventId: String, withdrawalId: Long, outcome: String): Unit =
+  /** Insert the provider-event dedup row. A duplicate (provider, eventId) raises a unique
+    * violation (the caller maps it to an idempotent replay). */
+  def insertProviderEvent(provider: String, eventId: String, withdrawalId: Long, providerTransferRef: Option[String], outcome: String, providerFeeDebited: Option[Long], rawInput: String): Unit =
     require(current.isBound, "insertProviderEvent must be called inside transaction { … }")
-    sql"INSERT INTO WITHDRAWAL_PROVIDER_EVENT (EVENT_ID, WITHDRAWAL_ID, OUTCOME) VALUES ($eventId, $withdrawalId, $outcome)".update.run()(using dbc)
+    sql"""INSERT INTO WITHDRAWAL_PROVIDER_EVENT
+          (PROVIDER, EVENT_ID, WITHDRAWAL_ID, PROVIDER_TRANSFER_REF, OUTCOME, PROVIDER_FEE_DEBITED, RAW_INPUT)
+          VALUES ($provider, $eventId, $withdrawalId, $providerTransferRef, $outcome, $providerFeeDebited, $rawInput)"""
+      .update.run()(using dbc)
 
   // No shipped fallback secret: when stripe_webhook_secret is unset, sign with a per-process
   // random secret. Production sets the real shared secret from env (LedgerServer); this keeps
   // signing self-consistent within the process without baking in a known constant.
   private val ephemeralWebhookSecret: String = java.util.UUID.randomUUID.toString + java.util.UUID.randomUUID.toString
 
-  def webhookSignature(eventId: String, withdrawalId: Long, outcome: String): String = readOnly {
+  def webhookSignature(provider: String, eventId: String, withdrawalId: Long, outcome: String, providerFeeDebited: Long): String = readOnly {
     val secret = configString0("stripe_webhook_secret", ephemeralWebhookSecret)
     val mac = Mac.getInstance("HmacSHA256")
     mac.init(SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256"))
-    mac.doFinal(s"$eventId:$withdrawalId:$outcome".getBytes("UTF-8")).map(b => f"$b%02x").mkString
+    mac.doFinal(s"$provider:$eventId:$withdrawalId:$outcome:$providerFeeDebited".getBytes("UTF-8")).map(b => f"$b%02x").mkString
   }
 
 object Db:
@@ -450,10 +544,16 @@ object Db:
   def txBySource(kind: String, id: String): Option[LedgerTx] = store.bySource(kind, id)
   def allTxs: List[LedgerTx] = store.all
   def balanceOf(account: String): Long = store.balanceOf(account)
+  def categoryBalance(category: String): Long = store.categoryBalance(category)
   def ledgerBalanceOf(account: String): Long = store.ledgerBalanceOf(account)
   def lockUserBalance(account: String): Unit = store.lockUserBalance(account)
   def lockTransaction(id: Long): Unit = store.lockTransaction(id)
   def balanceDrifts: List[BalanceDrift] = store.balanceDrifts
+  def payoutIntentPut(p: PayoutIntentRecord): Unit = store.payoutIntentPut(p)
+  def payoutIntentByWithdrawal(withdrawalId: Long): Option[PayoutIntentRecord] = store.payoutIntentByWithdrawal(withdrawalId)
+  def payoutReconciliationPut(r: PayoutReconciliationRecord): Unit = store.payoutReconciliationPut(r)
+  def payoutReconciliationByWithdrawal(withdrawalId: Long): Option[PayoutReconciliationRecord] = store.payoutReconciliationByWithdrawal(withdrawalId)
+  def providerEventsByWithdrawal(withdrawalId: Long): List[ProviderEventRecord] = store.providerEventsByWithdrawal(withdrawalId)
   def withdrawalPut(wd: Withdrawal): Unit = store.withdrawalPut(wd)
   def withdrawalById(id: Long): Option[Withdrawal] = store.withdrawalById(id)
   def withdrawalByClientReq(userUid: String, clientRequestId: String): Option[Withdrawal] = store.withdrawalByClientReq(userUid, clientRequestId)
@@ -473,11 +573,14 @@ object Db:
   def setPayoutsEnabled(enabled: Boolean, reason: String, actor: String): Unit = store.setPayoutsEnabled(enabled, reason, actor)
   def setSystemConfig(key: String, value: String, reason: String, actor: String): Unit = store.setSystemConfig(key, value, reason, actor)
   def payoutsEnabled: Boolean = store.payoutsEnabled
+  def accountNormalSide(account: String): String = store.accountNormalSide(account)
   def audit(action: String, actor: String, subject: String, detail: String): Unit = store.audit(action, actor, subject, detail)
   def auditLogs: List[AuditLogRecord] = store.auditLogs
   def risk(kind: String, subject: String, detail: String): Unit = store.risk(kind, subject, detail)
   def riskEvents: List[RiskEventRecord] = store.riskEvents
   def guardLedgerAmount(userUid: String, amount: Long, subject: String): Either[String, Unit] = store.guardLedgerAmount(userUid, amount, subject)
   def checkWithdrawalRisk(userUid: String, amount: Long): Either[String, Boolean] = store.checkWithdrawalRisk(userUid, amount)
-  def insertProviderEvent(eventId: String, withdrawalId: Long, outcome: String): Unit = store.insertProviderEvent(eventId, withdrawalId, outcome)
-  def webhookSignature(eventId: String, withdrawalId: Long, outcome: String): String = store.webhookSignature(eventId, withdrawalId, outcome)
+  def insertProviderEvent(provider: String, eventId: String, withdrawalId: Long, providerTransferRef: Option[String], outcome: String, providerFeeDebited: Option[Long], rawInput: String): Unit =
+    store.insertProviderEvent(provider, eventId, withdrawalId, providerTransferRef, outcome, providerFeeDebited, rawInput)
+  def webhookSignature(provider: String, eventId: String, withdrawalId: Long, outcome: String, providerFeeDebited: Long): String =
+    store.webhookSignature(provider, eventId, withdrawalId, outcome, providerFeeDebited)

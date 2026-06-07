@@ -77,20 +77,23 @@ class LedgerPropertiesSpec extends LedgerHttpSuite with LedgerGen with LedgerDif
     }
   }
 
-  property("settlement webhook is event-id idempotent and only moves cash once") {
+  property("recipient-pays webhook is event-id idempotent and provider settlement/reconciliation stay consistent") {
     forAll { (uid: UserUid, funded: FundedWithdrawal, source: SourceKey, clientReq: ClientRequestId, trace: IncentiveTraceId) =>
       val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val user = api.userToken(uid.value)
       secure(E.incentiveCredit, be, svc, CreditRequest(uid.value, funded.funded, source.kind, source.id, Some(trace.value), Some("incentives")))
       val wd = secure(E.requestWithdrawal, be, user, WithdrawalRequestBody(funded.withdrawn, clientReq.value)).body.toOption.get
-      assertEquals(secure(E.approveWithdrawal, be, svc, (wd.id, DecisionRequest("PendingReview"))).code, StatusCode.Ok)
+      val fee = math.min(20L, funded.withdrawn - 1L)
+      secure(E.submitWithdrawal, be, svc, (wd.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-prop", fee, funded.withdrawn - fee, Some(s"q-${trace.value}"), Some(s"tr-${trace.value}"))))
       val eventId = s"evt-${trace.value}"
-      val sig = Db.webhookSignature(eventId, wd.id, "settled")
-      val first = secure(E.stripeWebhook, be, svc, StripeWebhookBody(wd.id, "settled", eventId, sig))
+      val sig = Db.webhookSignature("stripe", eventId, wd.id, "settled", fee)
+      val first = secure(E.stripeWebhook, be, svc, StripeWebhookBody(wd.id, "settled", eventId, Some(s"tr-${trace.value}"), fee, sig))
       assertEquals(first.code, StatusCode.Ok)
-      val second = secure(E.stripeWebhook, be, svc, StripeWebhookBody(wd.id, "settled", eventId, sig))
+      val second = secure(E.stripeWebhook, be, svc, StripeWebhookBody(wd.id, "settled", eventId, Some(s"tr-${trace.value}"), fee, sig))
       assertEquals(second.code, StatusCode.Ok)
-      assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, funded.withdrawn)
-      assertEquals(secure(E.accountBalance, be, svc, "system:withdrawal_clearing").body.toOption.get.balancePoints, 0L)
+      assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, funded.withdrawn)
+      val rec = secure(E.getPayoutReconciliation, be, svc, wd.id).body.toOption.get
+      assertEquals(rec.result, "matched")
+      assertEquals(rec.observedFee, Some(fee))
     }
   }
 

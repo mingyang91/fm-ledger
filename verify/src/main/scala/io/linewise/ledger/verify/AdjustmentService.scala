@@ -6,16 +6,9 @@ import io.linewise.verify.effect.FMLong
 import LedgerModel._
 
 /* =============================================================================
- * ADJUSTMENT SERVICE — verified two-person control for manual adjustments and rollback
- * reversals, coordinating the proposal slice and the ledger through two Has lenses.
- *   propose -> writes a PENDING_REVIEW proposal (no money moves)
- *   approve -> THE GUARDED WRITE: proposer != approver (require), the optimistic
- *              expectedStatus guard, then post the proposal's balanced movement and
- *              flip the proposal to approved with its resultTxId
- *   reject  -> flip to rejected (no money moves)
- * The same shape covers a rollback_reversal proposal (its debit/credit accounts are the
- * REVERSED legs of the target tx, resolved by the shell at propose time). The headline
- * invariant — an approver cannot be the proposer — is a verified `require`/branch.
+ * Two-person manual adjustments and rollback reversals. Proposals stay scalar/two-leg
+ * for now; approval materializes them as a LedgerTx whose core can now support many
+ * entries even though this service still emits canonical two-leg postings.
  * ========================================================================== */
 case class AdjustmentService[W](ledgerLens: Has[W, LedgerRepository], pLens: Has[W, ProposalRepository]) {
 
@@ -31,10 +24,6 @@ case class AdjustmentService[W](ledgerLens: Has[W, LedgerRepository], pLens: Has
         ProposalStatus.PendingReview, None[FMLong](), targetTxId)
       (pLens(w).write((r: ProposalRepository) => r.put(p)), Right[LedgerError, Proposal](p))
 
-  /** A rollback reversal may target a transaction at most once: refuse a second proposal
-    * that targets the same tx unless the prior one was rejected. Manual adjustments carry
-    * no target, so they are never blocked here. This is the verified source of the
-    * AlreadyReversed error (the shell no longer re-checks it). */
   def alreadyReversed(repo: ProposalRepository, kind: TxKind, targetTxId: Option[FMLong]): Boolean =
     kind == TxKind.RollbackReversal && (targetTxId match
       case Some(t) => repo.all.exists((p: Proposal) => p.targetTxId == Some[FMLong](t) && p.status != ProposalStatus.Rejected)
@@ -48,8 +37,7 @@ case class AdjustmentService[W](ledgerLens: Has[W, LedgerRepository], pLens: Has
         else if p.proposedBy == approver then
           (w, Left[LedgerError, Proposal](TwoPersonViolation))
         else
-          val tx = LedgerTx(freshTxId, p.kind, p.debitAccount, p.creditAccount, p.amount,
-            None[String](), None[String](), p.userUid)
+          val tx = twoLegTx(freshTxId, p.kind, p.debitAccount, p.creditAccount, p.amount, None[String](), None[String](), p.userUid)
           val w1 = ledgerLens(w).write((r: LedgerRepository) => r.post(tx))
           val p2 = p.copy(status = ProposalStatus.Approved, resultTxId = Some[FMLong](freshTxId))
           (pLens(w1).write((r: ProposalRepository) => r.put(p2)), Right[LedgerError, Proposal](p2))

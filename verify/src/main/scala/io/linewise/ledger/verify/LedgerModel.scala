@@ -5,42 +5,71 @@ import stainless.collection._
 import io.linewise.verify.effect.FMLong
 
 /* =============================================================================
- * LEDGER — the DATA LAYER, translated to Stainless (transpiler input #1).
+ * LEDGER — the DATA LAYER, translated to Stainless.
  *
- * A posted transaction is a SINGLE balanced movement: `amount` is debited from
- * `debitAccount` and credited to `creditAccount`. Modeling a tx this way makes the
- * double-entry conservation invariant (ΣDR == ΣCR) STRUCTURAL — every tx is exactly
- * one debit and one credit of the same amount — so it needs no aggregate-fold proof.
- * The only thing to validate is a positive amount and idempotency. Accounts are
- * strings ("system:incentive_expense", "user:<uid>", …); the optional flat source
- * key is the incentive-credit idempotency key.
- *
- * `amount: Option[FMLong]`-free on purpose; ids are FMLong (BIGSERIAL, erases to Long).
- * Generated core lands in io.linewise.ledger.generated with the FM types erased.
+ * The core is now a JOURNAL HEADER plus MANY entry legs. This keeps the model small
+ * enough for Stainless while making multi-entry postings possible for payout fee and
+ * future tax/settlement flows. Compatibility accessors (`amount`, `debitAccount`,
+ * `creditAccount`) remain for callers that still deal in simple two-leg transactions;
+ * for true multi-entry postings they mean "first DR", "first CR", and total debits.
  * ========================================================================== */
 object LedgerModel {
 
-  // Constrained values are sum types, not bare strings. Scala 3 enums auto-namespace
-  // their cases, so the collisions across entities (PendingReview/Rejected/Cancelled)
-  // The status enums are top-level to keep generated case-object names stable.
   enum ObligationStatus { case Open, Realized, Cancelled }
-  enum TxKind { case IncentiveCredit, ManualAdjustment, RollbackReversal, WithdrawalReserve, WithdrawalSettle, WithdrawalReturn }
+  enum TxKind {
+    case IncentiveCredit, ManualAdjustment, RollbackReversal,
+      WithdrawalReserve, WithdrawalSettle, WithdrawalReturn,
+      WithdrawalFeeRecovery, ProviderPayoutFee
+  }
   enum WithdrawalStatus { case PendingReview, Submitted, Settled, Rejected, Cancelled, Failed }
   enum ProposalStatus { case PendingReview, Approved, Rejected }
+  enum EntryDirection { case DR, CR }
+
+  case class LedgerEntry(account: String, direction: EntryDirection, amount: FMLong)
+
+  def sumDirection(entries: List[LedgerEntry], direction: EntryDirection): BigInt =
+    entries.foldLeft(BigInt(0))((acc: BigInt, e: LedgerEntry) =>
+      if e.direction == direction then acc + e.amount.value else acc)
+
+  def hasDirection(entries: List[LedgerEntry], direction: EntryDirection): Boolean =
+    entries.exists((e: LedgerEntry) => e.direction == direction)
+
+  def allPositive(entries: List[LedgerEntry]): Boolean =
+    entries.forall((e: LedgerEntry) => e.amount > FMLong(BigInt(0)))
+
+  def firstAccount(entries: List[LedgerEntry], direction: EntryDirection): String =
+    entries.find((e: LedgerEntry) => e.direction == direction) match
+      case Some(e) => e.account
+      case _       => ""
 
   case class LedgerTx(
-      id:            FMLong,
-      kind:          TxKind,
-      debitAccount:  String,
-      creditAccount: String,
-      amount:        FMLong,
-      sourceKind:    Option[String],
-      sourceId:      Option[String],
-      userUid:       String,
-  )
+      id:         FMLong,
+      kind:       TxKind,
+      entries:    List[LedgerEntry],
+      sourceKind: Option[String],
+      sourceId:   Option[String],
+      userUid:    String,
+  ) {
+    def amount: FMLong = entries.find((e: LedgerEntry) => e.direction == EntryDirection.DR) match
+      case Some(e) => e.amount
+      case _       => FMLong(BigInt(0))
+    def debitAccount: String = firstAccount(entries, EntryDirection.DR)
+    def creditAccount: String = firstAccount(entries, EntryDirection.CR)
+  }
+
+  def twoLegTx(
+      id: FMLong, kind: TxKind, debitAccount: String, creditAccount: String,
+      amount: FMLong, sourceKind: Option[String], sourceId: Option[String], userUid: String): LedgerTx =
+    LedgerTx(id, kind,
+      List(
+        LedgerEntry(debitAccount, EntryDirection.DR, amount),
+        LedgerEntry(creditAccount, EntryDirection.CR, amount),
+      ),
+      sourceKind, sourceId, userUid)
 
   sealed trait LedgerError
   case object NonPositiveAmount extends LedgerError
+  case object UnbalancedTx extends LedgerError
   case object DuplicateSource extends LedgerError
   case class TxNotFound(id: FMLong) extends LedgerError
   case object WithdrawalNotFound extends LedgerError

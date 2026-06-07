@@ -86,7 +86,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     // the summary's funds invariant must still hold once points have moved into clearing/cash
     val s2 = secure(E.summary, be, svc, ()).body.toOption.get
     assertEquals(s2.withdrawalClearingPoints, 0L)
-    assertEquals(s2.cashPoints, 400L)
+    assertEquals(s2.settlementPoints, 400L)
     assert(s2.fundsInvariantHolds, s2.toString)
     // a withdrawal beyond the remaining balance is refused, and a stale expectedStatus 409s
     assertEquals(secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(99999, "cr-2")).code, StatusCode.BadRequest)
@@ -137,33 +137,41 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(1, "after-risk")).code, StatusCode.ServiceUnavailable)
   }
 
-  test("stripe webhook verifies signatures, deduplicates event ids, and writes one cash leg") {
+  test("recipient-pays submit captures payout intent, webhook reconciles fee, and provider settlement stays auditable") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "stripe-fund"))
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "stripe-cr")).body.toOption.get
-    secure(E.approveWithdrawal, be, svc, (w.id, DecisionRequest("PendingReview")))
-    val sig = Db.webhookSignature("evt-1", w.id, "settled")
-    val settled = secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-1", sig))
+    val submit = secure(E.submitWithdrawal, be, svc,
+      (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, Some("quote-1"), Some("tr-1"))))
+    assertEquals(submit.body.toOption.get.status, "Submitted")
+    val intent = secure(E.getPayoutIntent, be, svc, w.id).body.toOption.get
+    assertEquals(intent.quotedProviderFee, 20L)
+    assertEquals(intent.expectedRecipientNet, 280L)
+    val sig = Db.webhookSignature("stripe", "evt-1", w.id, "settled", 20)
+    val settled = secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-1", Some("tr-1"), 20, sig))
     assertEquals(settled.body.toOption.get.status, "Settled")
-    assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 300L)
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-1", sig)).code, StatusCode.Ok)
-    assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 300L)
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-2", "bad")).code, StatusCode.Unauthorized)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 300L)
+    val rec = secure(E.getPayoutReconciliation, be, svc, w.id).body.toOption.get
+    assertEquals(rec.result, "matched")
+    assertEquals(rec.observedFee, Some(20L))
+    assertEquals(secure(E.listProviderEvents, be, svc, w.id).body.toOption.get.size, 1)
+    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-1", Some("tr-1"), 20, sig)).code, StatusCode.Ok)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 300L)
+    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-2", None, 20, "bad")).code, StatusCode.Unauthorized)
   }
 
   test("F2: a settled webhook before approval is rejected but NOT consumed; the same event id settles after approval") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "f2-fund"))
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "f2-cr")).body.toOption.get
-    val sig = Db.webhookSignature("evt-f2", w.id, "settled")
+    val sig = Db.webhookSignature("stripe", "evt-f2", w.id, "settled", 20)
     // the provider reports "settled" while the withdrawal is still PendingReview: the
     // transition fails (409) and, crucially, the event id is rolled back — not consumed.
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-f2", sig)).code, StatusCode.Conflict)
-    assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 0L)
-    // approve, then RETRY the very same event id -> it now settles and moves cash exactly once
-    secure(E.approveWithdrawal, be, svc, (w.id, DecisionRequest("PendingReview")))
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-f2", sig)).body.toOption.get.status, "Settled")
-    assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 300L)
+    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-f2", None, 20, sig)).code, StatusCode.Conflict)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 0L)
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, Some("quote-f2"), Some("tr-f2"))))
+    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-f2", Some("tr-f2"), 20, sig)).body.toOption.get.status, "Settled")
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 300L)
   }
 
   test("a transaction cannot be reversed twice (already_reversed)") {
@@ -182,22 +190,21 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
       val st = c.createStatement()
       // a balanced tx must be inserted in ONE transaction so the deferred conservation trigger
       // checks it at commit with both legs present.
+      st.execute("INSERT INTO ACCOUNT (CODE, CATEGORY, NORMAL_SIDE, UNIT, OWNER_TYPE, OWNER_ID, POSTABLE, SYSTEM_MANAGED, STATUS) VALUES ('user:u1', 'user_liability', 'CR', 'PTS', 'User', 'u1', true, true, 'active')")
       c.setAutoCommit(false)
       st.execute("INSERT INTO LEDGER_TX (ID, KIND, USER_UID) VALUES (1, 'ManualAdjustment', 'u1')")
-      st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (1, 'system:adjustment', 'DR', 100)")
-      st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (1, 'user:u1', 'CR', 100)")
+      st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, LINE_NO, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (1, 1, 'system:adjustment', 'DR', 100)")
+      st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, LINE_NO, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (1, 2, 'user:u1', 'CR', 100)")
       c.commit()
       c.setAutoCommit(true)
-      intercept[java.sql.SQLException](st.execute("UPDATE LEDGER_TX SET USER_UID = 'u2' WHERE ID = 1")) // append-only: UPDATE rejected
-      intercept[java.sql.SQLException](st.execute("DELETE FROM LEDGER_ENTRY WHERE TX_ID = 1"))          // append-only: DELETE rejected
-      intercept[java.sql.SQLException](st.execute("TRUNCATE LEDGER_ENTRY"))                             // append-only: TRUNCATE rejected
-      intercept[java.sql.SQLException](st.execute("TRUNCATE LEDGER_TX CASCADE"))                        // append-only: TRUNCATE rejected
-      intercept[java.sql.SQLException](st.execute(                                                    // CHECK: credit needs a source
-        "INSERT INTO LEDGER_TX (ID, KIND, USER_UID) VALUES (2, 'IncentiveCredit', 'u1')"))
-      // conservation: a single-leg (unbalanced) tx is rejected at COMMIT by the deferred trigger.
+      intercept[java.sql.SQLException](st.execute("UPDATE LEDGER_TX SET USER_UID = 'u2' WHERE ID = 1"))
+      intercept[java.sql.SQLException](st.execute("DELETE FROM LEDGER_ENTRY WHERE TX_ID = 1"))
+      intercept[java.sql.SQLException](st.execute("TRUNCATE LEDGER_ENTRY"))
+      intercept[java.sql.SQLException](st.execute("TRUNCATE LEDGER_TX CASCADE"))
+      intercept[java.sql.SQLException](st.execute("INSERT INTO LEDGER_TX (ID, KIND, USER_UID) VALUES (2, 'IncentiveCredit', 'u1')"))
       c.setAutoCommit(false)
       st.execute("INSERT INTO LEDGER_TX (ID, KIND, USER_UID) VALUES (3, 'ManualAdjustment', 'u1')")
-      st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (3, 'system:adjustment', 'DR', 50)")
+      st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, LINE_NO, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (3, 1, 'system:adjustment', 'DR', 50)")
       intercept[java.sql.SQLException](c.commit())
       c.rollback()
     finally c.close()
@@ -221,8 +228,8 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "wf-fund"))
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(400, "wf-1")).body.toOption.get
     secure(E.approveWithdrawal, be, svc, (w.id, DecisionRequest("PendingReview")))
-    val sig = Db.webhookSignature("evt-fail", w.id, "failed")
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "failed", "evt-fail", sig)).body.toOption.get.status, "Failed")
+    val sig = Db.webhookSignature("stripe", "evt-fail", w.id, "failed", 0)
+    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "failed", "evt-fail", None, 0, sig)).body.toOption.get.status, "Failed")
     assertEquals(secure(E.accountBalance, be, svc, "system:withdrawal_clearing").body.toOption.get.balancePoints, 0L)
     assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 0L)
     assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 1000L)
@@ -252,7 +259,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "sub-fund"))
     assert(secure(E.userTransactions, be, svc, "u1").body.toOption.get.nonEmpty)
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "sub-1")).body.toOption.get
-    assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "bank", "acct-1"))).body.toOption.get.status, "Submitted")
+    assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 15, 285, Some("quote-sub"), Some("tr-sub")))).body.toOption.get.status, "Submitted")
     secure(E.openObligation, be, svc, ObligationOpenBody("annotation_job", "ob-x", "u2", 500))
     assertEquals(secure(E.cancelObligation, be, svc, ObligationCancelBody("annotation_job", "ob-x")).body.toOption.get.status, "Cancelled")
     val run = secure(E.invariantsCheck, be, svc, ()).body.toOption.get

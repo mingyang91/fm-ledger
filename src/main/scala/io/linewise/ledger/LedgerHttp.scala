@@ -58,24 +58,28 @@ final case class ReversalProposeBody(targetTxId: Long, reason: String)
 final case class ProposalResponse(
     id: Long, kind: String, userUid: String, debitAccount: String, creditAccount: String,
     amountPoints: Long, reason: String, proposedByUid: String, status: String, resultTxId: Option[Long])
+final case class TxEntryResponse(account: String, direction: String, amountPoints: Long)
 final case class TxResponse(
     id: Long, kind: String, debitAccount: String, creditAccount: String,
-    amountPoints: Long, userUid: String, sourceKind: Option[String], sourceId: Option[String])
+    amountPoints: Long, userUid: String, sourceKind: Option[String], sourceId: Option[String], entries: List[TxEntryResponse])
 final case class BalanceResponse(account: String, balancePoints: Long, normalSide: String)
 final case class SummaryResponse(
     incentiveExpensePoints: Long, totalUserLiabilityPoints: Long, withdrawalClearingPoints: Long,
-    cashPoints: Long, adjustmentPoints: Long, fundsInvariantHolds: Boolean)
+    settlementPoints: Long, adjustmentPoints: Long, feeRecoveryPoints: Long, providerPayoutFeePoints: Long, fundsInvariantHolds: Boolean)
 final case class WithdrawalRequestBody(amountPoints: Long, clientRequestId: String)
 final case class WithdrawalResponse(
     id: Long, userUid: String, amountPoints: Long, status: String, clientRequestId: String, reserveTxId: Long)
 final case class DecisionRequest(expectedStatus: String)
-final case class PayoutSubmitRequest(expectedStatus: String, channel: String, destinationId: String)
+final case class PayoutSubmitRequest(expectedStatus: String, provider: String, routeCode: String, destinationId: String, quotedProviderFee: Long, expectedRecipientNet: Long, quoteRef: Option[String], providerTransferRef: Option[String])
+final case class PayoutIntentResponse(withdrawalId: Long, provider: String, routeCode: String, destinationId: String, grossAmount: Long, quotedProviderFee: Long, expectedRecipientNet: Long, quoteRef: Option[String], providerTransferRef: Option[String])
+final case class PayoutReconciliationResponse(withdrawalId: Long, expectedFee: Long, observedFee: Option[Long], result: String, note: Option[String])
+final case class ProviderEventResponse(eventId: String, provider: String, providerTransferRef: Option[String], outcome: String, providerFeeDebited: Option[Long])
 final case class ObligationOpenBody(sourceKind: String, sourceId: String, userUid: String, estimatedPoints: Long)
 final case class ObligationCancelBody(sourceKind: String, sourceId: String)
 final case class ObligationResponse(
     sourceKind: String, sourceId: String, userUid: String, estimatedPoints: Long, status: String, realizedTxId: Option[Long])
 final case class UpcomingExpenseResponse(openCount: Long, projectedPoints: Long)
-final case class StripeWebhookBody(withdrawalId: Long, outcome: String, eventId: String, signature: String) // outcome: settled | failed
+final case class StripeWebhookBody(withdrawalId: Long, outcome: String, eventId: String, providerTransferRef: Option[String], providerFeeDebited: Long, signature: String) // outcome: settled | failed
 final case class InvariantCheckDto(name: String, passed: Boolean, detail: Option[String])
 final case class InvariantRunResponse(runId: String, allPassed: Boolean, checks: List[InvariantCheckDto])
 final case class RiskEventResponse(id: Long, kind: String, subject: String, detail: String)
@@ -89,6 +93,7 @@ object LedgerJson:
   given Pickler[AdjustProposeBody]      = Pickler.derived
   given Pickler[ReversalProposeBody]    = Pickler.derived
   given Pickler[ProposalResponse]       = Pickler.derived
+  given Pickler[TxEntryResponse]        = Pickler.derived
   given Pickler[TxResponse]             = Pickler.derived
   given Pickler[BalanceResponse]        = Pickler.derived
   given Pickler[SummaryResponse]        = Pickler.derived
@@ -96,6 +101,9 @@ object LedgerJson:
   given Pickler[WithdrawalResponse]     = Pickler.derived
   given Pickler[DecisionRequest]        = Pickler.derived
   given Pickler[PayoutSubmitRequest]    = Pickler.derived
+  given Pickler[PayoutIntentResponse]   = Pickler.derived
+  given Pickler[PayoutReconciliationResponse] = Pickler.derived
+  given Pickler[ProviderEventResponse]  = Pickler.derived
   given Pickler[ObligationOpenBody]     = Pickler.derived
   given Pickler[ObligationCancelBody]   = Pickler.derived
   given Pickler[ObligationResponse]     = Pickler.derived
@@ -134,6 +142,9 @@ object LedgerEndpoints:
   val summary         = endpoint.securityIn(bearer).get.in("ledger" / "summary").out(jsonBody[SummaryResponse]).errorOut(errOut)
 
   // withdrawals
+  val getPayoutIntent  = endpoint.securityIn(bearer).get.in("withdrawals" / path[Long]("id") / "payout-intent").out(jsonBody[PayoutIntentResponse]).errorOut(errOut)
+  val getPayoutReconciliation = endpoint.securityIn(bearer).get.in("withdrawals" / path[Long]("id") / "reconciliation").out(jsonBody[PayoutReconciliationResponse]).errorOut(errOut)
+  val listProviderEvents = endpoint.securityIn(bearer).get.in("withdrawals" / path[Long]("id") / "provider-events").out(jsonBody[List[ProviderEventResponse]]).errorOut(errOut)
   val requestWithdrawal = endpoint.securityIn(bearer).post.in("me" / "withdrawals").in(jsonBody[WithdrawalRequestBody]).out(jsonBody[WithdrawalResponse]).errorOut(errOut)
   val myWithdrawals     = endpoint.securityIn(bearer).get.in("me" / "withdrawals").out(jsonBody[List[WithdrawalResponse]]).errorOut(errOut)
   val cancelWithdrawal  = endpoint.securityIn(bearer).post.in("me" / "withdrawals" / path[Long]("id") / "cancel").in(jsonBody[DecisionRequest]).out(jsonBody[WithdrawalResponse]).errorOut(errOut)
@@ -196,7 +207,8 @@ class LedgerApi:
       case _                                => Left(unauthorized)
 
   private def txResponse(tx: LedgerTx): TxResponse =
-    TxResponse(tx.id, tx.kind.toString, tx.debitAccount, tx.creditAccount, tx.amount, tx.userUid, tx.sourceKind, tx.sourceId)
+    TxResponse(tx.id, tx.kind.toString, tx.debitAccount, tx.creditAccount, tx.amount, tx.userUid, tx.sourceKind, tx.sourceId,
+      tx.entries.map(e => TxEntryResponse(e.account, e.direction.toString, e.amount)))
 
   private def withdrawalResponse(wd: Withdrawal): WithdrawalResponse =
     WithdrawalResponse(wd.id, wd.userUid, wd.amount, wd.status.toString, wd.clientRequestId, wd.reserveTxId)
@@ -206,24 +218,29 @@ class LedgerApi:
     case WithdrawalNotFound => (StatusCode.NotFound, "withdrawal not found")
     case StatusConflict     => (StatusCode.Conflict, "status_conflict")
     case NonPositiveAmount  => (StatusCode.BadRequest, "non_positive_amount")
+    case UnbalancedTx       => (StatusCode.BadRequest, "unbalanced_tx")
     case _                  => (StatusCode.BadRequest, "bad request")
 
-  // parse the wire `expectedStatus` (a string) into the right enum; an unknown value
-  // can never match the stored status, so it surfaces as a status conflict.
   private def parseWStatus(s: String): Option[WithdrawalStatus] = WithdrawalStatus.values.find(_.toString == s)
   private def parsePStatus(s: String): Option[ProposalStatus] = ProposalStatus.values.find(_.toString == s)
   private val statusConflict: Err = (StatusCode.Conflict, "status_conflict")
 
   private def proposalResponse(p: Proposal): ProposalResponse =
     ProposalResponse(p.id, p.kind.toString, p.userUid, p.debitAccount, p.creditAccount, p.amount, p.reason, p.proposedBy, p.status.toString, p.resultTxId)
-  private def riskResponse(r: RiskEventRecord): RiskEventResponse =
-    RiskEventResponse(r.id, r.kind, r.subject, r.detail)
-  private def auditResponse(r: AuditLogRecord): AuditLogResponse =
-    AuditLogResponse(r.id, r.action, r.actor, r.subject, r.detail)
   private def configEntryResponse(c: ConfigEntry): ConfigEntryResponse =
     ConfigEntryResponse(c.key, c.value)
   private def configProposalResponse(c: ConfigProposalRecord): ConfigProposalResponse =
     ConfigProposalResponse(c.id, c.key, c.value, c.reason, c.status, c.proposedBy, c.approvedBy, c.rejectedBy)
+  private def payoutIntentResponse(p: PayoutIntentRecord): PayoutIntentResponse =
+    PayoutIntentResponse(p.withdrawalId, p.provider, p.routeCode, p.destinationId, p.grossAmount, p.quotedProviderFee, p.expectedRecipientNet, p.quoteRef, p.providerTransferRef)
+  private def payoutReconciliationResponse(withdrawalId: Long, r: PayoutReconciliationRecord): PayoutReconciliationResponse =
+    PayoutReconciliationResponse(withdrawalId, r.expectedFee, r.observedFee, r.result, r.note)
+  private def providerEventResponse(e: ProviderEventRecord): ProviderEventResponse =
+    ProviderEventResponse(e.eventId, e.provider, e.providerTransferRef, e.outcome, e.providerFeeDebited)
+  private def riskResponse(r: RiskEventRecord): RiskEventResponse =
+    RiskEventResponse(r.id, r.kind, r.subject, r.detail)
+  private def auditResponse(r: AuditLogRecord): AuditLogResponse =
+    AuditLogResponse(r.id, r.action, r.actor, r.subject, r.detail)
   private def obligationResponse(o: Obligation): ObligationResponse =
     ObligationResponse(o.sourceKind, o.sourceId, o.userUid, o.estimatedUnit, o.status.toString, o.realizedTxId)
 
@@ -231,31 +248,33 @@ class LedgerApi:
     * belt-and-suspenders read — the verified core already guarantees them by construction)
     * and record the run so latest/{runId} can return it. */
   private def runInvariants(): InvariantRunResponse =
-    val all        = Db.allTxs
-    val balanced   = all.forall(t => t.amount > 0L)
-    val expense    = Db.balanceOf(Accounts.IncentiveExpense)
-    val adjustment = Db.balanceOf(Accounts.Adjustment)
-    val clearing   = Db.balanceOf(Accounts.WithdrawalClearing)
-    val cash       = Db.balanceOf(Accounts.Cash)
-    val users = all.map(t =>
-      (if Accounts.isUser(t.creditAccount) then t.amount else 0L) -
-        (if Accounts.isUser(t.debitAccount) then t.amount else 0L)).sum
-    val funds  = expense == users + clearing + cash - adjustment
-    val userAccts = all.flatMap(t => List(t.debitAccount, t.creditAccount)).filter(Accounts.isUser).distinct
+    def drSum(tx: LedgerTx): Long = tx.entries.filter(_.direction == EntryDirection.DR).map(_.amount).sum
+    def crSum(tx: LedgerTx): Long = tx.entries.filter(_.direction == EntryDirection.CR).map(_.amount).sum
+    val all          = Db.allTxs
+    val balancedTxs  = all.forall(tx => tx.entries.nonEmpty && tx.entries.exists(_.direction == EntryDirection.DR) && tx.entries.exists(_.direction == EntryDirection.CR) && tx.entries.forall(_.amount > 0L) && drSum(tx) == crSum(tx))
+    val incentiveExpense = Db.balanceOf(Accounts.IncentiveExpense)
+    val providerPayoutFee = Db.balanceOf(Accounts.ProviderPayoutFee)
+    val adjustment = Db.categoryBalance("adjustment")
+    val users      = Db.categoryBalance("user_liability")
+    val clearing   = Db.categoryBalance("clearing")
+    val settlement = Db.categoryBalance("settlement")
+    val revenue    = Db.categoryBalance("revenue")
+    val funds      = incentiveExpense + providerPayoutFee == users + clearing + settlement + revenue - adjustment
+    val userAccts = all.flatMap(_.entries.map(_.account)).filter(Accounts.isUser).distinct
     val nonneg = userAccts.forall(a => Db.ledgerBalanceOf(a) >= 0L)
-    val clearingMatches = clearing == Db.pendingWithdrawalClearing
+    val clearingMatches = Db.balanceOf(Accounts.WithdrawalClearing) == Db.pendingWithdrawalClearing
     val drifts = Db.balanceDrifts
     val collisions = Db.allOpenObligations.filter(o => Db.txBySource(o.sourceKind, o.sourceId).isDefined)
     val rollbackProposals = Db.allProposals.filter(_.kind == TxKind.RollbackReversal).filter(_.status == ProposalStatus.Approved)
     val rollbackRefsOk = rollbackProposals.forall(p => p.targetTxId.flatMap(Db.txById).isDefined)
     val noReversalOfReversal = rollbackProposals.forall(p => p.targetTxId.flatMap(Db.txById).forall(_.kind != TxKind.RollbackReversal))
     val checks = List(
-      InvariantCheckDto("ledger_balanced", balanced, None),
+      InvariantCheckDto("ledger_balanced", balancedTxs, None),
       InvariantCheckDto("funds_invariant", funds,
-        if funds then None else Some(s"expense=$expense users=$users clearing=$clearing cash=$cash adjustment=$adjustment")),
+        if funds then None else Some(s"incentiveExpense=$incentiveExpense providerPayoutFee=$providerPayoutFee users=$users clearing=$clearing settlement=$settlement revenue=$revenue adjustment=$adjustment")),
       InvariantCheckDto("user_balance_nonneg", nonneg, None),
       InvariantCheckDto("withdrawal_clearing_matches_inflight", clearingMatches,
-        if clearingMatches then None else Some(s"clearing=$clearing inflight=${Db.pendingWithdrawalClearing}")),
+        if clearingMatches then None else Some(s"clearing=${Db.balanceOf(Accounts.WithdrawalClearing)} inflight=${Db.pendingWithdrawalClearing}")),
       InvariantCheckDto("account_balance_matches_replay", drifts.isEmpty,
         if drifts.isEmpty then None else Some(drifts.map(d => s"${d.account}:${d.materialized}/${d.replayed}").mkString(","))),
       InvariantCheckDto("rollback_references_prior_tx", rollbackRefsOk, None),
@@ -267,12 +286,14 @@ class LedgerApi:
     invariantRuns.put(resp.runId, resp); latestRun = Some(resp)
     if !resp.allPassed then Db.setPayoutsEnabled(false, "invariant failure", "system")
     resp
+
   private def pErr(e: LedgerError): Err = e match
     case ProposalNotFound   => (StatusCode.NotFound, "proposal not found")
     case TwoPersonViolation => (StatusCode.Conflict, "two_person_violation")
     case StatusConflict     => (StatusCode.Conflict, "status_conflict")
     case AlreadyReversed    => (StatusCode.Conflict, "already_reversed")
     case NonPositiveAmount  => (StatusCode.BadRequest, "non_positive_amount")
+    case UnbalancedTx       => (StatusCode.BadRequest, "unbalanced_tx")
     case _                  => (StatusCode.BadRequest, "bad request")
   /** Approve a proposal (adjustment or reversal), guarding a user-debiting approval
     * against driving the balance negative (a production fold, not a verified condition). */
@@ -305,6 +326,57 @@ class LedgerApi:
         Db.audit("proposal.approve", admin, id.toString, p2.kind.toString)
         Right(proposalResponse(p2))
       case Left(e)  => Left(pErr(e))
+
+  private def ledgerErr(e: LedgerError): Err = e match
+    case NonPositiveAmount => (StatusCode.BadRequest, "non_positive_amount")
+    case UnbalancedTx      => (StatusCode.BadRequest, "unbalanced_tx")
+    case DuplicateSource   => (StatusCode.Conflict, "duplicate_source")
+    case _                 => (StatusCode.BadRequest, "bad request")
+
+  private def postLedgerTx(kind: TxKind, userUid: String, entries: List[LedgerEntry], meta: TxWriteMeta = TxWriteMeta()): Either[Err, LedgerTx] =
+    Db.withTxMeta(meta) {
+      service.post(world, LedgerTx(Db.nextId(), kind, entries, None, None, userUid))._2
+    } match
+      case Right(tx) => Right(tx)
+      case Left(e)   => Left(ledgerErr(e))
+
+  private def settleRecipientPaysFee(withdrawal: Withdrawal, intent: PayoutIntentRecord, providerEventId: String, providerFeeDebited: Long, providerTransferRef: Option[String], actor: String): Either[Err, WithdrawalResponse] =
+    val netEntries = List(
+      LedgerEntry(Accounts.WithdrawalClearing, EntryDirection.DR, intent.expectedRecipientNet),
+      LedgerEntry(Accounts.providerBalance(intent.provider), EntryDirection.CR, intent.expectedRecipientNet),
+    )
+    val feeRecoveryEntries = List(
+      LedgerEntry(Accounts.WithdrawalClearing, EntryDirection.DR, intent.quotedProviderFee),
+      LedgerEntry(Accounts.FeeRecovery, EntryDirection.CR, intent.quotedProviderFee),
+    )
+    val providerFeeEntries = List(
+      LedgerEntry(Accounts.ProviderPayoutFee, EntryDirection.DR, providerFeeDebited),
+      LedgerEntry(Accounts.providerBalance(intent.provider), EntryDirection.CR, providerFeeDebited),
+    )
+    val feeRecoveryPost =
+      if intent.quotedProviderFee > 0 then
+        postLedgerTx(TxKind.WithdrawalFeeRecovery, withdrawal.userUid, feeRecoveryEntries, TxWriteMeta(withdrawalId = Some(withdrawal.id), payoutIntentId = Some(intent.id), rawInput = Some(s"providerEvent=$providerEventId;quotedFee=${intent.quotedProviderFee}")))
+      else Right(LedgerTx(-1L, TxKind.WithdrawalFeeRecovery, Nil, None, None, withdrawal.userUid))
+    val providerFeePost =
+      if providerFeeDebited > 0 then
+        postLedgerTx(TxKind.ProviderPayoutFee, withdrawal.userUid, providerFeeEntries, TxWriteMeta(withdrawalId = Some(withdrawal.id), payoutIntentId = Some(intent.id), rawInput = Some(s"providerEvent=$providerEventId;providerFee=$providerFeeDebited")))
+      else Right(LedgerTx(-1L, TxKind.ProviderPayoutFee, Nil, None, None, withdrawal.userUid))
+    for
+      _ <- postLedgerTx(TxKind.WithdrawalSettle, withdrawal.userUid, netEntries, TxWriteMeta(withdrawalId = Some(withdrawal.id), payoutIntentId = Some(intent.id), rawInput = Some(s"providerEvent=$providerEventId;transferRef=${providerTransferRef.getOrElse("")}")))
+      _ <- feeRecoveryPost
+      _ <- providerFeePost
+      wd <- Db.asActor(actor) {
+        wservice.transitionOnly(world, withdrawal.id, WithdrawalStatus.Submitted, WithdrawalStatus.Submitted, WithdrawalStatus.Settled)._2
+      } match
+        case Right(w) => Right(withdrawalResponse(w))
+        case Left(e)  => Left(wErr(e))
+    yield
+      val result =
+        if providerFeeDebited == intent.quotedProviderFee then PayoutReconciliationRecord(intent.id, Some(providerEventId), intent.quotedProviderFee, Some(providerFeeDebited), "matched", None)
+        else PayoutReconciliationRecord(intent.id, Some(providerEventId), intent.quotedProviderFee, Some(providerFeeDebited), "fee_variance", Some(s"quoted=${intent.quotedProviderFee} observed=$providerFeeDebited"))
+      Db.payoutReconciliationPut(result)
+      Db.audit("withdrawal.recipient_pays_fee", actor, withdrawal.id.toString, result.result)
+      wd
 
   def serverEndpoints: List[SE] = List(
     incentiveCredit.handleSecurity(resolveAdmin).handle(admin => (req: CreditRequest) =>
@@ -370,11 +442,9 @@ class LedgerApi:
 
     proposeReversal.handleSecurity(resolveAdmin).handle(admin => (req: ReversalProposeBody) =>
       Db.txById(req.targetTxId) match
-        case None                                     => Left((StatusCode.NotFound, "target transaction not found"))
+        case None => Left((StatusCode.NotFound, "target transaction not found"))
         case Some(t) if t.kind == TxKind.RollbackReversal => Left((StatusCode.Conflict, "cannot reverse a reversal"))
-        // already-reversed is enforced by the verified AdjustmentService.propose (returns
-        // AlreadyReversed -> 409 via pErr); the FOR-UPDATE lock on the target tx row
-        // serializes concurrent reversals of the same tx so that verified check is race-free.
+        case Some(t) if t.entries.size != 2 => Left((StatusCode.Conflict, "multi_entry_reversal_unsupported"))
         case Some(t) =>
           Db.transaction {
             Db.lockTransaction(req.targetTxId)
@@ -407,41 +477,35 @@ class LedgerApi:
       Right(service.all(world).map(txResponse))),
 
     accountBalance.handleSecurity(resolveAdmin).handle(_ => (account: String) =>
-      Right(BalanceResponse(account, Db.balanceOf(account), Accounts.normalSide(account)))),
+      Right(BalanceResponse(account, Db.balanceOf(account), Db.accountNormalSide(account)))),
 
     userBalance.handleSecurity(resolveAdmin).handle(_ => (uid: String) =>
-      val a = Accounts.user(uid); Right(BalanceResponse(a, Db.balanceOf(a), Accounts.normalSide(a)))),
+      val a = Accounts.user(uid); Right(BalanceResponse(a, Db.balanceOf(a), Db.accountNormalSide(a)))),
 
     myBalance.handleSecurity(resolveUser).handle(uid => (_: Unit) =>
-      val a = Accounts.user(uid); Right(BalanceResponse(a, Db.balanceOf(a), Accounts.normalSide(a)))),
+      val a = Accounts.user(uid); Right(BalanceResponse(a, Db.balanceOf(a), Db.accountNormalSide(a)))),
 
     summary.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      val expense    = Db.balanceOf(Accounts.IncentiveExpense)
-      val adjustment = Db.balanceOf(Accounts.Adjustment)
-      val clearing   = Db.balanceOf(Accounts.WithdrawalClearing)
-      val cash       = Db.balanceOf(Accounts.Cash)
-      val users = Db.allTxs.map(t =>
-        (if Accounts.isUser(t.creditAccount) then t.amount else 0L) -
-          (if Accounts.isUser(t.debitAccount) then t.amount else 0L)).sum
-      Right(SummaryResponse(expense, users, clearing, cash, adjustment,
-        fundsInvariantHolds = expense == users + clearing + cash - adjustment))),
+      val incentiveExpense = Db.balanceOf(Accounts.IncentiveExpense)
+      val providerPayoutFee = Db.balanceOf(Accounts.ProviderPayoutFee)
+      val adjustment = Db.categoryBalance("adjustment")
+      val users = Db.categoryBalance("user_liability")
+      val clearing = Db.categoryBalance("clearing")
+      val settlement = Db.categoryBalance("settlement")
+      val feeRecovery = Db.categoryBalance("revenue")
+      Right(SummaryResponse(incentiveExpense, users, clearing, settlement, adjustment, feeRecovery, providerPayoutFee,
+        fundsInvariantHolds = incentiveExpense + providerPayoutFee == users + clearing + settlement + feeRecovery - adjustment))),
 
     requestWithdrawal.handleSecurity(resolveUser).handle(uid => (req: WithdrawalRequestBody) =>
       Db.withdrawalByClientReq(uid, req.clientRequestId) match
         case Some(wd) => Right(withdrawalResponse(wd))
         case None =>
-          // Fast-path sufficiency (also keeps the 400-before-risk ordering for an obvious
-          // over-balance). checkWithdrawalRisk runs OUTSIDE the reserve transaction so its
-          // risk events / kill-switch commit independently of the reserve's success.
           if Db.balanceOf(Accounts.user(uid)) < req.amountPoints then Left((StatusCode.BadRequest, "insufficient_balance"))
           else
             Db.checkWithdrawalRisk(uid, req.amountPoints) match
               case Left("payouts_disabled") => Left((StatusCode.ServiceUnavailable, "payouts_disabled"))
               case Left(_)                  => Left((StatusCode.UnprocessableEntity, "risk_limit"))
               case Right(_) =>
-                // One transaction: lock the user's balance row, RE-CHECK sufficiency on the
-                // locked materialized balance, and post the reserve — so two concurrent
-                // reserves for the same user serialize instead of both passing (the TOCTOU).
                 Db.transaction {
                   Db.lockUserBalance(Accounts.user(uid))
                   if Db.balanceOf(Accounts.user(uid)) < req.amountPoints then Left((StatusCode.BadRequest, "insufficient_balance"))
@@ -481,6 +545,19 @@ class LedgerApi:
     listWithdrawals.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
       Right(wservice.all(world).map(withdrawalResponse))),
 
+    getPayoutIntent.handleSecurity(resolveAdmin).handle(_ => (id: Long) =>
+      Db.payoutIntentByWithdrawal(id) match
+        case Some(p) => Right(payoutIntentResponse(p))
+        case None    => Left((StatusCode.NotFound, "payout intent not found"))),
+
+    getPayoutReconciliation.handleSecurity(resolveAdmin).handle(_ => (id: Long) =>
+      Db.payoutReconciliationByWithdrawal(id) match
+        case Some(r) => Right(payoutReconciliationResponse(id, r))
+        case None    => Left((StatusCode.NotFound, "reconciliation not found"))),
+
+    listProviderEvents.handleSecurity(resolveAdmin).handle(_ => (id: Long) =>
+      Right(Db.providerEventsByWithdrawal(id).map(providerEventResponse))),
+
     approveWithdrawal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, DecisionRequest)) =>
       parseWStatus(in._2.expectedStatus) match
         case None     => Left(statusConflict)
@@ -493,13 +570,29 @@ class LedgerApi:
 
     submitWithdrawal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, PayoutSubmitRequest)) =>
       parseWStatus(in._2.expectedStatus) match
-        case None     => Left(statusConflict)
+        case None => Left(statusConflict)
+        case Some(es) if in._2.provider != "stripe" => Left((StatusCode.BadRequest, "unsupported_provider"))
         case Some(es) =>
-          Db.transaction {
-            Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
-              case Right(wd) => Db.audit("withdrawal.submit", admin, in._1.toString, s"${in._2.channel}:${in._2.destinationId}"); Right(withdrawalResponse(wd))
-              case Left(e)   => Left(wErr(e))
-          }),
+          Db.payoutIntentByWithdrawal(in._1) match
+            case Some(_) =>
+              Db.withdrawalById(in._1) match
+                case Some(wd) => Right(withdrawalResponse(wd))
+                case None     => Left((StatusCode.NotFound, "withdrawal not found"))
+            case None =>
+              Db.withdrawalById(in._1) match
+                case None => Left((StatusCode.NotFound, "withdrawal not found"))
+                case Some(wd) if in._2.quotedProviderFee < 0 || in._2.expectedRecipientNet <= 0 => Left((StatusCode.BadRequest, "bad_quote"))
+                case Some(wd) if wd.amount != in._2.expectedRecipientNet + in._2.quotedProviderFee => Left((StatusCode.BadRequest, "quote_mismatch"))
+                case Some(wd) =>
+                  Db.transaction {
+                    val intent = PayoutIntentRecord(Db.nextId(), wd.id, wd.userUid, in._2.provider, in._2.routeCode, in._2.destinationId, wd.amount, in._2.quotedProviderFee, in._2.expectedRecipientNet, in._2.quoteRef, in._2.providerTransferRef)
+                    Db.payoutIntentPut(intent)
+                    Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
+                      case Right(w2) =>
+                        Db.audit("withdrawal.submit", admin, in._1.toString, s"${in._2.provider}:${in._2.routeCode}:${in._2.quotedProviderFee}")
+                        Right(withdrawalResponse(w2))
+                      case Left(e) => Left(wErr(e))
+                  }),
 
     rejectWithdrawal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, DecisionRequest)) =>
       parseWStatus(in._2.expectedStatus) match
@@ -548,51 +641,49 @@ class LedgerApi:
 
     userTransactions.handleSecurity(resolveAdmin).handle(_ => (uid: String) =>
       val acct = Accounts.user(uid)
-      Right(service.all(world).filter(t => t.debitAccount == acct || t.creditAccount == acct).map(txResponse))),
+      Right(service.all(world).filter(t => t.entries.exists(_.account == acct)).map(txResponse))),
 
     stripeWebhook.handleSecurity(resolveAdmin).handle(_ => (b: StripeWebhookBody) =>
-      // The endpoint stays admin-bearer-gated: it is fronted by a trusted internal relay
-      // that injects the token; the HMAC over (eventId:withdrawalId:outcome) is a second
-      // factor, compared in constant time. A real provider never calls this path directly.
-      val expected = Db.webhookSignature(b.eventId, b.withdrawalId, b.outcome)
+      val expected = Db.webhookSignature("stripe", b.eventId, b.withdrawalId, b.outcome, b.providerFeeDebited)
       if !MessageDigest.isEqual(b.signature.getBytes(UTF_8), expected.getBytes(UTF_8)) then
         Left((StatusCode.Unauthorized, "bad_signature"))
       else if b.outcome != "settled" && b.outcome != "failed" then
         Left((StatusCode.BadRequest, "bad_outcome"))
       else Db.withdrawalById(b.withdrawalId) match
         case None => Left((StatusCode.NotFound, "withdrawal not found"))
-        case Some(_) =>
+        case Some(withdrawal) =>
           try
             val wd = Db.transaction {
-              // Dedup gate INSIDE the tx: a duplicate EVENT_ID trips the PK -> DuplicateEvent
-              // -> replay. Scoping the 23505 catch to THIS insert means a 23505 from any other
-              // write is a real error, not a misread replay. A failed transition throws
-              // WebhookAbort so the event row rolls back and stays retryable (no "consumed
-              // but unsettled" state).
-              try Db.insertProviderEvent(b.eventId, b.withdrawalId, b.outcome)
+              try Db.insertProviderEvent("stripe", b.eventId, b.withdrawalId, b.providerTransferRef, b.outcome, Some(b.providerFeeDebited), s"eventId=${b.eventId};fee=${b.providerFeeDebited}")
               catch case e: com.augustnagro.magnum.SqlException if isUniqueViolation(e) => throw DuplicateEvent()
               val res =
                 if b.outcome == "settled" then
-                  Db.asActor("stripe") {
-                    Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
-                      wservice.settle(world, b.withdrawalId, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, Accounts.Cash)._2
-                    }
-                  }
+                  Db.payoutIntentByWithdrawal(b.withdrawalId) match
+                    case Some(intent) => settleRecipientPaysFee(withdrawal, intent, b.eventId, b.providerFeeDebited, b.providerTransferRef, "stripe")
+                    case None =>
+                      Db.asActor("stripe") {
+                        Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
+                          wservice.settle(world, b.withdrawalId, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, Accounts.Cash)._2
+                        }
+                      } match
+                        case Right(w) => Db.audit("withdrawal.webhook", "stripe", b.withdrawalId.toString, b.eventId); Right(withdrawalResponse(w))
+                        case Left(e)  => Left(wErr(e))
                 else
                   Db.asActor("stripe") {
                     Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
                       wservice.fail(world, b.withdrawalId, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, userAcctOf(b.withdrawalId))._2
                     }
-                  }
+                  } match
+                    case Right(w) => Db.audit("withdrawal.webhook", "stripe", b.withdrawalId.toString, b.eventId); Right(withdrawalResponse(w))
+                    case Left(e)  => Left(wErr(e))
               res match
-                case Right(w) => Db.audit("withdrawal.webhook", "stripe", b.withdrawalId.toString, b.eventId); withdrawalResponse(w)
-                case Left(e)  => throw WebhookAbort(wErr(e))
+                case Right(w) => w
+                case Left(e)  => throw WebhookAbort(e)
             }
             Right(wd)
           catch
             case WebhookAbort(err) => Left(err)
             case _: DuplicateEvent =>
-              // duplicate event id -> already processed: idempotent replay of the outcome
               Db.withdrawalById(b.withdrawalId) match
                 case Some(w) => Right(withdrawalResponse(w))
                 case None    => Left((StatusCode.NotFound, "withdrawal not found"))),
