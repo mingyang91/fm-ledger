@@ -5,9 +5,10 @@ DELETE FROM ACCOUNT_BALANCE;
 INSERT INTO ACCOUNT_BALANCE (ACCOUNT_ID, BALANCE, UPDATED_AT)
 SELECT
   ACCOUNT_ID,
+  -- normal side must match Accounts.normalSide: CR for user accounts, withdrawal_clearing, AND cash.
   SUM(CASE
     WHEN DIRECTION = CASE
-      WHEN ACCOUNT_ID LIKE 'user:%' OR ACCOUNT_ID = 'system:withdrawal_clearing' THEN 'CR'
+      WHEN ACCOUNT_ID LIKE 'user:%' OR ACCOUNT_ID = 'system:withdrawal_clearing' OR ACCOUNT_ID = 'system:cash' THEN 'CR'
       ELSE 'DR'
     END THEN AMOUNT ELSE -AMOUNT END) AS BALANCE,
   CURRENT_TIMESTAMP

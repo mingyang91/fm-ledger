@@ -24,6 +24,17 @@ private final case class WebhookAbort(err: (StatusCode, String)) extends Runtime
 // replay and propagates as a real error.
 private final case class DuplicateEvent() extends RuntimeException
 
+/** Walk the cause chain for a Postgres unique-violation (SQLState 23505). Magnum wraps the
+  * driver SQLException in its own SqlException, so the 23505 sits on a cause, not the top. */
+private def isUniqueViolation(t: Throwable): Boolean =
+  var c = t
+  var found = false
+  while c != null && !found do
+    c match
+      case s: java.sql.SQLException if s.getSQLState == "23505" => found = true
+      case _ => c = c.getCause
+  found
+
 /* =============================================================================
  * LEDGER WEB SERVER — direct-style (Ox / Identity) tapir over PostgreSQL-backed JDBC.
  * Every business decision is delegated to the STAINLESS-TRANSPILED LedgerService through
@@ -280,10 +291,7 @@ class LedgerApi:
                 Left((StatusCode.UnprocessableEntity, "would_violate_balance_invariant"))
               else approveProposalWrite(id, es, admin, p)
             case Some(p) => approveProposalWrite(id, es, admin, p)
-            case None =>
-              aservice.approve(world, id, es, admin, Db.nextId())._2 match
-                case Right(p) => Right(proposalResponse(p))
-                case Left(e)  => Left(pErr(e))
+            case None    => Left(pErr(ProposalNotFound)) // no such proposal — don't burn an id on a guaranteed miss
         }
 
   private def approveProposalWrite(id: Long, es: ProposalStatus, admin: String, p: Proposal): Either[Err, ProposalResponse] =
@@ -562,7 +570,7 @@ class LedgerApi:
               // WebhookAbort so the event row rolls back and stays retryable (no "consumed
               // but unsettled" state).
               try Db.insertProviderEvent(b.eventId, b.withdrawalId, b.outcome)
-              catch case e: java.sql.SQLException if e.getSQLState == "23505" => throw DuplicateEvent()
+              catch case e: com.augustnagro.magnum.SqlException if isUniqueViolation(e) => throw DuplicateEvent()
               val res =
                 if b.outcome == "settled" then
                   Db.asActor("stripe") {

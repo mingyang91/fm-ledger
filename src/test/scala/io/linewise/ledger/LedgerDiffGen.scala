@@ -28,6 +28,7 @@ trait LedgerDiffGen:
     case SettleW(target: Long, exp: WithdrawalStatus)
     case RejectW(target: Long, exp: WithdrawalStatus, legUid: String)
     case CancelW(target: Long, exp: WithdrawalStatus, legUid: String)
+    case FailW(target: Long, exp: WithdrawalStatus, legUid: String)
     case Propose(uid: String, amount: Long, by: String)
     case Reverse(uid: String, amount: Long, by: String, target: Long)
     case ApproveP(target: Long, exp: ProposalStatus, approver: String)
@@ -43,7 +44,7 @@ trait LedgerDiffGen:
     * SAME values to both worlds). Reference ops consume none — they target an existing id. */
   protected def freshIdCount(op: LedgerOp): Int = op match
     case _: Reserve => 2 // withdrawal id + reserve tx id
-    case _: Credit | _: SettleW | _: RejectW | _: CancelW | _: Propose | _: Reverse | _: ApproveP => 1
+    case _: Credit | _: SettleW | _: RejectW | _: CancelW | _: FailW | _: Propose | _: Reverse | _: ApproveP => 1
     case _ => 0
 
   /** Apply one op to a world; the returned verdict is compared across the two worlds. */
@@ -56,6 +57,7 @@ trait LedgerDiffGen:
     case SettleW(t, exp)          => wSvc.settle(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.Cash)
     case RejectW(t, exp, u)       => wSvc.reject(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
     case CancelW(t, exp, u)       => wSvc.cancel(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
+    case FailW(t, exp, u)         => wSvc.fail(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
     case Propose(uid, amt, by)    => aSvc.propose(w, TxKind.ManualAdjustment, uid, Accounts.Adjustment, Accounts.user(uid), amt, "reason", by, a, None)
     case Reverse(uid, amt, by, t) => aSvc.propose(w, TxKind.RollbackReversal, uid, Accounts.user(uid), Accounts.Adjustment, amt, "reason", by, a, Some(t))
     case ApproveP(t, exp, ap)     => aSvc.approve(w, t, exp, ap, a)
@@ -79,6 +81,7 @@ trait LedgerDiffGen:
     for t <- targets; s <- wStatus yield SettleW(t, s),
     for t <- targets; s <- wStatus; u <- uids yield RejectW(t, s, u),
     for t <- targets; s <- wStatus; u <- uids yield CancelW(t, s, u),
+    for t <- targets; s <- wStatus; u <- uids yield FailW(t, s, u),
     for u <- uids; a <- amounts; by <- actors yield Propose(u, a, by),
     for u <- uids; a <- amounts; by <- actors; t <- targets yield Reverse(u, a, by, t),
     for t <- targets; s <- pStatus; ap <- actors yield ApproveP(t, s, ap),

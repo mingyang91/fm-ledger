@@ -104,6 +104,11 @@ object Jdbc:
     // ACCOUNT_BALANCE is the intentionally-MUTABLE materialized view of the ledger: every
     // posting UPDATEs it, and `balanceDrifts` + the account_balance_matches_replay invariant
     // reconcile it against replaying LEDGER_ENTRY. It deliberately has no append-only guard.
+    // NB: no `user balance >= 0` CHECK. The verified ledger repository permits ANY balanced
+    // posting regardless of resulting sign — balance sufficiency is a shell-layer policy
+    // (lockUserBalance + the sufficiency check), not a repository invariant. A DB CHECK would
+    // make the JDBC realization reject overdraws the InMem oracle accepts, so the differential
+    // drift gate would (correctly) flag the realization as unfaithful to the proven model.
     """CREATE TABLE ACCOUNT_BALANCE (
          ACCOUNT_ID VARCHAR PRIMARY KEY,
          BALANCE BIGINT NOT NULL DEFAULT 0,
@@ -123,6 +128,24 @@ object Jdbc:
     // BEFORE TRUNCATE triggers, or the whole table could be wiped past the guard.
     "CREATE TRIGGER LEDGER_TX_NO_TRUNCATE BEFORE TRUNCATE ON LEDGER_TX FOR EACH STATEMENT EXECUTE FUNCTION LEDGER_REJECT_MUTATION()",
     "CREATE TRIGGER LEDGER_ENTRY_NO_TRUNCATE BEFORE TRUNCATE ON LEDGER_ENTRY FOR EACH STATEMENT EXECUTE FUNCTION LEDGER_REJECT_MUTATION()",
+    // Double-entry conservation, enforced at the DB: at COMMIT, the signed entry sum (DR +, CR -)
+    // of every tx must be zero. A DEFERRABLE INITIALLY DEFERRED constraint trigger is required so
+    // the check runs once both legs are present, not after the first leg is inserted.
+    """CREATE OR REPLACE FUNCTION LEDGER_TX_BALANCED()
+       RETURNS trigger
+       LANGUAGE plpgsql
+       AS $$
+       DECLARE imbalance BIGINT;
+       BEGIN
+         SELECT COALESCE(SUM(CASE WHEN DIRECTION = 'DR' THEN AMOUNT ELSE -AMOUNT END), 0)
+           INTO imbalance FROM LEDGER_ENTRY WHERE TX_ID = NEW.TX_ID;
+         IF imbalance <> 0 THEN
+           RAISE EXCEPTION 'ledger tx % is not balanced (DR-CR = %)', NEW.TX_ID, imbalance;
+         END IF;
+         RETURN NULL;
+       END;
+       $$""",
+    "CREATE CONSTRAINT TRIGGER LEDGER_ENTRY_BALANCED AFTER INSERT ON LEDGER_ENTRY DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION LEDGER_TX_BALANCED()",
 
     """CREATE TABLE WITHDRAWAL (
          ID BIGINT PRIMARY KEY,

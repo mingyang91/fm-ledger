@@ -174,21 +174,32 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(secure(E.proposeReversal, be, alice, ReversalProposeBody(tx.id, "again")).code, StatusCode.Conflict)
   }
 
-  test("LEDGER_TX is append-only and a credit must carry a source (DB-enforced)") {
+  test("DB-enforced invariants: append-only, credit-has-source, double-entry conservation") {
     val ds = freshDs("ledgerao")
     val c = ds.getConnection()
     try
       Jdbc.initSchema(c)
       val st = c.createStatement()
+      // a balanced tx must be inserted in ONE transaction so the deferred conservation trigger
+      // checks it at commit with both legs present.
+      c.setAutoCommit(false)
       st.execute("INSERT INTO LEDGER_TX (ID, KIND, USER_UID) VALUES (1, 'ManualAdjustment', 'u1')")
       st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (1, 'system:adjustment', 'DR', 100)")
       st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (1, 'user:u1', 'CR', 100)")
+      c.commit()
+      c.setAutoCommit(true)
       intercept[java.sql.SQLException](st.execute("UPDATE LEDGER_TX SET USER_UID = 'u2' WHERE ID = 1")) // append-only: UPDATE rejected
       intercept[java.sql.SQLException](st.execute("DELETE FROM LEDGER_ENTRY WHERE TX_ID = 1"))          // append-only: DELETE rejected
       intercept[java.sql.SQLException](st.execute("TRUNCATE LEDGER_ENTRY"))                             // append-only: TRUNCATE rejected
       intercept[java.sql.SQLException](st.execute("TRUNCATE LEDGER_TX CASCADE"))                        // append-only: TRUNCATE rejected
       intercept[java.sql.SQLException](st.execute(                                                    // CHECK: credit needs a source
         "INSERT INTO LEDGER_TX (ID, KIND, USER_UID) VALUES (2, 'IncentiveCredit', 'u1')"))
+      // conservation: a single-leg (unbalanced) tx is rejected at COMMIT by the deferred trigger.
+      c.setAutoCommit(false)
+      st.execute("INSERT INTO LEDGER_TX (ID, KIND, USER_UID) VALUES (3, 'ManualAdjustment', 'u1')")
+      st.execute("INSERT INTO LEDGER_ENTRY (TX_ID, ACCOUNT_ID, DIRECTION, AMOUNT) VALUES (3, 'system:adjustment', 'DR', 50)")
+      intercept[java.sql.SQLException](c.commit())
+      c.rollback()
     finally c.close()
   }
 
