@@ -20,7 +20,11 @@ case class ObligationService[W](oLens: Has[W, ObligationRepository]) {
   def open(
       w: W, sourceKind: String, sourceId: String, userUid: String, role: String,
       projectRef: String, taskKind: String, estimatedUnit: FMLong): (W, Either[LedgerError, Obligation]) =
-    oLens.get(w).bySource(sourceKind, sourceId) match
+    // #P2-b: an open obligation feeds the upcoming-expense forecast, so its estimate must be positive;
+    // a non-positive estimate is rejected rather than skewing the projection. (realize may still land a
+    // terminal 0-estimate row when a credit beats the publish — that row is never summed into the forecast.)
+    if !(estimatedUnit > FMLong(BigInt(0))) then (w, Left[LedgerError, Obligation](NonPositiveAmount))
+    else oLens.get(w).bySource(sourceKind, sourceId) match
       case Some(o) =>
         if o.status != ObligationStatus.Open then (w, Left[LedgerError, Obligation](SourceTerminal))
         else (w, Right[LedgerError, Obligation](o))   // idempotent replay

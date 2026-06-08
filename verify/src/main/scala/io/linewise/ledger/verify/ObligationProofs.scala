@@ -14,6 +14,7 @@ object ObligationProofs {
       w: World, sk: String, si: String, uid: String, role: String,
       projectRef: String, taskKind: String, estimatedUnit: FMLong): Boolean = {
     require(w.obligations.bySource(sk, si) == None[Obligation]())
+    require(estimatedUnit > FMLong(BigInt(0)))
     val svc = ObligationService[World](HasObligations())
     svc.open(w, sk, si, uid, role, projectRef, taskKind, estimatedUnit) match
       case (w1, Right(o)) =>
@@ -28,6 +29,7 @@ object ObligationProofs {
     require(w.obligations.bySource(sk, si) match
       case Some(o) => o.status == ObligationStatus.Open
       case _       => false)
+    require(estimatedUnit > FMLong(BigInt(0)))
     val existing = w.obligations.bySource(sk, si)
     existing match
       case Some(o) =>
@@ -42,8 +44,25 @@ object ObligationProofs {
     require(w.obligations.bySource(sk, si) match
       case Some(o) => o.status != ObligationStatus.Open
       case _       => false)
+    require(estimatedUnit > FMLong(BigInt(0)))
     ObligationService[World](HasObligations()).open(w, sk, si, uid, role, projectRef, taskKind, estimatedUnit)._2 ==
       Left[LedgerError, Obligation](SourceTerminal)
+  }.holds
+
+  // #P2-b: a non-positive estimate is rejected before any source/idempotency logic, world unchanged.
+  def openRejectsNonPositiveEstimate(
+      w: World, sk: String, si: String, uid: String, role: String,
+      projectRef: String, taskKind: String, estimatedUnit: FMLong): Boolean = {
+    require(!(estimatedUnit > FMLong(BigInt(0))))
+    ObligationService[World](HasObligations()).open(w, sk, si, uid, role, projectRef, taskKind, estimatedUnit)._2 ==
+      Left[LedgerError, Obligation](NonPositiveAmount)
+  }.holds
+
+  def openNonPositiveLeavesWorldUnchanged(
+      w: World, sk: String, si: String, uid: String, role: String,
+      projectRef: String, taskKind: String, estimatedUnit: FMLong): Boolean = {
+    require(!(estimatedUnit > FMLong(BigInt(0))))
+    ObligationService[World](HasObligations()).open(w, sk, si, uid, role, projectRef, taskKind, estimatedUnit)._1 == w
   }.holds
 
   def cancelOpenMovesCancelled(w: World, sk: String, si: String): Boolean = {

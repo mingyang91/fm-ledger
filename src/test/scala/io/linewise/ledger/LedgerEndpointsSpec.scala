@@ -3,6 +3,7 @@ package io.linewise.ledger
 import sttp.model.StatusCode
 
 import io.linewise.ledger.LedgerEndpoints as E
+import scala.jdk.CollectionConverters.*
 
 /* =============================================================================
  * Example-style endpoint spec for the ledger microservice. The shared test harness
@@ -41,7 +42,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
   test("two-person adjustment: propose+approve credits a user, proposer can't self-approve, funds invariant holds, DEBIT-beyond-balance refused") {
     val api = freshApi(); val be = stubOf(api); val alice = api.adminToken("alice"); val bob = api.adminToken("bob")
     secure(E.incentiveCredit, be, alice, CreditRequest("u1", 1000, "annotation_job", "job-2"))
-    val prop = secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", "CREDIT", 500, "bonus")).body.toOption.get
+    val prop = secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", AdjustDirection.CREDIT, 500, "bonus")).body.toOption.get
     assertEquals(prop.status, "PendingReview")
     // the verified proposer != approver invariant: alice cannot approve her own proposal
     assertEquals(secure(E.approveAdjustment, be, alice, (prop.id, DecisionRequest("PendingReview"))).code, StatusCode.Conflict)
@@ -55,7 +56,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(s.adjustmentPoints, 500L)
     assert(s.fundsInvariantHolds, s.toString)
     // a DEBIT adjustment beyond the user's balance is refused at approval (production guard)
-    val dprop = secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", "DEBIT", 99999, "clawback")).body.toOption.get
+    val dprop = secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", AdjustDirection.DEBIT, 99999, "clawback")).body.toOption.get
     assertEquals(secure(E.approveAdjustment, be, bob, (dprop.id, DecisionRequest("PendingReview"))).code, StatusCode.UnprocessableEntity)
   }
 
@@ -376,6 +377,85 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assert(secure(E.summary, be, svc, ()).body.toOption.get.fundsInvariantHolds)
   }
 
+  /* ===========================================================================
+   * REPRODUCTIONS of the external review findings (P1-a/b, P2-a/b). Each is tagged `.fail`:
+   * it asserts the CORRECT property, which fails TODAY (documenting the bug) so the suite stays
+   * green; when the bug is fixed the property holds, munit reports an unexpected pass, and the fix
+   * removes the `.fail`. P1-a/b are reproduced deterministically at the decision/store level (no
+   * flaky thread races) — the same root cause concurrency exposes.
+   * ======================================================================== */
+
+  test("P1-a (fixed): concurrent over-limit withdrawals serialize on an advisory lock — exactly one passes") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    Db.setSystemConfig("per_user_day_payout_limit_points", "500", "test", "test")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "p1a-fund"))
+    val barrier = new java.util.concurrent.CyclicBarrier(2)
+    val ok = new java.util.concurrent.atomic.AtomicInteger(0)
+    val rejected = new java.util.concurrent.atomic.AtomicInteger(0)
+    def fire(cr: String): Unit =
+      try
+        barrier.await()
+        secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, cr)).code match
+          case StatusCode.Ok                  => ok.incrementAndGet()
+          case StatusCode.UnprocessableEntity => rejected.incrementAndGet()
+          case _                              => ()
+      catch case _: Throwable => ()
+    val t1 = new Thread(() => fire("p1a-A")); val t2 = new Thread(() => fire("p1a-B"))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    // 300 + 300 = 600 > 500/day: the advisory lock serializes them, the second sees the first's
+    // committed reservation in its in-tx check and is rejected. Exactly one passes (never both).
+    assertEquals(ok.get, 1, s"expected exactly one to pass; ok=${ok.get} rejected=${rejected.get}")
+    assertEquals(rejected.get, 1)
+  }
+
+  test("P1-b (fixed): concurrent duplicate-source credits both resolve to the SAME tx idempotently (no 23505 leak)") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc")
+    val barrier = new java.util.concurrent.CyclicBarrier(2)
+    val ids = new java.util.concurrent.ConcurrentLinkedQueue[Long]()
+    val errs = new java.util.concurrent.atomic.AtomicInteger(0)
+    def fire(): Unit =
+      try
+        barrier.await()
+        secure(E.incentiveCredit, be, svc, CreditRequest("u1", 100, "annotation_job", "dup-src")).body match
+          case Right(tx) => ids.add(tx.id)
+          case Left(_)   => errs.incrementAndGet()
+      catch case _: Throwable => errs.incrementAndGet()
+    val t1 = new Thread(() => fire()); val t2 = new Thread(() => fire())
+    t1.start(); t2.start(); t1.join(); t2.join()
+    // Whichever order they interleave (collision caught + reselected, or the loser sees the committed
+    // row on its pre-check), both end as an idempotent Ok for the SAME tx — never a leaked 23505.
+    assertEquals(errs.get, 0, "a concurrent duplicate credit leaked an error instead of an idempotent replay")
+    assertEquals(ids.asScala.toSet.size, 1, "both concurrent credits should resolve to the same tx id")
+  }
+
+  test("P2-a (fixed): the startup reaper uses the configured timeout, so a fresh live inflight row is left alone") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "p2a-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "p2a-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    Db.claimPendingDispatches(1) // a live transfer just claimed this row
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("inflight"))
+    // exactly what LedgerServer startup now runs (the configured window, NOT 0): a just-claimed row
+    // is well within the window, so an overlapping/restarted instance does not reclaim a live transfer.
+    Db.reclaimStaleInflight(PayoutDispatcher.DefaultReclaimAfterSeconds)
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("inflight"))
+  }
+
+  test("P2-b (fixed): an invalid adjustment direction is rejected at the HTTP boundary (enum decode -> 400)") {
+    val api = freshApi(); val be = stubOf(api); val alice = api.adminToken("alice")
+    secure(E.incentiveCredit, be, alice, CreditRequest("u1", 1000, "annotation_job", "p2b-fund"))
+    // a valid DEBIT still debits the user (CREDIT/DEBIT are the only representable directions)
+    assertEquals(secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", AdjustDirection.DEBIT, 100, "clawback")).body.toOption.get.debitAccount, Accounts.user("u1"))
+    // an unknown wire value can't be constructed in the typed client; over the wire it is a decode-time 400.
+    assertEquals(rawPost(be, "adjustments", alice, """{"userUid":"u1","direction":"BOGUS","amountPoints":100,"reason":"typo"}""").code, StatusCode.BadRequest)
+  }
+
+  test("P2-b (fixed): a non-positive obligation estimate is rejected (400), never entering the forecast") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc")
+    assertEquals(secure(E.openObligation, be, svc, ObligationOpenBody("annotation_job", "neg-est", "u1", -100)).code, StatusCode.BadRequest)
+    assertEquals(secure(E.openObligation, be, svc, ObligationOpenBody("annotation_job", "zero-est", "u1", 0)).code, StatusCode.BadRequest)
+  }
+
   test("stripe-mock: StripeGateway posts a well-formed /v1/transfers and parses the tr_ id") {
     val container =
       try
@@ -479,7 +559,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
   test("adjustments: list and get round-trip; a rejected proposal cannot be approved") {
     val api = freshApi(); val be = stubOf(api); val alice = api.adminToken("alice"); val bob = api.adminToken("bob")
     secure(E.incentiveCredit, be, alice, CreditRequest("u1", 1000, "annotation_job", "adj-fund"))
-    val p = secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", "CREDIT", 100, "bonus")).body.toOption.get
+    val p = secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", AdjustDirection.CREDIT, 100, "bonus")).body.toOption.get
     assert(secure(E.listAdjustments, be, alice, ()).body.toOption.get.exists(_.id == p.id))
     assertEquals(secure(E.getAdjustment, be, alice, p.id).body.toOption.get.id, p.id)
     assertEquals(secure(E.rejectAdjustment, be, bob, (p.id, DecisionRequest("PendingReview"))).body.toOption.get.status, "Rejected")

@@ -51,7 +51,11 @@ final case class CreditRequest(
     sourceId: String,
     incentiveTraceId: Option[String] = None,
     incentiveModule: Option[String] = None)
-final case class AdjustProposeBody(userUid: String, direction: String, amountPoints: Long, reason: String) // direction: CREDIT | DEBIT
+// #P2-b: a closed enum so an unknown direction is rejected at the JSON boundary (decode -> 400),
+// never silently defaulted to a DEBIT against the user.
+enum AdjustDirection:
+  case CREDIT, DEBIT
+final case class AdjustProposeBody(userUid: String, direction: AdjustDirection, amountPoints: Long, reason: String)
 final case class ReversalProposeBody(targetTxId: Long, reason: String)
 final case class ProposalResponse(
     id: Long, kind: String, userUid: String, debitAccount: String, creditAccount: String,
@@ -90,6 +94,7 @@ final case class ConfigProposalResponse(id: Long, key: String, value: String, re
 
 object LedgerJson:
   given Pickler[CreditRequest]          = Pickler.derived
+  given Pickler[AdjustDirection]        = Pickler.derived
   given Pickler[AdjustProposeBody]      = Pickler.derived
   given Pickler[ReversalProposeBody]    = Pickler.derived
   given Pickler[ProposalResponse]       = Pickler.derived
@@ -523,9 +528,13 @@ class LedgerApi:
           Db.guardLedgerAmount(req.userUid, req.amountPoints, s"${req.sourceKind}:${req.sourceId}") match
             case Left(_) => Left((StatusCode.UnprocessableEntity, "risk_limit"))
             case Right(_) =>
-              // Credit + obligation realize + audit commit as one unit.
-              Db.transaction {
-                Db.asActor(admin) {
+              // Credit + obligation realize + audit commit as one unit. A concurrent duplicate-source
+              // insert (the pre-check missed the racing row) surfaces as a 23505 -> roll back and
+              // return the now-committed existing tx idempotently (#P1-b).
+              try Db.transaction {
+                Db.advisoryXactLock(req.userUid)                  // #P1-a: serialize same-user credits on the growth bucket
+                if !Db.withinDayGrowthLimit(req.userUid, req.amountPoints) then Left((StatusCode.UnprocessableEntity, "risk_limit")) // #P1-a: authoritative, race-free re-check under the lock
+                else Db.asActor(admin) {
                   Db.withTxMeta(TxWriteMeta(incentiveTraceId = req.incentiveTraceId, incentiveModule = req.incentiveModule, rawInput = Some(s"incentiveTraceId=${req.incentiveTraceId.getOrElse("")};module=${req.incentiveModule.getOrElse("")}"))) {
                     service.credit(world, Accounts.IncentiveExpense, Accounts.user(req.userUid), req.userUid,
                       req.amountPoints, Db.nextId(), req.sourceKind, req.sourceId)._2
@@ -541,12 +550,16 @@ class LedgerApi:
                       case Some(tx) => Right(txResponse(tx))
                       case None     => Left((StatusCode.Conflict, "duplicate_source"))
                   case Left(_)                 => Left((StatusCode.BadRequest, "bad request"))
-              }),
+              }
+              catch case e: com.augustnagro.magnum.SqlException if isUniqueViolation(e) =>
+                Db.txBySource(req.sourceKind, req.sourceId) match
+                  case Some(tx) => Right(txResponse(tx))
+                  case None     => Left((StatusCode.Conflict, "duplicate_source"))),
 
 
     proposeAdjustment.handleSecurity(resolveAdmin).handle(admin => (req: AdjustProposeBody) =>
       val (dr, cr) =
-        if req.direction == "CREDIT" then (Accounts.Adjustment, Accounts.user(req.userUid))
+        if req.direction == AdjustDirection.CREDIT then (Accounts.Adjustment, Accounts.user(req.userUid))
         else (Accounts.user(req.userUid), Accounts.Adjustment)
       Db.transaction {
         Db.asActor(admin) {
@@ -643,9 +656,13 @@ class LedgerApi:
               case Left("payouts_disabled") => Left((StatusCode.ServiceUnavailable, "payouts_disabled"))
               case Left(_)                  => Left((StatusCode.UnprocessableEntity, "risk_limit"))
               case Right(_) =>
-                Db.transaction {
+                // A concurrent duplicate clientRequestId surfaces as a 23505 -> roll back and return
+                // the now-committed existing withdrawal idempotently (#P1-b).
+                try Db.transaction {
+                  Db.advisoryXactLock(uid)                                    // #P1-a: serialize same-user reservations on the limit bucket
                   Db.lockUserBalance(Accounts.user(uid))
                   if Db.balanceOf(Accounts.user(uid)) < req.amountPoints then Left((StatusCode.BadRequest, "insufficient_balance"))
+                  else if !Db.withinPayoutDayLimits(uid, req.amountPoints) then Left((StatusCode.UnprocessableEntity, "risk_limit")) // #P1-a: authoritative, race-free re-check under the lock
                   else
                     val wid = Db.nextId()
                     val reserveTxId = Db.nextId()
@@ -657,7 +674,11 @@ class LedgerApi:
                     } match
                       case Right(wd) => Db.audit("withdrawal.request", uid, wid.toString, req.amountPoints.toString); Right(withdrawalResponse(wd))
                       case Left(e)   => Left(wErr(e))
-                }),
+                }
+                catch case e: com.augustnagro.magnum.SqlException if isUniqueViolation(e) =>
+                  Db.withdrawalByClientReq(uid, req.clientRequestId) match
+                    case Some(wd) => Right(withdrawalResponse(wd))
+                    case None     => Left((StatusCode.Conflict, "duplicate_client_request"))),
 
     myWithdrawals.handleSecurity(resolveUser).handle(uid => (_: Unit) =>
       Right(wservice.all(world).filter(_.userUid == uid).map(withdrawalResponse))),

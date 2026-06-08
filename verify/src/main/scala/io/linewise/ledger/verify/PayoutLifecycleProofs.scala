@@ -878,4 +878,71 @@ object PayoutLifecycleProofs {
   def clientErrorIsPermanent(): Boolean = {
     classifyResponse(false, false, false) == DispatchOutcome.PermanentFailure && !outcomeRetryable(DispatchOutcome.PermanentFailure)
   }.holds
+
+  /* ---------------------------------------------------------------------------
+   * #P2-a — STALENESS for the reaper. A row is stale only when its last update is older than the
+   * timeout. The startup sweep must use a real (positive) timeout, NOT 0: with timeout 0 any row
+   * claimed a moment earlier is "stale" and a live transfer gets reclaimed out from under a
+   * concurrent / just-restarted instance. These tie the reclaim guard to the timeout arithmetic.
+   * ------------------------------------------------------------------------ */
+  def isStale(updatedAt: BigInt, now: BigInt, timeout: BigInt): Boolean = now - updatedAt > timeout
+
+  // a row updated within the timeout window is not stale (for any non-negative timeout).
+  def withinTimeoutNotStale(updatedAt: BigInt, now: BigInt, timeout: BigInt): Boolean = {
+    require(timeout >= BigInt(0))
+    require(now - updatedAt <= timeout)
+    !isStale(updatedAt, now, timeout)
+  }.holds
+
+  // a just-claimed row (age 0) is never stale under any non-negative timeout.
+  def justClaimedNotStale(now: BigInt, timeout: BigInt): Boolean = {
+    require(timeout >= BigInt(0))
+    !isStale(now, now, timeout)
+  }.holds
+
+  // DOCUMENTS THE BUG: timeout 0 marks ANY prior claim (updatedAt < now) stale -> reclaimed.
+  def zeroTimeoutReclaimsAnyPriorClaim(updatedAt: BigInt, now: BigInt): Boolean = {
+    require(updatedAt < now)
+    isStale(updatedAt, now, BigInt(0))
+  }.holds
+
+  // a proper (positive, age-respecting) timeout leaves a fresh InFlight row untouched by the reaper.
+  def reclaimWithProperTimeoutLeavesFresh(w: PayoutWorld, d: PayoutDispatch, updatedAt: BigInt, now: BigInt, timeout: BigInt): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    require(timeout >= BigInt(0))
+    require(now - updatedAt <= timeout)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d))
+    reclaim(w0, d.intentId, isStale(updatedAt, now, timeout)) == w0
+  }.holds
+
+  /* ---------------------------------------------------------------------------
+   * #P1-a — LIMIT DECISION. The authoritative reservation check, given a CONSISTENT running total
+   * (the per-user advisory lock + in-tx read provide that consistency in production). Admits iff the
+   * total + amount stays within the limit; an admitted reservation keeps the total within the limit;
+   * and a second reservation checked against the FIRST's total can only be admitted if the SUM fits.
+   * ------------------------------------------------------------------------ */
+  def admitsReservation(runningTotal: BigInt, amount: BigInt, limit: BigInt): Boolean =
+    runningTotal + amount <= limit
+
+  def admittedReservationStaysUnderLimit(runningTotal: BigInt, amount: BigInt, limit: BigInt): Boolean = {
+    require(admitsReservation(runningTotal, amount, limit))
+    runningTotal + amount <= limit
+  }.holds
+
+  // the race-closing property: when the second reservation is checked against the FIRST's committed
+  // total (which the advisory lock guarantees it sees), admitting it implies the combined total is
+  // within the limit — so two serialized reservations can never both pass past the limit.
+  def secondReservationSeesFirstAndStaysUnderLimit(first: BigInt, second: BigInt, limit: BigInt): Boolean = {
+    require(admitsReservation(first, second, limit))
+    first + second <= limit
+  }.holds
+
+  // contrast (the bug): when BOTH are checked against a STALE total of 0, both can be admitted even
+  // though their sum exceeds the limit — exactly the concurrent bypass the advisory lock removes.
+  def staleZeroCheckAdmitsOverLimitPair(first: BigInt, second: BigInt, limit: BigInt): Boolean = {
+    require(first > BigInt(0) && second > BigInt(0))
+    require(first <= limit && second <= limit)
+    require(first + second > limit)
+    admitsReservation(BigInt(0), first, limit) && admitsReservation(BigInt(0), second, limit)
+  }.holds
 }

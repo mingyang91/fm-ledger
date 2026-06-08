@@ -86,6 +86,11 @@ abstract class LedgerHttpSuite extends munit.ScalaCheckSuite:
   protected def public[I, EE, O](ep: Endpoint[Unit, I, EE, O, Any], be: SyncBackend, in: I): Response[Either[EE, O]] =
     client.toRequestThrowDecodeFailures(ep, Some(baseUri))(in).send(be)
 
+  // Raw bearer-authenticated POST with a hand-written JSON body — used to drive malformed inputs
+  // (e.g. an unknown enum value) that the typed client cannot even construct.
+  protected def rawPost(be: SyncBackend, path: String, token: String, jsonBody: String): Response[Either[String, String]] =
+    basicRequest.post(baseUri.addPath(path)).header("Authorization", s"Bearer $token").contentType("application/json").body(jsonBody).send(be)
+
 object LedgerHttpSuite:
   // Shared across all ledger suites so the global `Db` singleton is touched by one test at a time.
   private val dbLock = ReentrantLock()

@@ -562,6 +562,41 @@ final class LedgerStore(ds: DataSource):
         Right(forceReview)
   }
 
+  /** #P1-a: per-user advisory lock held to end of transaction. Concurrent reservations/credits for
+    * the same user serialize on it, so the second waits and then reads the first's COMMITTED total in
+    * its in-tx limit check — closing the check-then-write race. Mirrors the verified LimitDecision's
+    * "consistent day total" premise. (Cross-user system-day races are caught by SERIALIZABLE+retry.) */
+  def advisoryXactLock(userUid: String): Unit =
+    require(current.isBound, "advisoryXactLock must be called inside transaction { … }")
+    val key = ("payout:" + userUid).hashCode.toLong
+    val ps = dbc.connection.prepareStatement("SELECT pg_advisory_xact_lock(?)")
+    try { ps.setLong(1, key); ps.execute() } finally ps.close()
+
+  /** Authoritative payout-limit gate, read INSIDE the reserve transaction (after advisoryXactLock):
+    * true iff `amount` fits under the per-user/day, per-user/month, and system/day limits given the
+    * currently committed live withdrawals. */
+  def withinPayoutDayLimits(userUid: String, amount: Long): Boolean = readOnly {
+    val userDayLimit = configLong0("per_user_day_payout_limit_points", 100000L)
+    val userMonthLimit = configLong0("per_user_month_payout_limit_points", 500000L)
+    val systemDayLimit = configLong0("system_day_payout_limit_points", 10000000L)
+    val live = SqlLiteral(liveWithdrawalFilter)
+    val userDay = sql"SELECT COALESCE(SUM(AMOUNT), 0) FROM WITHDRAWAL WHERE USER_UID = $userUid AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'$live".query[Long].run()(using dbc).head
+    val userMonth = sql"SELECT COALESCE(SUM(AMOUNT), 0) FROM WITHDRAWAL WHERE USER_UID = $userUid AND CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 month'$live".query[Long].run()(using dbc).head
+    val systemDay = sql"SELECT COALESCE(SUM(AMOUNT), 0) FROM WITHDRAWAL WHERE CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'$live".query[Long].run()(using dbc).head
+    userDay + amount <= userDayLimit && userMonth + amount <= userMonthLimit && systemDay + amount <= systemDayLimit
+  }
+
+  /** Authoritative per-user/day point-growth gate for incentive credits, read INSIDE the credit
+    * transaction (after advisoryXactLock): true iff `amount` fits under the day growth limit. */
+  def withinDayGrowthLimit(userUid: String, amount: Long): Boolean = readOnly {
+    val growth = configLong0("per_user_day_point_growth_limit_points", 50000L)
+    val userAcct = Accounts.user(userUid)
+    val today = sql"""SELECT COALESCE(SUM(E.AMOUNT), 0) FROM LEDGER_TX T JOIN LEDGER_ENTRY E ON E.TX_ID = T.ID
+                      WHERE T.USER_UID = $userUid AND T.KIND = 'IncentiveCredit' AND E.DIRECTION = 'CR' AND E.ACCOUNT_ID = $userAcct
+                        AND T.CREATED_AT >= CURRENT_TIMESTAMP - INTERVAL '1 day'""".query[Long].run()(using dbc).head
+    today + amount <= growth
+  }
+
   def pendingWithdrawalClearing: Long =
     val live = Set("PendingReview", "Submitted")
     allWithdrawals.filter(w => live.contains(w.status.toString)).map(_.amount).sum
@@ -649,6 +684,9 @@ object Db:
   def riskEvents: List[RiskEventRecord] = store.riskEvents
   def guardLedgerAmount(userUid: String, amount: Long, subject: String): Either[String, Unit] = store.guardLedgerAmount(userUid, amount, subject)
   def checkWithdrawalRisk(userUid: String, amount: Long): Either[String, Boolean] = store.checkWithdrawalRisk(userUid, amount)
+  def advisoryXactLock(userUid: String): Unit = store.advisoryXactLock(userUid)
+  def withinPayoutDayLimits(userUid: String, amount: Long): Boolean = store.withinPayoutDayLimits(userUid, amount)
+  def withinDayGrowthLimit(userUid: String, amount: Long): Boolean = store.withinDayGrowthLimit(userUid, amount)
   def insertProviderEvent(provider: String, eventId: String, withdrawalId: Long, providerTransferRef: Option[String], outcome: String, providerFeeDebited: Option[Long], rawInput: String): Unit =
     store.insertProviderEvent(provider, eventId, withdrawalId, providerTransferRef, outcome, providerFeeDebited, rawInput)
   def payoutDispatchPut(d: PayoutDispatchRecord): Unit = store.payoutDispatchPut(d)

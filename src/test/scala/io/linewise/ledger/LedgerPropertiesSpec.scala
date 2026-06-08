@@ -101,7 +101,7 @@ class LedgerPropertiesSpec extends LedgerHttpSuite with LedgerGen with LedgerDif
     forAll { (uid: UserUid, fundedDebit: FundedDebit, source: SourceKey) =>
       val api = freshApi(); val be = stubOf(api); val alice = api.adminToken("alice"); val bob = api.adminToken("bob")
       secure(E.incentiveCredit, be, alice, CreditRequest(uid.value, fundedDebit.funded, source.kind, source.id))
-      val prop = secure(E.proposeAdjustment, be, alice, AdjustProposeBody(uid.value, "DEBIT", fundedDebit.debit, "generated-clawback")).body.toOption.get
+      val prop = secure(E.proposeAdjustment, be, alice, AdjustProposeBody(uid.value, AdjustDirection.DEBIT, fundedDebit.debit, "generated-clawback")).body.toOption.get
       assertEquals(secure(E.approveAdjustment, be, bob, (prop.id, DecisionRequest("PendingReview"))).code, StatusCode.UnprocessableEntity)
       assertEquals(secure(E.userBalance, be, alice, uid.value).body.toOption.get.balancePoints, fundedDebit.funded)
     }

@@ -7,7 +7,12 @@ package io.linewise.ledger
  * holding a connection across the network). The gateway Idempotency-Key makes retries safe.
  * tick; permanent ones (or exhausted attempts) flip to 'failed' and raise a risk event.
  * ========================================================================== */
-final class PayoutDispatcher(gateway: PayoutGateway, onPermanentFailure: Long => Unit = _ => (), batchSize: Int = 20, maxAttempts: Int = 6, reclaimAfterSeconds: Int = 120):
+object PayoutDispatcher:
+  // Reclaim window for stranded 'inflight' rows. Used both by the periodic tick and the startup
+  // sweep, so a freshly-claimed live transfer (age < this) is never reclaimed by a restart/overlap.
+  val DefaultReclaimAfterSeconds = 120
+
+final class PayoutDispatcher(gateway: PayoutGateway, onPermanentFailure: Long => Unit = _ => (), batchSize: Int = 20, maxAttempts: Int = 6, reclaimAfterSeconds: Int = PayoutDispatcher.DefaultReclaimAfterSeconds):
 
   /** One pass over the pending outbox. Returns how many rows it successfully dispatched.
     * Idempotent and safe to call repeatedly; tests call this directly instead of run(). */

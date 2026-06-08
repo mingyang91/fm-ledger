@@ -41,7 +41,10 @@ object LedgerServer:
       case Some(key) =>
         val base = sys.env.getOrElse("STRIPE_API_BASE_URL", "https://api.stripe.com")
         val ver  = sys.env.getOrElse("STRIPE_API_VERSION", "2024-06-20")
-        Db.reclaimStaleInflight(0) // startup reaper: rows left 'inflight' by a prior crashed process are orphans
+        // Startup reaper uses the SAME timeout as the periodic one (not 0): a row a concurrent /
+        // just-superseded instance claimed moments ago is NOT yet stale, so we never reclaim a live
+        // transfer during a rolling deploy; genuine orphans are recovered once they age past the window.
+        Db.reclaimStaleInflight(PayoutDispatcher.DefaultReclaimAfterSeconds)
         PayoutDispatcher(StripeGateway(key, base, ver), onPermanentFailure = api.failWithdrawalForFailedDispatch).run()
         println(s"Payout dispatcher started (Stripe at $base)")
       case None =>
