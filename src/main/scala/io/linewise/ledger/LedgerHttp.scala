@@ -2,8 +2,6 @@ package io.linewise.ledger
 
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
 
 import sttp.model.StatusCode
 import sttp.monad.{IdentityMonad, MonadError}
@@ -79,7 +77,9 @@ final case class ObligationCancelBody(sourceKind: String, sourceId: String)
 final case class ObligationResponse(
     sourceKind: String, sourceId: String, userUid: String, estimatedPoints: Long, status: String, realizedTxId: Option[Long])
 final case class UpcomingExpenseResponse(openCount: Long, projectedPoints: Long)
-final case class StripeWebhookBody(withdrawalId: Long, outcome: String, eventId: String, providerTransferRef: Option[String], providerFeeDebited: Long, signature: String) // outcome: settled | failed
+// Webhook acknowledgement: Stripe only needs a 2xx, so we report what we did rather than echo a
+// withdrawal. handled=false means a signed-but-unrelated event type we acknowledge and ignore.
+final case class WebhookAck(eventId: String, handled: Boolean, withdrawalId: Option[Long], status: Option[String])
 final case class InvariantCheckDto(name: String, passed: Boolean, detail: Option[String])
 final case class InvariantRunResponse(runId: String, allPassed: Boolean, checks: List[InvariantCheckDto])
 final case class RiskEventResponse(id: Long, kind: String, subject: String, detail: String)
@@ -108,7 +108,7 @@ object LedgerJson:
   given Pickler[ObligationCancelBody]   = Pickler.derived
   given Pickler[ObligationResponse]     = Pickler.derived
   given Pickler[UpcomingExpenseResponse] = Pickler.derived
-  given Pickler[StripeWebhookBody]      = Pickler.derived
+  given Pickler[WebhookAck]             = Pickler.derived
   given Pickler[InvariantCheckDto]      = Pickler.derived
   given Pickler[InvariantRunResponse]   = Pickler.derived
   given Pickler[RiskEventResponse]      = Pickler.derived
@@ -162,7 +162,9 @@ object LedgerEndpoints:
 
   // per-user transactions, Stripe payout webhook, risk/config/audit, and invariant runs
   val userTransactions = endpoint.securityIn(bearer).get.in("ledger" / "users" / path[String]("uid") / "transactions").out(jsonBody[List[TxResponse]]).errorOut(errOut)
-  val stripeWebhook    = endpoint.securityIn(bearer).post.in("stripe" / "webhook").in(jsonBody[StripeWebhookBody]).out(jsonBody[WithdrawalResponse]).errorOut(errOut)
+  // Public (no bearer): the Stripe-Signature header IS the auth. Raw stringBody is required so the
+  // HMAC is computed over the exact bytes Stripe sent (a JSON re-serialize would break the signature).
+  val stripeWebhook    = endpoint.post.in("stripe" / "webhook").in(header[String]("Stripe-Signature")).in(stringBody).out(jsonBody[WebhookAck]).errorOut(errOut)
   val riskEvents       = endpoint.securityIn(bearer).get.in("risk" / "events").out(jsonBody[List[RiskEventResponse]]).errorOut(errOut)
   val auditLog         = endpoint.securityIn(bearer).get.in("audit-log").out(jsonBody[List[AuditLogResponse]]).errorOut(errOut)
   val configCurrent    = endpoint.securityIn(bearer).get.in("system" / "config").out(jsonBody[List[ConfigEntryResponse]]).errorOut(errOut)
@@ -225,6 +227,9 @@ class LedgerApi:
   private def parseWStatus(s: String): Option[WithdrawalStatus] = WithdrawalStatus.values.find(_.toString == s)
   private def parsePStatus(s: String): Option[ProposalStatus] = ProposalStatus.values.find(_.toString == s)
   private val statusConflict: Err = (StatusCode.Conflict, "status_conflict")
+  // Providers we can actually dispatch to (the gateway speaks Stripe). Keep the set here so adding
+  // a rail is a one-line change plus a gateway impl, not a scattered string literal.
+  private val supportedProviders = Set("stripe")
 
   private def proposalResponse(p: Proposal): ProposalResponse =
     ProposalResponse(p.id, p.kind.toString, p.userUid, p.debitAccount, p.creditAccount, p.amount, p.reason, p.proposedBy, p.status.toString, p.resultTxId)
@@ -380,6 +385,95 @@ class LedgerApi:
       Db.payoutReconciliationPut(result)
       Db.audit("withdrawal.recipient_pays_fee", actor, withdrawal.id.toString, result.result)
       wd
+
+  // --- Stripe webhook: real signature + event parsing. The accounting it funnels into
+  //     (settleRecipientPaysFee / wservice.fail) is the proven path, reused unchanged. ---
+  private def jstr(v: ujson.Value, k: String): Option[String] = scala.util.Try(v.obj.get(k).flatMap(_.strOpt)).toOption.flatten
+  private def jlong(v: ujson.Value, k: String): Option[Long] = scala.util.Try(v.obj.get(k).flatMap(_.numOpt).map(_.toLong)).toOption.flatten
+  private def jchild(v: ujson.Value, k: String): Option[ujson.Value] = scala.util.Try(v.obj.get(k)).toOption.flatten
+
+  private def outcomeOf(eventType: String): Option[String] = eventType match
+    case "transfer.paid" | "payout.paid"                           => Some("settled")
+    case "transfer.failed" | "payout.failed" | "transfer.reversed" => Some("failed")
+    case _                                                         => None
+
+  // Observed provider fee: try the object's own fee, then a (possibly expanded) balance_transaction
+  // fee; absent either, fall back to the quoted fee so the settlement reconciles as "matched". The
+  // exact field is rail-dependent (see the integration plan) — this is the one swappable seam.
+  private def feeFromObject(obj: ujson.Value, quotedFallback: Long): Long =
+    jlong(obj, "fee")
+      .orElse(jchild(obj, "balance_transaction").flatMap(bt => jlong(bt, "fee")))
+      .getOrElse(quotedFallback)
+
+  private def resolveWithdrawalId(obj: ujson.Value, transferRef: Option[String]): Option[Long] =
+    jchild(obj, "metadata").flatMap(m => jstr(m, "withdrawal_id")).flatMap(s => scala.util.Try(s.toLong).toOption)
+      .orElse(transferRef.flatMap(Db.withdrawalIdByProviderTransferRef))
+
+  private def handleStripeWebhook(sigHeader: String, rawBody: String): Either[Err, WebhookAck] =
+    val now = System.currentTimeMillis() / 1000L
+    StripeSignature.verify(rawBody, sigHeader, Db.stripeWebhookSecret, now) match
+      case Left(_) => Left((StatusCode.Unauthorized, "bad_signature"))
+      case Right(_) =>
+        scala.util.Try(ujson.read(rawBody)).toOption match
+          case None => Left((StatusCode.BadRequest, "bad_payload"))
+          case Some(json) =>
+            val eventId = jstr(json, "id").getOrElse("")
+            val eventType = jstr(json, "type").getOrElse("")
+            val dataObj = jchild(json, "data").flatMap(d => jchild(d, "object"))
+            (eventId, dataObj) match
+              case (e, _) if e.isEmpty => Left((StatusCode.BadRequest, "bad_payload"))
+              case (_, None)           => Left((StatusCode.BadRequest, "bad_payload"))
+              case (_, Some(obj)) =>
+                outcomeOf(eventType) match
+                  case None => Right(WebhookAck(eventId, handled = false, None, None)) // ack signed-but-unrelated events
+                  case Some(outcome) =>
+                    val transferRef = jstr(obj, "id")
+                    resolveWithdrawalId(obj, transferRef) match
+                      case None => Left((StatusCode.NotFound, "withdrawal not resolvable"))
+                      case Some(withdrawalId) =>
+                        Db.withdrawalById(withdrawalId) match
+                          case None => Left((StatusCode.NotFound, "withdrawal not found"))
+                          case Some(withdrawal) =>
+                            val intentOpt = Db.payoutIntentByWithdrawal(withdrawalId)
+                            val observedFee = feeFromObject(obj, intentOpt.map(_.quotedProviderFee).getOrElse(0L))
+                            processWebhook(withdrawal, intentOpt, eventId, outcome, observedFee, transferRef)
+
+  private def processWebhook(withdrawal: Withdrawal, intentOpt: Option[PayoutIntentRecord], eventId: String, outcome: String, observedFee: Long, transferRef: Option[String]): Either[Err, WebhookAck] =
+    try
+      val statusStr = Db.transaction {
+        try Db.insertProviderEvent("stripe", eventId, withdrawal.id, transferRef, outcome, Some(observedFee), s"eventId=$eventId;outcome=$outcome;fee=$observedFee")
+        catch case e: com.augustnagro.magnum.SqlException if isUniqueViolation(e) => throw DuplicateEvent()
+        val res: Either[Err, WithdrawalResponse] =
+          if outcome == "settled" then
+            intentOpt match
+              case Some(intent) => settleRecipientPaysFee(withdrawal, intent, eventId, observedFee, transferRef, "stripe")
+              case None =>
+                Db.asActor("stripe") {
+                  Db.withTxMeta(TxWriteMeta(withdrawalId = Some(withdrawal.id), rawInput = Some(s"stripeEvent=$eventId"))) {
+                    wservice.settle(world, withdrawal.id, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, Accounts.Cash)._2
+                  }
+                } match
+                  case Right(w) => Db.audit("withdrawal.webhook", "stripe", withdrawal.id.toString, eventId); Right(withdrawalResponse(w))
+                  case Left(e)  => Left(wErr(e))
+          else
+            Db.asActor("stripe") {
+              Db.withTxMeta(TxWriteMeta(withdrawalId = Some(withdrawal.id), rawInput = Some(s"stripeEvent=$eventId"))) {
+                wservice.fail(world, withdrawal.id, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, userAcctOf(withdrawal.id))._2
+              }
+            } match
+              case Right(w) => Db.audit("withdrawal.webhook", "stripe", withdrawal.id.toString, eventId); Right(withdrawalResponse(w))
+              case Left(e)  => Left(wErr(e))
+        res match
+          case Right(w) => w.status
+          case Left(e)  => throw WebhookAbort(e)
+      }
+      Right(WebhookAck(eventId, handled = true, Some(withdrawal.id), Some(statusStr)))
+    catch
+      case WebhookAbort(err) => Left(err)
+      case _: DuplicateEvent =>
+        Db.withdrawalById(withdrawal.id) match
+          case Some(w) => Right(WebhookAck(eventId, handled = true, Some(w.id), Some(w.status.toString)))
+          case None    => Left((StatusCode.NotFound, "withdrawal not found"))
 
   def serverEndpoints: List[SE] = List(
     incentiveCredit.handleSecurity(resolveAdmin).handle(admin => (req: CreditRequest) =>
@@ -574,7 +668,7 @@ class LedgerApi:
     submitWithdrawal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, PayoutSubmitRequest)) =>
       parseWStatus(in._2.expectedStatus) match
         case None => Left(statusConflict)
-        case Some(es) if in._2.provider != "stripe" => Left((StatusCode.BadRequest, "unsupported_provider"))
+        case Some(es) if !supportedProviders.contains(in._2.provider) => Left((StatusCode.BadRequest, "unsupported_provider"))
         case Some(es) =>
           Db.payoutIntentByWithdrawal(in._1) match
             case Some(_) =>
@@ -590,6 +684,9 @@ class LedgerApi:
                   Db.transaction {
                     val intent = PayoutIntentRecord(Db.nextId(), wd.id, wd.userUid, in._2.provider, in._2.routeCode, in._2.destinationId, wd.amount, in._2.quotedProviderFee, in._2.expectedRecipientNet, in._2.quoteRef, in._2.providerTransferRef)
                     Db.payoutIntentPut(intent)
+                    // Outbox: the dispatcher transfers the recipient's NET to the provider account.
+                    val amountMinor = intent.expectedRecipientNet / Db.payoutPointsPerMinorUnit
+                    Db.payoutDispatchPut(PayoutDispatchRecord(intent.id, wd.id, intent.provider, intent.destinationId, amountMinor, Db.payoutCurrency, s"wd-${wd.id}-intent-${intent.id}", "pending", 0, None, None))
                     Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
                       case Right(w2) =>
                         Db.audit("withdrawal.submit", admin, in._1.toString, s"${in._2.provider}:${in._2.routeCode}:${in._2.quotedProviderFee}")
@@ -646,52 +743,7 @@ class LedgerApi:
       val acct = Accounts.user(uid)
       Right(service.all(world).filter(t => t.entries.exists(_.account == acct)).map(txResponse))),
 
-    stripeWebhook.handleSecurity(resolveAdmin).handle(_ => (b: StripeWebhookBody) =>
-      val expected = Db.webhookSignature("stripe", b.eventId, b.withdrawalId, b.outcome, b.providerFeeDebited)
-      if !MessageDigest.isEqual(b.signature.getBytes(UTF_8), expected.getBytes(UTF_8)) then
-        Left((StatusCode.Unauthorized, "bad_signature"))
-      else if b.outcome != "settled" && b.outcome != "failed" then
-        Left((StatusCode.BadRequest, "bad_outcome"))
-      else if b.providerFeeDebited < 0 then
-        Left((StatusCode.BadRequest, "bad_fee"))
-      else Db.withdrawalById(b.withdrawalId) match
-        case None => Left((StatusCode.NotFound, "withdrawal not found"))
-        case Some(withdrawal) =>
-          try
-            val wd = Db.transaction {
-              try Db.insertProviderEvent("stripe", b.eventId, b.withdrawalId, b.providerTransferRef, b.outcome, Some(b.providerFeeDebited), s"eventId=${b.eventId};fee=${b.providerFeeDebited}")
-              catch case e: com.augustnagro.magnum.SqlException if isUniqueViolation(e) => throw DuplicateEvent()
-              val res =
-                if b.outcome == "settled" then
-                  Db.payoutIntentByWithdrawal(b.withdrawalId) match
-                    case Some(intent) => settleRecipientPaysFee(withdrawal, intent, b.eventId, b.providerFeeDebited, b.providerTransferRef, "stripe")
-                    case None =>
-                      Db.asActor("stripe") {
-                        Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
-                          wservice.settle(world, b.withdrawalId, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, Accounts.Cash)._2
-                        }
-                      } match
-                        case Right(w) => Db.audit("withdrawal.webhook", "stripe", b.withdrawalId.toString, b.eventId); Right(withdrawalResponse(w))
-                        case Left(e)  => Left(wErr(e))
-                else
-                  Db.asActor("stripe") {
-                    Db.withTxMeta(TxWriteMeta(withdrawalId = Some(b.withdrawalId), rawInput = Some(s"stripeEvent=${b.eventId}"))) {
-                      wservice.fail(world, b.withdrawalId, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, userAcctOf(b.withdrawalId))._2
-                    }
-                  } match
-                    case Right(w) => Db.audit("withdrawal.webhook", "stripe", b.withdrawalId.toString, b.eventId); Right(withdrawalResponse(w))
-                    case Left(e)  => Left(wErr(e))
-              res match
-                case Right(w) => w
-                case Left(e)  => throw WebhookAbort(e)
-            }
-            Right(wd)
-          catch
-            case WebhookAbort(err) => Left(err)
-            case _: DuplicateEvent =>
-              Db.withdrawalById(b.withdrawalId) match
-                case Some(w) => Right(withdrawalResponse(w))
-                case None    => Left((StatusCode.NotFound, "withdrawal not found"))),
+    stripeWebhook.handle((in: (String, String)) => handleStripeWebhook(in._1, in._2)),
 
     riskEvents.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
       Right(Db.riskEvents.map(riskResponse))),

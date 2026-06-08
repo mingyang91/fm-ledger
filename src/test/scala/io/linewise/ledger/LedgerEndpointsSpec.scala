@@ -13,6 +13,10 @@ import io.linewise.ledger.LedgerEndpoints as E
  * ========================================================================== */
 class LedgerEndpointsSpec extends LedgerHttpSuite:
 
+  // Webhook signing secret for tests; set into config after freshApi so Db.stripeWebhookSecret reads it.
+  private val whsec = "whsec_test_secret"
+  private def withWebhookSecret(): Unit = Db.setSystemConfig("stripe_webhook_secret", whsec, "test", "test")
+
   test("incentive credit mints (DR expense / CR user), is idempotent, and the balance reflects it") {
     val api = freshApi(); val be = stubOf(api); val tok = api.adminToken("svc")
     val r1 = secure(E.incentiveCredit, be, tok, CreditRequest("u1", 1500, "annotation_job", "job-1"))
@@ -137,40 +141,152 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(1, "after-risk")).code, StatusCode.ServiceUnavailable)
   }
 
-  test("recipient-pays submit captures payout intent, webhook reconciles fee, and provider settlement stays auditable") {
+  test("recipient-pays submit captures intent + queues dispatch; a real-signed transfer.paid reconciles matched and is auditable") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    withWebhookSecret()
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "stripe-fund"))
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "stripe-cr")).body.toOption.get
     val submit = secure(E.submitWithdrawal, be, svc,
-      (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, Some("quote-1"), Some("tr-1"))))
+      (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, Some("quote-1"), None)))
     assertEquals(submit.body.toOption.get.status, "Submitted")
+    // submit also queues an outbox dispatch row
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("pending"))
     val intent = secure(E.getPayoutIntent, be, svc, w.id).body.toOption.get
     assertEquals(intent.quotedProviderFee, 20L)
     assertEquals(intent.expectedRecipientNet, 280L)
-    val sig = Db.webhookSignature("stripe", "evt-1", w.id, "settled", 20)
-    val settled = secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-1", Some("tr-1"), 20, sig))
-    assertEquals(settled.body.toOption.get.status, "Settled")
+    // a genuine Stripe-signed transfer.paid event, observed fee == quoted -> matched
+    val (sig, body) = StripeEvents.signed(whsec, StripeEvents.event("evt_1", "transfer.paid", "tr_1", w.id, 20))
+    val ack = public(E.stripeWebhook, be, (sig, body)).body.toOption.get
+    assertEquals(ack.handled, true)
+    assertEquals(ack.status, Some("Settled"))
     assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 300L)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.FeeRecovery).body.toOption.get.balancePoints, 20L)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.ProviderPayoutFee).body.toOption.get.balancePoints, 20L)
+    val s = secure(E.summary, be, svc, ()).body.toOption.get
+    assertEquals(s.feeRecoveryPoints, 20L)
+    assertEquals(s.providerPayoutFeePoints, 20L)
+    assert(s.fundsInvariantHolds, s.toString)
     val rec = secure(E.getPayoutReconciliation, be, svc, w.id).body.toOption.get
     assertEquals(rec.result, "matched")
     assertEquals(rec.observedFee, Some(20L))
     assertEquals(secure(E.listProviderEvents, be, svc, w.id).body.toOption.get.size, 1)
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-1", Some("tr-1"), 20, sig)).code, StatusCode.Ok)
+    // idempotent replay of the same event id (fresh signature) is a no-op 200
+    assertEquals(public(E.stripeWebhook, be, StripeEvents.signed(whsec, StripeEvents.event("evt_1", "transfer.paid", "tr_1", w.id, 20))).code, StatusCode.Ok)
     assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 300L)
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-2", None, 20, "bad")).code, StatusCode.Unauthorized)
+    // a tampered/forged signature is rejected (401)
+    assertEquals(public(E.stripeWebhook, be, ("t=1,v1=deadbeef", body)).code, StatusCode.Unauthorized)
   }
 
-  test("F2: a settled webhook before approval is rejected but NOT consumed; the same event id settles after approval") {
+  test("recipient-pays fee_variance: observed fee != quoted records fee_variance, posts the observed expense, funds invariant still holds") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    withWebhookSecret()
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "var-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "var-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    // Stripe debited 25, not the quoted 20 -> fee_variance; FeeRecovery uses the quote, ProviderPayoutFee the observed
+    val (sig, body) = StripeEvents.signed(whsec, StripeEvents.event("evt_var", "transfer.paid", "tr_var", w.id, 25))
+    assertEquals(public(E.stripeWebhook, be, (sig, body)).body.toOption.get.status, Some("Settled"))
+    val rec = secure(E.getPayoutReconciliation, be, svc, w.id).body.toOption.get
+    assertEquals(rec.result, "fee_variance")
+    assertEquals(rec.observedFee, Some(25L))
+    assert(rec.note.exists(_.contains("observed=25")), rec.note.toString)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.FeeRecovery).body.toOption.get.balancePoints, 20L)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.ProviderPayoutFee).body.toOption.get.balancePoints, 25L)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 305L)
+    assert(secure(E.summary, be, svc, ()).body.toOption.get.fundsInvariantHolds)
+  }
+
+  test("recipient-pays zero-fee fast path: no fee-recovery / provider-fee txs posted, reconciles matched") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    withWebhookSecret()
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "zero-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "zero-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 0, 300, None, None)))
+    val (sig, body) = StripeEvents.signed(whsec, StripeEvents.event("evt_zero", "transfer.paid", "tr_zero", w.id, 0))
+    assertEquals(public(E.stripeWebhook, be, (sig, body)).body.toOption.get.status, Some("Settled"))
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.FeeRecovery).body.toOption.get.balancePoints, 0L)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.ProviderPayoutFee).body.toOption.get.balancePoints, 0L)
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 300L)
+    assertEquals(secure(E.getPayoutReconciliation, be, svc, w.id).body.toOption.get.result, "matched")
+  }
+
+  test("submit quote validation: unsupported_provider, bad_quote, quote_mismatch all 400 with their reason") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "qv-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "qv-cr")).body.toOption.get
+    val unsup = secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "paypal", "r", "d", 20, 280, None, None)))
+    assertEquals(unsup.code, StatusCode.BadRequest); assertEquals(unsup.body.swap.toOption.get._2, "unsupported_provider")
+    val bad = secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "r", "d", 20, 0, None, None)))
+    assertEquals(bad.code, StatusCode.BadRequest); assertEquals(bad.body.swap.toOption.get._2, "bad_quote")
+    val mis = secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "r", "d", 20, 290, None, None)))
+    assertEquals(mis.code, StatusCode.BadRequest); assertEquals(mis.body.swap.toOption.get._2, "quote_mismatch")
+  }
+
+  test("payout dispatcher: a pending outbox row becomes a transfer with the NET amount + routing metadata, then dispatched") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "disp-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "disp-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    val fake = FakeGateway()
+    assertEquals(PayoutDispatcher(fake).tick(), 1)
+    val d = Db.dispatchByWithdrawal(w.id).get
+    assertEquals(d.status, "dispatched")
+    assert(d.providerTransferRef.exists(_.startsWith("tr_")), d.toString)
+    assertEquals(fake.calls.head.amountMinor, 280L)            // the recipient NET, not the gross
+    assertEquals(fake.calls.head.destination, "acct-1")
+    assertEquals(fake.calls.head.metadata.get("withdrawal_id"), Some(w.id.toString))
+    assertEquals(PayoutDispatcher(fake).tick(), 0)             // already dispatched -> no-op
+  }
+
+  test("payout dispatcher: a permanent gateway error marks the row failed and raises a risk event") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "df-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "df-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    PayoutDispatcher(FailingGateway(retryable = false)).tick()
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("failed"))
+    assert(secure(E.riskEvents, be, svc, ()).body.toOption.get.exists(_.kind == "payout_dispatch_failed"))
+  }
+
+  test("payout dispatcher: a transient gateway error leaves the row pending for retry") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "dt-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "dt-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    PayoutDispatcher(FailingGateway(retryable = true)).tick()
+    val d = Db.dispatchByWithdrawal(w.id).get
+    assertEquals(d.status, "pending")
+    assertEquals(d.attempts, 1)
+  }
+
+  test("stripe-mock: StripeGateway posts a well-formed /v1/transfers and parses the tr_ id") {
+    val container =
+      try
+        val c = StripeMockContainer().withExposedPorts(12111)
+        c.start(); Some(c)
+      catch case _: Throwable => None
+    assume(container.isDefined, "stripe-mock image unavailable")
+    val c = container.get
+    try
+      val base = s"http://${c.getHost}:${c.getMappedPort(12111)}"
+      val res = StripeGateway("sk_test_123", base, "2024-06-20")
+        .createTransfer(TransferRequest(280, "usd", "acct_123", "idem-mock-1", Map("withdrawal_id" -> "7"), Some("grp-7")))
+      assert(res.isRight, res.toString)
+      assert(res.toOption.get.providerTransferRef.startsWith("tr_"), res.toString)
+    finally c.stop()
+  }
+
+  test("F2: a settled webhook before submit is rejected but NOT consumed; the same event id settles after submit") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    withWebhookSecret()
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "f2-fund"))
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "f2-cr")).body.toOption.get
-    val sig = Db.webhookSignature("stripe", "evt-f2", w.id, "settled", 20)
-    // the provider reports "settled" while the withdrawal is still PendingReview: the
-    // transition fails (409) and, crucially, the event id is rolled back — not consumed.
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-f2", None, 20, sig)).code, StatusCode.Conflict)
+    // settled arrives while still PendingReview (no intent yet): the transition fails (409) and the
+    // event id is rolled back — not consumed — so the same event settles cleanly after submit.
+    assertEquals(public(E.stripeWebhook, be, StripeEvents.signed(whsec, StripeEvents.event("evt_f2", "transfer.paid", "tr_f2", w.id, 20))).code, StatusCode.Conflict)
     assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 0L)
-    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, Some("quote-f2"), Some("tr-f2"))))
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "settled", "evt-f2", Some("tr-f2"), 20, sig)).body.toOption.get.status, "Settled")
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, Some("quote-f2"), None)))
+    assertEquals(public(E.stripeWebhook, be, StripeEvents.signed(whsec, StripeEvents.event("evt_f2", "transfer.paid", "tr_f2", w.id, 20))).body.toOption.get.status, Some("Settled"))
     assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, 300L)
   }
 
@@ -225,11 +341,11 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
 
   test("webhook failed outcome returns the reserve to the user (the refund leg), cash untouched") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    withWebhookSecret()
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "wf-fund"))
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(400, "wf-1")).body.toOption.get
     secure(E.approveWithdrawal, be, svc, (w.id, DecisionRequest("PendingReview")))
-    val sig = Db.webhookSignature("stripe", "evt-fail", w.id, "failed", 0)
-    assertEquals(secure(E.stripeWebhook, be, svc, StripeWebhookBody(w.id, "failed", "evt-fail", None, 0, sig)).body.toOption.get.status, "Failed")
+    assertEquals(public(E.stripeWebhook, be, StripeEvents.signed(whsec, StripeEvents.event("evt_fail", "transfer.failed", "tr_fail", w.id, 0))).body.toOption.get.status, Some("Failed"))
     assertEquals(secure(E.accountBalance, be, svc, "system:withdrawal_clearing").body.toOption.get.balancePoints, 0L)
     assertEquals(secure(E.accountBalance, be, svc, "system:cash").body.toOption.get.balancePoints, 0L)
     assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 1000L)

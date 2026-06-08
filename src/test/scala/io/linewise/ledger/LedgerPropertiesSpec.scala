@@ -81,14 +81,14 @@ class LedgerPropertiesSpec extends LedgerHttpSuite with LedgerGen with LedgerDif
     forAll { (uid: UserUid, funded: FundedWithdrawal, source: SourceKey, clientReq: ClientRequestId, trace: IncentiveTraceId) =>
       val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val user = api.userToken(uid.value)
       secure(E.incentiveCredit, be, svc, CreditRequest(uid.value, funded.funded, source.kind, source.id, Some(trace.value), Some("incentives")))
+      Db.setSystemConfig("stripe_webhook_secret", "whsec_prop", "test", "test")
       val wd = secure(E.requestWithdrawal, be, user, WithdrawalRequestBody(funded.withdrawn, clientReq.value)).body.toOption.get
       val fee = math.min(20L, funded.withdrawn - 1L)
-      secure(E.submitWithdrawal, be, svc, (wd.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-prop", fee, funded.withdrawn - fee, Some(s"q-${trace.value}"), Some(s"tr-${trace.value}"))))
-      val eventId = s"evt-${trace.value}"
-      val sig = Db.webhookSignature("stripe", eventId, wd.id, "settled", fee)
-      val first = secure(E.stripeWebhook, be, svc, StripeWebhookBody(wd.id, "settled", eventId, Some(s"tr-${trace.value}"), fee, sig))
+      secure(E.submitWithdrawal, be, svc, (wd.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-prop", fee, funded.withdrawn - fee, Some(s"q-${trace.value}"), None)))
+      val event = StripeEvents.event(s"evt-${trace.value}", "transfer.paid", s"tr-${trace.value}", wd.id, fee)
+      val first = public(E.stripeWebhook, be, StripeEvents.signed("whsec_prop", event))
       assertEquals(first.code, StatusCode.Ok)
-      val second = secure(E.stripeWebhook, be, svc, StripeWebhookBody(wd.id, "settled", eventId, Some(s"tr-${trace.value}"), fee, sig))
+      val second = public(E.stripeWebhook, be, StripeEvents.signed("whsec_prop", event))
       assertEquals(second.code, StatusCode.Ok)
       assertEquals(secure(E.accountBalance, be, svc, Accounts.providerBalance("stripe")).body.toOption.get.balancePoints, funded.withdrawn)
       val rec = secure(E.getPayoutReconciliation, be, svc, wd.id).body.toOption.get

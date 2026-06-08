@@ -82,6 +82,10 @@ abstract class LedgerHttpSuite extends munit.ScalaCheckSuite:
   protected def secure[A, I, EE, O](ep: Endpoint[A, I, EE, O, Any], be: SyncBackend, token: A, in: I): Response[Either[EE, O]] =
     client.toSecureRequestThrowDecodeFailures(ep, Some(baseUri))(token)(in).send(be)
 
+  // Public (no-bearer) endpoint call — the Stripe webhook authenticates via signature, not a token.
+  protected def public[I, EE, O](ep: Endpoint[Unit, I, EE, O, Any], be: SyncBackend, in: I): Response[Either[EE, O]] =
+    client.toRequestThrowDecodeFailures(ep, Some(baseUri))(in).send(be)
+
 object LedgerHttpSuite:
   // Shared across all ledger suites so the global `Db` singleton is touched by one test at a time.
   private val dbLock = ReentrantLock()

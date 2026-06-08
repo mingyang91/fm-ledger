@@ -2,8 +2,6 @@ package io.linewise.ledger
 
 import javax.sql.DataSource
 import java.sql.{Connection, SQLException}
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
 import com.augustnagro.magnum.*
 
@@ -58,6 +56,7 @@ final case class AccountRecord(code: String, category: String, normalSide: Strin
 final case class PayoutIntentRecord(id: Long, withdrawalId: Long, userUid: String, provider: String, routeCode: String, destinationId: String, grossAmount: Long, quotedProviderFee: Long, expectedRecipientNet: Long, quoteRef: Option[String], providerTransferRef: Option[String]) derives DbCodec
 final case class ProviderEventRecord(eventId: String, provider: String, providerTransferRef: Option[String], outcome: String, providerFeeDebited: Option[Long]) derives DbCodec
 final case class PayoutReconciliationRecord(payoutIntentId: Long, providerEventId: Option[String], expectedFee: Long, observedFee: Option[Long], result: String, note: Option[String]) derives DbCodec
+final case class PayoutDispatchRecord(payoutIntentId: Long, withdrawalId: Long, provider: String, destinationId: String, amountMinor: Long, currency: String, idempotencyKey: String, status: String, attempts: Int, lastError: Option[String], providerTransferRef: Option[String]) derives DbCodec
 
 final class LedgerStore(ds: DataSource):
 
@@ -282,6 +281,45 @@ final class LedgerStore(ds: DataSource):
          WHERE WITHDRAWAL_ID = $withdrawalId
          ORDER BY ID"""
       .query[ProviderEventRecord].run()(using dbc).toList
+  }
+
+  // --- payout dispatch outbox (recipient-pays-fee: created at submit, drained by PayoutDispatcher) ---
+  def payoutDispatchPut(d: PayoutDispatchRecord): Unit = transaction {
+    sql"""INSERT INTO PAYOUT_DISPATCH
+          (PAYOUT_INTENT_ID, WITHDRAWAL_ID, PROVIDER, DESTINATION_ID, AMOUNT_MINOR, CURRENCY, IDEMPOTENCY_KEY, STATUS, ATTEMPTS, LAST_ERROR, PROVIDER_TRANSFER_REF)
+          VALUES (${d.payoutIntentId}, ${d.withdrawalId}, ${d.provider}, ${d.destinationId}, ${d.amountMinor}, ${d.currency}, ${d.idempotencyKey}, ${d.status}, ${d.attempts}, ${d.lastError}, ${d.providerTransferRef})"""
+      .update.run()(using dbc)
+  }
+
+  def pendingDispatches(limit: Int): List[PayoutDispatchRecord] = readOnly {
+    sql"""SELECT PAYOUT_INTENT_ID, WITHDRAWAL_ID, PROVIDER, DESTINATION_ID, AMOUNT_MINOR, CURRENCY, IDEMPOTENCY_KEY, STATUS, ATTEMPTS, LAST_ERROR, PROVIDER_TRANSFER_REF
+          FROM PAYOUT_DISPATCH WHERE STATUS = 'pending' ORDER BY CREATED_AT, PAYOUT_INTENT_ID LIMIT $limit"""
+      .query[PayoutDispatchRecord].run()(using dbc).toList
+  }
+
+  def dispatchByWithdrawal(withdrawalId: Long): Option[PayoutDispatchRecord] = readOnly {
+    sql"""SELECT PAYOUT_INTENT_ID, WITHDRAWAL_ID, PROVIDER, DESTINATION_ID, AMOUNT_MINOR, CURRENCY, IDEMPOTENCY_KEY, STATUS, ATTEMPTS, LAST_ERROR, PROVIDER_TRANSFER_REF
+          FROM PAYOUT_DISPATCH WHERE WITHDRAWAL_ID = $withdrawalId"""
+      .query[PayoutDispatchRecord].run()(using dbc).headOption
+  }
+
+  /** Mark dispatched and record the transfer ref (also onto PAYOUT_INTENT, so the inbound webhook
+    * can resolve the withdrawal by transfer ref when event metadata is absent). Guarded by
+    * STATUS='pending' so a duplicate tick is a harmless no-op. */
+  def markDispatched(payoutIntentId: Long, providerTransferRef: String): Unit = transaction {
+    sql"""UPDATE PAYOUT_DISPATCH SET STATUS = 'dispatched', PROVIDER_TRANSFER_REF = $providerTransferRef, ATTEMPTS = ATTEMPTS + 1, UPDATED_AT = CURRENT_TIMESTAMP
+          WHERE PAYOUT_INTENT_ID = $payoutIntentId AND STATUS = 'pending'""".update.run()(using dbc)
+    sql"UPDATE PAYOUT_INTENT SET PROVIDER_TRANSFER_REF = $providerTransferRef WHERE ID = $payoutIntentId AND PROVIDER_TRANSFER_REF IS NULL".update.run()(using dbc)
+  }
+
+  def markDispatchFailed(payoutIntentId: Long, newStatus: String, error: String): Unit = transaction {
+    sql"""UPDATE PAYOUT_DISPATCH SET STATUS = $newStatus, ATTEMPTS = ATTEMPTS + 1, LAST_ERROR = $error, UPDATED_AT = CURRENT_TIMESTAMP
+          WHERE PAYOUT_INTENT_ID = $payoutIntentId AND STATUS = 'pending'""".update.run()(using dbc)
+  }
+
+  def withdrawalIdByProviderTransferRef(ref: String): Option[Long] = readOnly {
+    sql"SELECT WITHDRAWAL_ID FROM PAYOUT_INTENT WHERE PROVIDER_TRANSFER_REF = $ref".query[Long].run()(using dbc).headOption
+      .orElse(sql"SELECT WITHDRAWAL_ID FROM PAYOUT_DISPATCH WHERE PROVIDER_TRANSFER_REF = $ref".query[Long].run()(using dbc).headOption)
   }
 
   /** Lock a LEDGER_TX row (append-only, so FOR UPDATE is allowed) to serialize concurrent
@@ -511,12 +549,12 @@ final class LedgerStore(ds: DataSource):
   // signing self-consistent within the process without baking in a known constant.
   private val ephemeralWebhookSecret: String = java.util.UUID.randomUUID.toString + java.util.UUID.randomUUID.toString
 
-  def webhookSignature(provider: String, eventId: String, withdrawalId: Long, outcome: String, providerFeeDebited: Long): String = readOnly {
-    val secret = configString0("stripe_webhook_secret", ephemeralWebhookSecret)
-    val mac = Mac.getInstance("HmacSHA256")
-    mac.init(SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256"))
-    mac.doFinal(s"$provider:$eventId:$withdrawalId:$outcome:$providerFeeDebited".getBytes("UTF-8")).map(b => f"$b%02x").mkString
-  }
+  // The webhook signing secret + payout currency/conversion, read from approved system config
+  // (bootstrapped from STRIPE_WEBHOOK_SECRET / seed). Signature verification itself lives in the
+  // pure StripeSignature object; this only surfaces the secret and the points->minor-unit knobs.
+  def stripeWebhookSecret: String = readOnly { configString0("stripe_webhook_secret", ephemeralWebhookSecret) }
+  def payoutCurrency: String = readOnly { configString0("payout_currency", "usd") }
+  def payoutPointsPerMinorUnit: Long = readOnly { math.max(1L, configLong0("payout_points_per_minor_unit", 1L)) }
 
 object Db:
   @volatile private var store: LedgerStore = scala.compiletime.uninitialized
@@ -582,5 +620,12 @@ object Db:
   def checkWithdrawalRisk(userUid: String, amount: Long): Either[String, Boolean] = store.checkWithdrawalRisk(userUid, amount)
   def insertProviderEvent(provider: String, eventId: String, withdrawalId: Long, providerTransferRef: Option[String], outcome: String, providerFeeDebited: Option[Long], rawInput: String): Unit =
     store.insertProviderEvent(provider, eventId, withdrawalId, providerTransferRef, outcome, providerFeeDebited, rawInput)
-  def webhookSignature(provider: String, eventId: String, withdrawalId: Long, outcome: String, providerFeeDebited: Long): String =
-    store.webhookSignature(provider, eventId, withdrawalId, outcome, providerFeeDebited)
+  def payoutDispatchPut(d: PayoutDispatchRecord): Unit = store.payoutDispatchPut(d)
+  def pendingDispatches(limit: Int): List[PayoutDispatchRecord] = store.pendingDispatches(limit)
+  def dispatchByWithdrawal(withdrawalId: Long): Option[PayoutDispatchRecord] = store.dispatchByWithdrawal(withdrawalId)
+  def markDispatched(payoutIntentId: Long, providerTransferRef: String): Unit = store.markDispatched(payoutIntentId, providerTransferRef)
+  def markDispatchFailed(payoutIntentId: Long, newStatus: String, error: String): Unit = store.markDispatchFailed(payoutIntentId, newStatus, error)
+  def withdrawalIdByProviderTransferRef(ref: String): Option[Long] = store.withdrawalIdByProviderTransferRef(ref)
+  def stripeWebhookSecret: String = store.stripeWebhookSecret
+  def payoutCurrency: String = store.payoutCurrency
+  def payoutPointsPerMinorUnit: Long = store.payoutPointsPerMinorUnit
