@@ -213,7 +213,7 @@ object Jdbc:
          AMOUNT_MINOR BIGINT NOT NULL CHECK (AMOUNT_MINOR > 0),
          CURRENCY VARCHAR NOT NULL,
          IDEMPOTENCY_KEY VARCHAR NOT NULL UNIQUE,
-         STATUS VARCHAR NOT NULL CHECK (STATUS IN ('pending','dispatched','failed')),
+         STATUS VARCHAR NOT NULL CHECK (STATUS IN ('pending','inflight','dispatched','failed')),
          ATTEMPTS INT NOT NULL DEFAULT 0,
          LAST_ERROR TEXT,
          PROVIDER_TRANSFER_REF VARCHAR,

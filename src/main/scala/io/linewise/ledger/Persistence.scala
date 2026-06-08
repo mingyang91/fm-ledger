@@ -297,6 +297,25 @@ final class LedgerStore(ds: DataSource):
       .query[PayoutDispatchRecord].run()(using dbc).toList
   }
 
+  def claimPendingDispatches(limit: Int): List[PayoutDispatchRecord] = transaction {
+    sql"""WITH picked AS (
+            SELECT PAYOUT_INTENT_ID
+              FROM PAYOUT_DISPATCH
+             WHERE STATUS = 'pending'
+             ORDER BY CREATED_AT, PAYOUT_INTENT_ID
+             LIMIT $limit
+             FOR UPDATE SKIP LOCKED
+          )
+          UPDATE PAYOUT_DISPATCH D
+             SET STATUS = 'inflight',
+                 UPDATED_AT = CURRENT_TIMESTAMP
+            FROM picked
+           WHERE D.PAYOUT_INTENT_ID = picked.PAYOUT_INTENT_ID
+       RETURNING D.PAYOUT_INTENT_ID, D.WITHDRAWAL_ID, D.PROVIDER, D.DESTINATION_ID, D.AMOUNT_MINOR, D.CURRENCY,
+                 D.IDEMPOTENCY_KEY, D.STATUS, D.ATTEMPTS, D.LAST_ERROR, D.PROVIDER_TRANSFER_REF"""
+      .query[PayoutDispatchRecord].run()(using dbc).toList
+  }
+
   def dispatchByWithdrawal(withdrawalId: Long): Option[PayoutDispatchRecord] = readOnly {
     sql"""SELECT PAYOUT_INTENT_ID, WITHDRAWAL_ID, PROVIDER, DESTINATION_ID, AMOUNT_MINOR, CURRENCY, IDEMPOTENCY_KEY, STATUS, ATTEMPTS, LAST_ERROR, PROVIDER_TRANSFER_REF
           FROM PAYOUT_DISPATCH WHERE WITHDRAWAL_ID = $withdrawalId"""
@@ -305,16 +324,16 @@ final class LedgerStore(ds: DataSource):
 
   /** Mark dispatched and record the transfer ref (also onto PAYOUT_INTENT, so the inbound webhook
     * can resolve the withdrawal by transfer ref when event metadata is absent). Guarded by
-    * STATUS='pending' so a duplicate tick is a harmless no-op. */
+    * STATUS='inflight' so a duplicate completion is a harmless no-op. */
   def markDispatched(payoutIntentId: Long, providerTransferRef: String): Unit = transaction {
     sql"""UPDATE PAYOUT_DISPATCH SET STATUS = 'dispatched', PROVIDER_TRANSFER_REF = $providerTransferRef, ATTEMPTS = ATTEMPTS + 1, UPDATED_AT = CURRENT_TIMESTAMP
-          WHERE PAYOUT_INTENT_ID = $payoutIntentId AND STATUS = 'pending'""".update.run()(using dbc)
+          WHERE PAYOUT_INTENT_ID = $payoutIntentId AND STATUS = 'inflight'""".update.run()(using dbc)
     sql"UPDATE PAYOUT_INTENT SET PROVIDER_TRANSFER_REF = $providerTransferRef WHERE ID = $payoutIntentId AND PROVIDER_TRANSFER_REF IS NULL".update.run()(using dbc)
   }
 
   def markDispatchFailed(payoutIntentId: Long, newStatus: String, error: String): Unit = transaction {
     sql"""UPDATE PAYOUT_DISPATCH SET STATUS = $newStatus, ATTEMPTS = ATTEMPTS + 1, LAST_ERROR = $error, UPDATED_AT = CURRENT_TIMESTAMP
-          WHERE PAYOUT_INTENT_ID = $payoutIntentId AND STATUS = 'pending'""".update.run()(using dbc)
+          WHERE PAYOUT_INTENT_ID = $payoutIntentId AND STATUS = 'inflight'""".update.run()(using dbc)
   }
 
   def withdrawalIdByProviderTransferRef(ref: String): Option[Long] = readOnly {
@@ -622,6 +641,7 @@ object Db:
     store.insertProviderEvent(provider, eventId, withdrawalId, providerTransferRef, outcome, providerFeeDebited, rawInput)
   def payoutDispatchPut(d: PayoutDispatchRecord): Unit = store.payoutDispatchPut(d)
   def pendingDispatches(limit: Int): List[PayoutDispatchRecord] = store.pendingDispatches(limit)
+  def claimPendingDispatches(limit: Int): List[PayoutDispatchRecord] = store.claimPendingDispatches(limit)
   def dispatchByWithdrawal(withdrawalId: Long): Option[PayoutDispatchRecord] = store.dispatchByWithdrawal(withdrawalId)
   def markDispatched(payoutIntentId: Long, providerTransferRef: String): Unit = store.markDispatched(payoutIntentId, providerTransferRef)
   def markDispatchFailed(payoutIntentId: Long, newStatus: String, error: String): Unit = store.markDispatchFailed(payoutIntentId, newStatus, error)

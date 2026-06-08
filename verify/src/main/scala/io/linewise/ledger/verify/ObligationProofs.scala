@@ -97,4 +97,12 @@ object ObligationProofs {
     val (_, o) = ObligationService[World](HasObligations()).realize(w, sk, si, uid, role, projectRef, taskKind, estimatedUnit, txId)
     o.status == ObligationStatus.Realized && o.realizedTxId == Some[FMLong](txId)
   }.holds
+
+  def realizeCancelledStaysCancelled(o: Obligation, txId: FMLong): Boolean = {
+    require(o.status == ObligationStatus.Cancelled)
+    val o2 =
+      if o.status == ObligationStatus.Cancelled then o
+      else o.copy(status = ObligationStatus.Realized, realizedTxId = Some[FMLong](txId))
+    o2.status == ObligationStatus.Cancelled && o2.realizedTxId == o.realizedTxId
+  }.holds
 }

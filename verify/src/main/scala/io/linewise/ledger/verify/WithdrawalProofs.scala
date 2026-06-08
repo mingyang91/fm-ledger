@@ -1,6 +1,7 @@
 package io.linewise.verify.fm.ledger
 
 import stainless.lang._
+import stainless.collection._
 import io.linewise.verify.effect.FMLong
 import LedgerModel._
 
@@ -159,5 +160,34 @@ object WithdrawalProofs {
     require(!w.ledger.get(freshTxId).isEmpty)
     WithdrawalService[World](HasLedger(), HasWithdrawals()).settle(w, id, WithdrawalStatus.Submitted, freshTxId, clearingAccount, cashAccount)._2 ==
       Left[LedgerError, Withdrawal](DuplicateTxId)
+  }.holds
+
+  def settlementTxHasExactShape(
+      userUid: String, amount: FMLong, freshTxId: FMLong, clearingAccount: String, cashAccount: String): Boolean = {
+    require(amount > zero)
+    val tx = twoLegTx(freshTxId, TxKind.WithdrawalSettle, clearingAccount, cashAccount, amount, None[String](), None[String](), userUid)
+    tx.kind == TxKind.WithdrawalSettle &&
+      tx.entries == List(
+        LedgerEntry(clearingAccount, EntryDirection.DR, amount),
+        LedgerEntry(cashAccount, EntryDirection.CR, amount),
+      ) &&
+      LedgerValidation.admissible(tx)
+  }.holds
+
+  def returnTxHasExactShape(
+      userUid: String, amount: FMLong, freshTxId: FMLong, clearingAccount: String, userAccount: String): Boolean = {
+    require(amount > zero)
+    val tx = twoLegTx(freshTxId, TxKind.WithdrawalReturn, clearingAccount, userAccount, amount, None[String](), None[String](), userUid)
+    tx.kind == TxKind.WithdrawalReturn &&
+      tx.entries == List(
+        LedgerEntry(clearingAccount, EntryDirection.DR, amount),
+        LedgerEntry(userAccount, EntryDirection.CR, amount),
+      ) &&
+      LedgerValidation.admissible(tx)
+  }.holds
+
+  def transitionOnlyDoesNotChangeLedger(w: World, id: FMLong, expected: WithdrawalStatus, from: WithdrawalStatus, to: WithdrawalStatus): Boolean = {
+    val (w1, _) = WithdrawalService[World](HasLedger(), HasWithdrawals()).transitionOnly(w, id, expected, from, to)
+    w1.ledger == w.ledger
   }.holds
 }

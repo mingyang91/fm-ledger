@@ -45,6 +45,7 @@ case class ObligationService[W](oLens: Has[W, ObligationRepository]) {
       w: W, sourceKind: String, sourceId: String, userUid: String, role: String,
       projectRef: String, taskKind: String, estimatedUnit: FMLong, txId: FMLong): (W, Obligation) =
     val o2 = oLens.get(w).bySource(sourceKind, sourceId) match
+      case Some(o) if o.status == ObligationStatus.Cancelled => o
       case Some(o) => o.copy(status = ObligationStatus.Realized, realizedTxId = Some[FMLong](txId))
       case _       => Obligation(sourceKind, sourceId, userUid, role, projectRef, taskKind, estimatedUnit, ObligationStatus.Realized, Some[FMLong](txId))
     (oLens(w).write((r: ObligationRepository) => r.put(o2)), o2)

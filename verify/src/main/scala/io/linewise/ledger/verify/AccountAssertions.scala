@@ -58,4 +58,39 @@ object AccountAssertions {
 
   def entriesPostableForRecipientPaysFee(entries: List[LedgerEntry], providerBalance: String): Boolean =
     entries.forall((e: LedgerEntry) => entryPostableForRecipientPaysFee(e, providerBalance))
+
+  def legalAccountsFor(kind: TxKind, debitAccount: String, creditAccount: String, userAccount: String, providerBalance: String): Boolean =
+    kind match
+      case TxKind.IncentiveCredit =>
+        debitAccount == IncentiveExpense && creditAccount == userAccount && userAccountSpec(userAccount).postable
+      case TxKind.WithdrawalReserve =>
+        debitAccount == userAccount && creditAccount == WithdrawalClearing && userAccountSpec(userAccount).postable
+      case TxKind.WithdrawalSettle =>
+        debitAccount == WithdrawalClearing && (creditAccount == Cash || creditAccount == providerBalance) && providerBalanceSpec(providerBalance).postable
+      case TxKind.WithdrawalReturn =>
+        debitAccount == WithdrawalClearing && creditAccount == userAccount && userAccountSpec(userAccount).postable
+      case TxKind.WithdrawalFeeRecovery =>
+        debitAccount == WithdrawalClearing && creditAccount == FeeRecovery
+      case TxKind.ProviderPayoutFee =>
+        debitAccount == ProviderPayoutFee && creditAccount == providerBalance && providerBalanceSpec(providerBalance).postable
+      case TxKind.ManualAdjustment =>
+        debitAccount == Adjustment || creditAccount == Adjustment
+      case TxKind.RollbackReversal =>
+        true
+
+  def incentiveCreditUsesLegalAccounts(userAccount: String): Boolean = {
+    legalAccountsFor(TxKind.IncentiveCredit, IncentiveExpense, userAccount, userAccount, "") &&
+      postableSystemAccount(IncentiveExpense)
+  }.holds
+
+  def withdrawalReserveUsesLegalAccounts(userAccount: String): Boolean = {
+    legalAccountsFor(TxKind.WithdrawalReserve, userAccount, WithdrawalClearing, userAccount, "") &&
+      postableSystemAccount(WithdrawalClearing)
+  }.holds
+
+  def recipientPaysFeeUsesLegalAccounts(providerBalance: String): Boolean = {
+    legalAccountsFor(TxKind.WithdrawalSettle, WithdrawalClearing, providerBalance, "", providerBalance) &&
+      legalAccountsFor(TxKind.WithdrawalFeeRecovery, WithdrawalClearing, FeeRecovery, "", providerBalance) &&
+      legalAccountsFor(TxKind.ProviderPayoutFee, ProviderPayoutFee, providerBalance, "", providerBalance)
+  }.holds
 }

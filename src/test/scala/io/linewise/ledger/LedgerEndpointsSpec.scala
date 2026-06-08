@@ -210,6 +210,19 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(secure(E.getPayoutReconciliation, be, svc, w.id).body.toOption.get.result, "matched")
   }
 
+  test("negative Stripe fee is rejected before consuming the provider event") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    withWebhookSecret()
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "neg-fee-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "neg-fee-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    val rejected = public(E.stripeWebhook, be, StripeEvents.signed(whsec, StripeEvents.event("evt_neg", "transfer.paid", "tr_neg", w.id, -1)))
+    assertEquals(rejected.code, StatusCode.BadRequest)
+    assertEquals(rejected.body.swap.toOption.get._2, "bad_fee")
+    assertEquals(secure(E.listProviderEvents, be, svc, w.id).body.toOption.get.size, 0)
+    assertEquals(public(E.stripeWebhook, be, StripeEvents.signed(whsec, StripeEvents.event("evt_neg", "transfer.paid", "tr_neg", w.id, 20))).body.toOption.get.status, Some("Settled"))
+  }
+
   test("submit quote validation: unsupported_provider, bad_quote, quote_mismatch all 400 with their reason") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "qv-fund"))
@@ -220,6 +233,38 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(bad.code, StatusCode.BadRequest); assertEquals(bad.body.swap.toOption.get._2, "bad_quote")
     val mis = secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "r", "d", 20, 290, None, None)))
     assertEquals(mis.code, StatusCode.BadRequest); assertEquals(mis.body.swap.toOption.get._2, "quote_mismatch")
+  }
+
+  test("submit is atomic on status conflict and detects idempotency conflicts") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "idem-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "idem-cr")).body.toOption.get
+    val wrong = secure(E.submitWithdrawal, be, svc,
+      (w.id, PayoutSubmitRequest("Submitted", "stripe", "stripe_standard", "acct-1", 20, 280, Some("q1"), None)))
+    assertEquals(wrong.code, StatusCode.Conflict)
+    assertEquals(Db.payoutIntentByWithdrawal(w.id), None)
+    assertEquals(Db.dispatchByWithdrawal(w.id), None)
+
+    val req = PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, Some("q1"), None)
+    assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, req)).body.toOption.get.status, "Submitted")
+    assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, req)).body.toOption.get.status, "Submitted")
+    val changed = secure(E.submitWithdrawal, be, svc,
+      (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-2", 20, 280, Some("q1"), None)))
+    assertEquals(changed.code, StatusCode.Conflict)
+    assertEquals(changed.body.swap.toOption.get._2, "idempotency_conflict")
+  }
+
+  test("submit rejects a non-divisible payout unit before creating intent or dispatch") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    Db.setSystemConfig("payout_points_per_minor_unit", "100", "test", "test")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "unit-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "unit-cr")).body.toOption.get
+    val res = secure(E.submitWithdrawal, be, svc,
+      (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    assertEquals(res.code, StatusCode.BadRequest)
+    assertEquals(res.body.swap.toOption.get._2, "bad_payout_unit")
+    assertEquals(Db.payoutIntentByWithdrawal(w.id), None)
+    assertEquals(Db.dispatchByWithdrawal(w.id), None)
   }
 
   test("payout dispatcher: a pending outbox row becomes a transfer with the NET amount + routing metadata, then dispatched") {
@@ -257,6 +302,18 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     val d = Db.dispatchByWithdrawal(w.id).get
     assertEquals(d.status, "pending")
     assertEquals(d.attempts, 1)
+  }
+
+  test("payout dispatcher claim moves a pending row to inflight and prevents a second claim") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "claim-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "claim-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    val first = Db.claimPendingDispatches(1)
+    assertEquals(first.size, 1)
+    assertEquals(first.head.status, "inflight")
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("inflight"))
+    assertEquals(Db.claimPendingDispatches(1), Nil)
   }
 
   test("stripe-mock: StripeGateway posts a well-formed /v1/transfers and parses the tr_ id") {

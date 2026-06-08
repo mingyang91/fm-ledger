@@ -2,10 +2,9 @@ package io.linewise.ledger
 
 /* =============================================================================
  * PAYOUT DISPATCHER — the outbox worker. submitWithdrawal records a PAYOUT_DISPATCH
- * 'pending' row in the same DB transaction as the intent; this loop reads pending rows
- * and calls the gateway OUTSIDE any DB transaction (never holding a connection across the
- * network). The gateway Idempotency-Key makes an at-least-once dispatch safe, so a retried
- * or doubly-claimed row never double-pays. Transient failures stay 'pending' for the next
+ * 'pending' row in the same DB transaction as the intent; this loop atomically claims
+ * pending rows as 'inflight' before calling the gateway OUTSIDE any DB transaction (never
+ * holding a connection across the network). The gateway Idempotency-Key makes retries safe.
  * tick; permanent ones (or exhausted attempts) flip to 'failed' and raise a risk event.
  * ========================================================================== */
 final class PayoutDispatcher(gateway: PayoutGateway, batchSize: Int = 20, maxAttempts: Int = 6):
@@ -13,7 +12,7 @@ final class PayoutDispatcher(gateway: PayoutGateway, batchSize: Int = 20, maxAtt
   /** One pass over the pending outbox. Returns how many rows it successfully dispatched.
     * Idempotent and safe to call repeatedly; tests call this directly instead of run(). */
   def tick(): Int =
-    Db.pendingDispatches(batchSize).foldLeft(0) { (n, d) =>
+    Db.claimPendingDispatches(batchSize).foldLeft(0) { (n, d) =>
       val req = TransferRequest(
         amountMinor = d.amountMinor,
         currency = d.currency,

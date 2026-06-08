@@ -348,6 +348,25 @@ class LedgerApi:
       case Right(tx) => Right(tx)
       case Left(e)   => Left(ledgerErr(e))
 
+
+  private def payoutIntentMatches(wd: Withdrawal, req: PayoutSubmitRequest, intent: PayoutIntentRecord): Boolean =
+    intent.withdrawalId == wd.id &&
+      intent.userUid == wd.userUid &&
+      intent.provider == req.provider &&
+      intent.routeCode == req.routeCode &&
+      intent.destinationId == req.destinationId &&
+      intent.grossAmount == wd.amount &&
+      intent.quotedProviderFee == req.quotedProviderFee &&
+      intent.expectedRecipientNet == req.expectedRecipientNet &&
+      intent.quoteRef == req.quoteRef
+
+  private def payoutAmountMinor(points: Long): Either[Err, Long] =
+    val unit = Db.payoutPointsPerMinorUnit
+    if points <= 0 || points % unit != 0 then Left((StatusCode.BadRequest, "bad_payout_unit"))
+    else
+      val minor = points / unit
+      if minor <= 0 then Left((StatusCode.BadRequest, "bad_payout_unit"))
+      else Right(minor)
   private def settleRecipientPaysFee(withdrawal: Withdrawal, intent: PayoutIntentRecord, providerEventId: String, providerFeeDebited: Long, providerTransferRef: Option[String], actor: String): Either[Err, WithdrawalResponse] =
     val netEntries = List(
       LedgerEntry(Accounts.WithdrawalClearing, EntryDirection.DR, intent.expectedRecipientNet),
@@ -436,7 +455,8 @@ class LedgerApi:
                           case Some(withdrawal) =>
                             val intentOpt = Db.payoutIntentByWithdrawal(withdrawalId)
                             val observedFee = feeFromObject(obj, intentOpt.map(_.quotedProviderFee).getOrElse(0L))
-                            processWebhook(withdrawal, intentOpt, eventId, outcome, observedFee, transferRef)
+                            if observedFee < 0 then Left((StatusCode.BadRequest, "bad_fee"))
+                            else processWebhook(withdrawal, intentOpt, eventId, outcome, observedFee, transferRef)
 
   private def processWebhook(withdrawal: Withdrawal, intentOpt: Option[PayoutIntentRecord], eventId: String, outcome: String, observedFee: Long, transferRef: Option[String]): Either[Err, WebhookAck] =
     try
@@ -670,29 +690,32 @@ class LedgerApi:
         case None => Left(statusConflict)
         case Some(es) if !supportedProviders.contains(in._2.provider) => Left((StatusCode.BadRequest, "unsupported_provider"))
         case Some(es) =>
-          Db.payoutIntentByWithdrawal(in._1) match
-            case Some(_) =>
-              Db.withdrawalById(in._1) match
-                case Some(wd) => Right(withdrawalResponse(wd))
-                case None     => Left((StatusCode.NotFound, "withdrawal not found"))
-            case None =>
-              Db.withdrawalById(in._1) match
-                case None => Left((StatusCode.NotFound, "withdrawal not found"))
-                case Some(wd) if in._2.quotedProviderFee < 0 || in._2.expectedRecipientNet <= 0 => Left((StatusCode.BadRequest, "bad_quote"))
-                case Some(wd) if wd.amount != in._2.expectedRecipientNet + in._2.quotedProviderFee => Left((StatusCode.BadRequest, "quote_mismatch"))
-                case Some(wd) =>
-                  Db.transaction {
-                    val intent = PayoutIntentRecord(Db.nextId(), wd.id, wd.userUid, in._2.provider, in._2.routeCode, in._2.destinationId, wd.amount, in._2.quotedProviderFee, in._2.expectedRecipientNet, in._2.quoteRef, in._2.providerTransferRef)
-                    Db.payoutIntentPut(intent)
-                    // Outbox: the dispatcher transfers the recipient's NET to the provider account.
-                    val amountMinor = intent.expectedRecipientNet / Db.payoutPointsPerMinorUnit
-                    Db.payoutDispatchPut(PayoutDispatchRecord(intent.id, wd.id, intent.provider, intent.destinationId, amountMinor, Db.payoutCurrency, s"wd-${wd.id}-intent-${intent.id}", "pending", 0, None, None))
-                    Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
-                      case Right(w2) =>
-                        Db.audit("withdrawal.submit", admin, in._1.toString, s"${in._2.provider}:${in._2.routeCode}:${in._2.quotedProviderFee}")
-                        Right(withdrawalResponse(w2))
-                      case Left(e) => Left(wErr(e))
-                  }),
+          Db.transaction {
+            Db.withdrawalById(in._1) match
+              case None => Left((StatusCode.NotFound, "withdrawal not found"))
+              case Some(wd) =>
+                Db.payoutIntentByWithdrawal(in._1) match
+                  case Some(existing) =>
+                    if payoutIntentMatches(wd, in._2, existing) then Right(withdrawalResponse(wd))
+                    else Left((StatusCode.Conflict, "idempotency_conflict"))
+                  case None if in._2.quotedProviderFee < 0 || in._2.expectedRecipientNet <= 0 =>
+                    Left((StatusCode.BadRequest, "bad_quote"))
+                  case None if wd.amount != in._2.expectedRecipientNet + in._2.quotedProviderFee =>
+                    Left((StatusCode.BadRequest, "quote_mismatch"))
+                  case None =>
+                    payoutAmountMinor(in._2.expectedRecipientNet) match
+                      case Left(err) => Left(err)
+                      case Right(amountMinor) =>
+                        Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
+                          case Right(w2) =>
+                            val intent = PayoutIntentRecord(Db.nextId(), wd.id, wd.userUid, in._2.provider, in._2.routeCode, in._2.destinationId, wd.amount, in._2.quotedProviderFee, in._2.expectedRecipientNet, in._2.quoteRef, in._2.providerTransferRef)
+                            Db.payoutIntentPut(intent)
+                            // Outbox: the dispatcher transfers the recipient's NET to the provider account.
+                            Db.payoutDispatchPut(PayoutDispatchRecord(intent.id, wd.id, intent.provider, intent.destinationId, amountMinor, Db.payoutCurrency, s"wd-${wd.id}-intent-${intent.id}", "pending", 0, None, None))
+                            Db.audit("withdrawal.submit", admin, in._1.toString, s"${in._2.provider}:${in._2.routeCode}:${in._2.quotedProviderFee}")
+                            Right(withdrawalResponse(w2))
+                          case Left(e) => Left(wErr(e))
+          }),
 
     rejectWithdrawal.handleSecurity(resolveAdmin).handle(admin => (in: (Long, DecisionRequest)) =>
       parseWStatus(in._2.expectedStatus) match
