@@ -140,4 +140,66 @@ object AdjustmentProofs {
     AdjustmentService[World](HasLedger(), HasProposals()).reject(w, id, expectedStatus)._2 ==
       Left[LedgerError, Proposal](StatusConflict)
   }.holds
+
+  def proposeRejectsNonPositiveLeavesWorldUnchanged(
+      w: World, kind: TxKind, userUid: String, debitAccount: String, creditAccount: String,
+      amount: FMLong, reason: String, proposedBy: String, freshPid: FMLong): Boolean = {
+    require(!(amount > zero))
+    AdjustmentService[World](HasLedger(), HasProposals()).propose(w, kind, userUid, debitAccount, creditAccount, amount, reason, proposedBy, freshPid, None[FMLong]())._1 == w
+  }.holds
+
+  def reversalOfAlreadyReversedLeavesWorldUnchanged(
+      w: World, userUid: String, debitAccount: String, creditAccount: String,
+      amount: FMLong, reason: String, proposedBy: String, freshPid: FMLong, targetTxId: FMLong): Boolean = {
+    require(amount > zero)
+    val svc = AdjustmentService[World](HasLedger(), HasProposals())
+    require(svc.alreadyReversed(w.proposals, TxKind.RollbackReversal, Some[FMLong](targetTxId)))
+    svc.propose(w, TxKind.RollbackReversal, userUid, debitAccount, creditAccount, amount, reason, proposedBy, freshPid, Some[FMLong](targetTxId))._1 == w
+  }.holds
+
+  def approveRejectsMissingLeavesWorldUnchanged(w: World, id: FMLong, approver: String, freshTxId: FMLong): Boolean = {
+    require(w.proposals.get(id).isEmpty)
+    AdjustmentService[World](HasLedger(), HasProposals()).approve(w, id, ProposalStatus.PendingReview, approver, freshTxId)._1 == w
+  }.holds
+
+  def approveRejectsWrongExpectedStatusLeavesWorldUnchanged(w: World, id: FMLong, expectedStatus: ProposalStatus, approver: String, freshTxId: FMLong): Boolean = {
+    require(w.proposals.get(id) match
+      case Some(p) => p.status != expectedStatus || p.status != ProposalStatus.PendingReview
+      case _       => false)
+    AdjustmentService[World](HasLedger(), HasProposals()).approve(w, id, expectedStatus, approver, freshTxId)._1 == w
+  }.holds
+
+  def approveByProposerLeavesWorldUnchanged(w: World, id: FMLong, approver: String, freshTxId: FMLong): Boolean = {
+    require(w.proposals.get(id) match
+      case Some(p) => p.status == ProposalStatus.PendingReview && p.proposedBy == approver
+      case _       => false)
+    AdjustmentService[World](HasLedger(), HasProposals()).approve(w, id, ProposalStatus.PendingReview, approver, freshTxId)._1 == w
+  }.holds
+
+  def approveRejectsNonPositiveStoredAmountLeavesWorldUnchanged(w: World, id: FMLong, approver: String, freshTxId: FMLong): Boolean = {
+    require(w.proposals.get(id) match
+      case Some(p) => p.status == ProposalStatus.PendingReview && p.proposedBy != approver && !(p.amount > zero)
+      case _       => false)
+    AdjustmentService[World](HasLedger(), HasProposals()).approve(w, id, ProposalStatus.PendingReview, approver, freshTxId)._1 == w
+  }.holds
+
+  def approveRejectsDuplicateTxIdLeavesWorldUnchanged(w: World, id: FMLong, approver: String, freshTxId: FMLong): Boolean = {
+    require(w.proposals.get(id) match
+      case Some(p) => p.status == ProposalStatus.PendingReview && p.proposedBy != approver && p.amount > zero
+      case _       => false)
+    require(!w.ledger.get(freshTxId).isEmpty)
+    AdjustmentService[World](HasLedger(), HasProposals()).approve(w, id, ProposalStatus.PendingReview, approver, freshTxId)._1 == w
+  }.holds
+
+  def rejectRejectsMissingLeavesWorldUnchanged(w: World, id: FMLong): Boolean = {
+    require(w.proposals.get(id).isEmpty)
+    AdjustmentService[World](HasLedger(), HasProposals()).reject(w, id, ProposalStatus.PendingReview)._1 == w
+  }.holds
+
+  def rejectRejectsWrongStatusLeavesWorldUnchanged(w: World, id: FMLong, expectedStatus: ProposalStatus): Boolean = {
+    require(w.proposals.get(id) match
+      case Some(p) => p.status != expectedStatus || p.status != ProposalStatus.PendingReview
+      case _       => false)
+    AdjustmentService[World](HasLedger(), HasProposals()).reject(w, id, expectedStatus)._1 == w
+  }.holds
 }

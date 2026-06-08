@@ -105,4 +105,29 @@ object ObligationProofs {
       else o.copy(status = ObligationStatus.Realized, realizedTxId = Some[FMLong](txId))
     o2.status == ObligationStatus.Cancelled && o2.realizedTxId == o.realizedTxId
   }.holds
+
+  def openExistingOpenLeavesWorldUnchanged(
+      w: World, sk: String, si: String, uid: String, role: String,
+      projectRef: String, taskKind: String, estimatedUnit: FMLong): Boolean = {
+    require(w.obligations.bySource(sk, si) match
+      case Some(o) => o.status == ObligationStatus.Open
+      case _       => false)
+    ObligationService[World](HasObligations()).open(w, sk, si, uid, role, projectRef, taskKind, estimatedUnit)._1 == w
+  }.holds
+
+  def openTerminalLeavesWorldUnchanged(
+      w: World, sk: String, si: String, uid: String, role: String,
+      projectRef: String, taskKind: String, estimatedUnit: FMLong): Boolean = {
+    require(w.obligations.bySource(sk, si) match
+      case Some(o) => o.status != ObligationStatus.Open
+      case _       => false)
+    ObligationService[World](HasObligations()).open(w, sk, si, uid, role, projectRef, taskKind, estimatedUnit)._1 == w
+  }.holds
+
+  def cancelRealizedLeavesWorldUnchanged(w: World, sk: String, si: String): Boolean = {
+    require(w.obligations.bySource(sk, si) match
+      case Some(o) => o.status == ObligationStatus.Realized
+      case _       => false)
+    ObligationService[World](HasObligations()).cancel(w, sk, si)._1 == w
+  }.holds
 }

@@ -190,4 +190,154 @@ object WithdrawalProofs {
     val (w1, _) = WithdrawalService[World](HasLedger(), HasWithdrawals()).transitionOnly(w, id, expected, from, to)
     w1.ledger == w.ledger
   }.holds
+
+  def requestRejectsNonPositiveLeavesWorldUnchanged(
+      w: World, userUid: String, amount: FMLong, clientReq: String,
+      freshWid: FMLong, freshTxId: FMLong, userAccount: String, clearingAccount: String): Boolean = {
+    require(!(amount > zero))
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).request(w, userUid, amount, clientReq, freshWid, freshTxId, userAccount, clearingAccount)._1 == w
+  }.holds
+
+  def requestRejectsDuplicateTxIdLeavesWorldUnchanged(
+      w: World, userUid: String, amount: FMLong, clientReq: String,
+      freshWid: FMLong, freshTxId: FMLong, userAccount: String, clearingAccount: String): Boolean = {
+    require(amount > zero)
+    require(w.withdrawals.findByClientReq(userUid, clientReq).isEmpty)
+    require(!w.ledger.get(freshTxId).isEmpty)
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).request(w, userUid, amount, clientReq, freshWid, freshTxId, userAccount, clearingAccount)._1 == w
+  }.holds
+
+  def requestDuplicateLeavesWorldUnchanged(
+      w: World, userUid: String, amount: FMLong, clientReq: String,
+      freshWid: FMLong, freshTxId: FMLong, userAccount: String, clearingAccount: String): Boolean = {
+    require(w.withdrawals.findByClientReq(userUid, clientReq).nonEmpty)
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).request(w, userUid, amount, clientReq, freshWid, freshTxId, userAccount, clearingAccount)._1 == w
+  }.holds
+
+  def requestSuccessHasExactDelta(
+      w: World, userUid: String, amount: FMLong, clientReq: String,
+      freshWid: FMLong, freshTxId: FMLong, userAccount: String, clearingAccount: String): Boolean = {
+    require(amount > zero)
+    require(w.withdrawals.findByClientReq(userUid, clientReq).isEmpty)
+    require(w.ledger.get(freshTxId).isEmpty)
+    val tx = twoLegTx(freshTxId, TxKind.WithdrawalReserve, userAccount, clearingAccount, amount, None[String](), None[String](), userUid)
+    val wd = Withdrawal(freshWid, userUid, amount, WithdrawalStatus.PendingReview, clientReq, freshTxId)
+    val expected = w.copy(ledger = w.ledger.post(tx), withdrawals = w.withdrawals.put(wd))
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).request(w, userUid, amount, clientReq, freshWid, freshTxId, userAccount, clearingAccount) ==
+      (expected, Right[LedgerError, Withdrawal](wd))
+  }.holds
+
+  def approveRejectsMissingLeavesWorldUnchanged(w: World, id: FMLong): Boolean = {
+    require(w.withdrawals.get(id).isEmpty)
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).approve(w, id, WithdrawalStatus.PendingReview)._1 == w
+  }.holds
+
+  def approveRejectsWrongExpectedStatusLeavesWorldUnchanged(w: World, id: FMLong, expectedStatus: WithdrawalStatus): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status != expectedStatus
+      case _        => false)
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).approve(w, id, expectedStatus)._1 == w
+  }.holds
+
+  def approveSuccessHasExactDelta(w: World, id: FMLong): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status == WithdrawalStatus.PendingReview
+      case _        => false)
+    w.withdrawals.get(id) match
+      case Some(wd) =>
+        val wd2 = wd.copy(status = WithdrawalStatus.Submitted)
+        val expected = w.copy(withdrawals = w.withdrawals.put(wd2))
+        WithdrawalService[World](HasLedger(), HasWithdrawals()).approve(w, id, WithdrawalStatus.PendingReview) ==
+          (expected, Right[LedgerError, Withdrawal](wd2))
+      case _ => false
+  }.holds
+
+  def moneyMoveRejectsWrongStatusLeavesWorldUnchanged(
+      w: World, id: FMLong, expectedStatus: WithdrawalStatus, freshTxId: FMLong, clearingAccount: String, cashAccount: String): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status != expectedStatus || wd.status != WithdrawalStatus.Submitted
+      case _        => false)
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).settle(w, id, expectedStatus, freshTxId, clearingAccount, cashAccount)._1 == w
+  }.holds
+
+  def moneyMoveRejectsNonPositiveStoredAmountLeavesWorldUnchanged(
+      w: World, id: FMLong, freshTxId: FMLong, clearingAccount: String, cashAccount: String): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status == WithdrawalStatus.Submitted && !(wd.amount > zero)
+      case _        => false)
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).settle(w, id, WithdrawalStatus.Submitted, freshTxId, clearingAccount, cashAccount)._1 == w
+  }.holds
+
+  def moneyMoveRejectsDuplicateTxIdLeavesWorldUnchanged(
+      w: World, id: FMLong, freshTxId: FMLong, clearingAccount: String, cashAccount: String): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status == WithdrawalStatus.Submitted && wd.amount > zero
+      case _        => false)
+    require(!w.ledger.get(freshTxId).isEmpty)
+    WithdrawalService[World](HasLedger(), HasWithdrawals()).settle(w, id, WithdrawalStatus.Submitted, freshTxId, clearingAccount, cashAccount)._1 == w
+  }.holds
+
+  def settleSuccessHasExactDelta(
+      w: World, id: FMLong, freshTxId: FMLong, clearingAccount: String, cashAccount: String): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status == WithdrawalStatus.Submitted && wd.amount > zero
+      case _        => false)
+    require(w.ledger.get(freshTxId).isEmpty)
+    w.withdrawals.get(id) match
+      case Some(wd) =>
+        val tx = twoLegTx(freshTxId, TxKind.WithdrawalSettle, clearingAccount, cashAccount, wd.amount, None[String](), None[String](), wd.userUid)
+        val wd2 = wd.copy(status = WithdrawalStatus.Settled)
+        val expected = w.copy(ledger = w.ledger.post(tx), withdrawals = w.withdrawals.put(wd2))
+        WithdrawalService[World](HasLedger(), HasWithdrawals()).settle(w, id, WithdrawalStatus.Submitted, freshTxId, clearingAccount, cashAccount) ==
+          (expected, Right[LedgerError, Withdrawal](wd2))
+      case _ => false
+  }.holds
+
+  def failSuccessHasExactDelta(
+      w: World, id: FMLong, freshTxId: FMLong, clearingAccount: String, userAccount: String): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status == WithdrawalStatus.Submitted && wd.amount > zero
+      case _        => false)
+    require(w.ledger.get(freshTxId).isEmpty)
+    w.withdrawals.get(id) match
+      case Some(wd) =>
+        val tx = twoLegTx(freshTxId, TxKind.WithdrawalReturn, clearingAccount, userAccount, wd.amount, None[String](), None[String](), wd.userUid)
+        val wd2 = wd.copy(status = WithdrawalStatus.Failed)
+        val expected = w.copy(ledger = w.ledger.post(tx), withdrawals = w.withdrawals.put(wd2))
+        WithdrawalService[World](HasLedger(), HasWithdrawals()).fail(w, id, WithdrawalStatus.Submitted, freshTxId, clearingAccount, userAccount) ==
+          (expected, Right[LedgerError, Withdrawal](wd2))
+      case _ => false
+  }.holds
+
+  def rejectSuccessHasExactDelta(
+      w: World, id: FMLong, freshTxId: FMLong, clearingAccount: String, userAccount: String): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status == WithdrawalStatus.PendingReview && wd.amount > zero
+      case _        => false)
+    require(w.ledger.get(freshTxId).isEmpty)
+    w.withdrawals.get(id) match
+      case Some(wd) =>
+        val tx = twoLegTx(freshTxId, TxKind.WithdrawalReturn, clearingAccount, userAccount, wd.amount, None[String](), None[String](), wd.userUid)
+        val wd2 = wd.copy(status = WithdrawalStatus.Rejected)
+        val expected = w.copy(ledger = w.ledger.post(tx), withdrawals = w.withdrawals.put(wd2))
+        WithdrawalService[World](HasLedger(), HasWithdrawals()).reject(w, id, WithdrawalStatus.PendingReview, freshTxId, clearingAccount, userAccount) ==
+          (expected, Right[LedgerError, Withdrawal](wd2))
+      case _ => false
+  }.holds
+
+  def cancelSuccessHasExactDelta(
+      w: World, id: FMLong, freshTxId: FMLong, clearingAccount: String, userAccount: String): Boolean = {
+    require(w.withdrawals.get(id) match
+      case Some(wd) => wd.status == WithdrawalStatus.PendingReview && wd.amount > zero
+      case _        => false)
+    require(w.ledger.get(freshTxId).isEmpty)
+    w.withdrawals.get(id) match
+      case Some(wd) =>
+        val tx = twoLegTx(freshTxId, TxKind.WithdrawalReturn, clearingAccount, userAccount, wd.amount, None[String](), None[String](), wd.userUid)
+        val wd2 = wd.copy(status = WithdrawalStatus.Cancelled)
+        val expected = w.copy(ledger = w.ledger.post(tx), withdrawals = w.withdrawals.put(wd2))
+        WithdrawalService[World](HasLedger(), HasWithdrawals()).cancel(w, id, WithdrawalStatus.PendingReview, freshTxId, clearingAccount, userAccount) ==
+          (expected, Right[LedgerError, Withdrawal](wd2))
+      case _ => false
+  }.holds
 }
