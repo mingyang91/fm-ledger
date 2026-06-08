@@ -316,6 +316,66 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(Db.claimPendingDispatches(1), Nil)
   }
 
+  test("reaper (B1): a dispatch stranded 'inflight' by a crash is reclaimed to 'pending' and a later tick dispatches it") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "reap-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "reap-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    // simulate B1: claim the row to 'inflight', then the worker dies before completing it
+    Db.claimPendingDispatches(1)
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("inflight"))
+    // the reaper (startup or periodic) reclaims the stranded row back to 'pending' — proven to wake it
+    assertEquals(Db.reclaimStaleInflight(0), 1)
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("pending"))
+    // a healthy tick now dispatches it under the SAME idempotency key (safe, no double-pay)
+    val fake = FakeGateway()
+    assertEquals(PayoutDispatcher(fake).tick(), 1)
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("dispatched"))
+    assertEquals(fake.calls.head.idempotencyKey, s"wd-${w.id}-intent-${Db.payoutIntentByWithdrawal(w.id).get.id}")
+  }
+
+  test("reaper safety: a FRESH inflight row (within the timeout) is NOT reclaimed — never touch a live transfer") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "fresh-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "fresh-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    Db.claimPendingDispatches(1)
+    assertEquals(Db.reclaimStaleInflight(3600), 0)
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("inflight"))
+  }
+
+  test("#3: a permanently failed dispatch fails the withdrawal AND refunds the reserve (never stuck in Submitted)") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "p3-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "p3-cr")).body.toOption.get
+    secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
+    assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 700L) // reserve held in clearing
+    // a permanent gateway error: in one tick the dispatch flips to failed AND the withdrawal is failed + refunded
+    PayoutDispatcher(FailingGateway(retryable = false), onPermanentFailure = api.failWithdrawalForFailedDispatch).tick()
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("failed"))
+    assertEquals(Db.withdrawalById(w.id).map(_.status.toString), Some("Failed"))
+    assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 1000L) // reserve refunded
+    assertEquals(secure(E.accountBalance, be, svc, "system:withdrawal_clearing").body.toOption.get.balancePoints, 0L)
+    assert(secure(E.riskEvents, be, svc, ()).body.toOption.get.exists(_.kind == "payout_dispatch_failed"))
+  }
+
+  test("#5: the webhook observed fee (minor units) is converted to points before posting/reconciling (ratio != 1)") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    withWebhookSecret()
+    Db.setSystemConfig("payout_points_per_minor_unit", "2", "test", "test") // 1 minor unit = 2 points
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "p5-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "p5-cr")).body.toOption.get
+    // gross 300, quoted fee 20 points, net 280 -> amountMinor = 280/2 = 140 (divisible, accepted)
+    assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None))).body.toOption.get.status, "Submitted")
+    assertEquals(Db.dispatchByWithdrawal(w.id).map(_.amountMinor), Some(140L))
+    // Stripe reports the fee as 10 MINOR units; the shell converts 10*2 = 20 points == the quote -> matched
+    val (sig, body) = StripeEvents.signed(whsec, StripeEvents.event("evt_p5", "transfer.paid", "tr_p5", w.id, 10))
+    assertEquals(public(E.stripeWebhook, be, (sig, body)).body.toOption.get.status, Some("Settled"))
+    assertEquals(secure(E.getPayoutReconciliation, be, svc, w.id).body.toOption.get.result, "matched")
+    assertEquals(secure(E.accountBalance, be, svc, Accounts.ProviderPayoutFee).body.toOption.get.balancePoints, 20L) // 10 minor -> 20 points
+    assert(secure(E.summary, be, svc, ()).body.toOption.get.fundsInvariantHolds)
+  }
+
   test("stripe-mock: StripeGateway posts a well-formed /v1/transfers and parses the tr_ id") {
     val container =
       try

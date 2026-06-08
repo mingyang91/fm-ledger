@@ -65,7 +65,9 @@ final class StripeGateway(apiKey: String, baseUrl: String, apiVersion: String) e
       if code >= 200 && code < 300 then
         scala.util.Try(ujson.read(body).obj.get("id").flatMap(_.strOpt)).toOption.flatten match
           case Some(id) if id.nonEmpty => Right(TransferResult(id, body))
-          case _                       => Left(GatewayError(retryable = false, code, "no_id", "transfer response missing id"))
+          // #7: a 2xx we cannot parse an id from is AMBIGUOUS — the transfer may well have been
+          // created, so retry under the same Idempotency-Key / reconcile; never a terminal failure.
+          case _                       => Left(GatewayError(retryable = true, code, "ambiguous_success", "2xx without a parseable transfer id"))
       else
         val errObj = scala.util.Try(ujson.read(body).obj("error").obj).toOption
         val errCode = errObj.flatMap(o => o.get("code").orElse(o.get("type"))).flatMap(_.strOpt).getOrElse("stripe_error")
@@ -78,3 +80,7 @@ final class StripeGateway(apiKey: String, baseUrl: String, apiVersion: String) e
       case _: InterruptedException =>
         Thread.currentThread().interrupt()
         Left(GatewayError(retryable = true, 0, "interrupted", "interrupted"))
+      case e: RuntimeException =>
+        // Never let an unexpected client/encoding error (e.g. an illegal header value) escape and
+        // strand the claimed 'inflight' row; surface it as transient so markDispatchFailed recovers it.
+        Left(GatewayError(retryable = true, 0, "exception", String.valueOf(e.getMessage)))

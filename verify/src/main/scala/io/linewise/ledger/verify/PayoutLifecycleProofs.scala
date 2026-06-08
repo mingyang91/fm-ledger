@@ -675,4 +675,207 @@ object PayoutLifecycleProofs {
       case (w1, Right(wd2)) => wd2.status == WithdrawalStatus.Failed && failedCouplingHolds(w1, wd.id)
       case _                => false
   }.holds
+
+  /* ---------------------------------------------------------------------------
+   * REAPER (B1 fix) — the dispatcher claims a row to InFlight, then calls the gateway OUTSIDE
+   * any DB transaction. If the worker dies in that window the row is stranded in InFlight forever:
+   * `claim` only acts on Pending and the completions only act on InFlight, so without a reaper an
+   * InFlight row is an absorbing dead end (see claimCannotWakeInFlight below). `reclaim` adds the
+   * missing InFlight -> Pending edge for a STALE row (its owning tick is gone). The staleness
+   * predicate (now - updatedAt > timeout) is a shell/clock concern; here it is the opaque `stale`
+   * guard the production SQL supplies. attempts is preserved — a reclaim is not a failure, and the
+   * re-dispatch reuses the same Idempotency-Key, so it never double-pays.
+   * ------------------------------------------------------------------------ */
+  def reclaim(w: PayoutWorld, intentId: FMLong, stale: Boolean): PayoutWorld =
+    findDispatch(w.dispatches, intentId) match
+      case Some(d) if d.status == DispatchStatus.InFlight && stale =>
+        w.copy(dispatches = putDispatch(w.dispatches, d.copy(status = DispatchStatus.Pending)))
+      case _ => w
+
+  def exactReclaimDelta(before: PayoutWorld, after: PayoutWorld, d: PayoutDispatch): Boolean =
+    after == before.copy(dispatches = putDispatch(before.dispatches, d.copy(status = DispatchStatus.Pending)))
+
+  // (1) WAKE-UP: a stale InFlight dispatch becomes Pending (claimable) again, attempts preserved.
+  def reclaimStaleInFlightMovesPending(w: PayoutWorld, d: PayoutDispatch): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d))
+    findDispatch(reclaim(w0, d.intentId, true).dispatches, d.intentId) match
+      case Some(woken) => woken.status == DispatchStatus.Pending && woken.attempts == d.attempts
+      case _           => false
+  }.holds
+
+  // (1b) the wake-up step has the exact delta we expect (only this row's status flips to Pending).
+  def reclaimStaleInFlightHasExactDelta(w: PayoutWorld, d: PayoutDispatch): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d))
+    exactReclaimDelta(w0, reclaim(w0, d.intentId, true), d)
+  }.holds
+
+  // (2) SAFETY: a FRESH (non-stale) InFlight row is left untouched — never reclaim a live transfer.
+  def reclaimFreshInFlightLeavesWorldUnchanged(w: PayoutWorld, d: PayoutDispatch): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d))
+    reclaim(w0, d.intentId, false) == w0
+  }.holds
+
+  // (3) SAFETY: reclaim is a no-op on a non-InFlight row (Pending/Dispatched/Failed), any guard.
+  def reclaimNonInFlightLeavesWorldUnchanged(w: PayoutWorld, d: PayoutDispatch, stale: Boolean): Boolean = {
+    require(d.status != DispatchStatus.InFlight)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d))
+    reclaim(w0, d.intentId, stale) == w0
+  }.holds
+
+  // (4) PROGRESS: once the reaper wakes it, the row can be claimed again (Pending -> InFlight).
+  def reclaimedDispatchIsClaimable(w: PayoutWorld, d: PayoutDispatch): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d))
+    val woken = reclaim(w0, d.intentId, true)
+    findDispatch(claim(woken, d.intentId).dispatches, d.intentId) match
+      case Some(reclaimed) => reclaimed.status == DispatchStatus.InFlight
+      case _               => false
+  }.holds
+
+  // (5) LIVENESS / B1-ESCAPE: a stranded InFlight dispatch reaches the TERMINAL Dispatched status
+  //     via reclaim -> claim -> dispatchSuccess. InFlight is no longer absorbing once the reaper runs.
+  def stuckInFlightReachesDispatchedAfterReclaim(w: PayoutWorld, d: PayoutDispatch, transferRef: String): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    val w0        = w.copy(dispatches = putDispatch(w.dispatches, d))
+    val woken     = reclaim(w0, d.intentId, true)
+    val reclaimed = claim(woken, d.intentId)
+    val done      = dispatchSuccess(reclaimed, d.intentId, transferRef)
+    findDispatch(done.dispatches, d.intentId) match
+      case Some(d2) => d2.status == DispatchStatus.Dispatched
+      case _        => false
+  }.holds
+
+  // (5b) the failure branch also terminates: reclaim -> claim -> permanent dispatchFailure -> Failed.
+  def stuckInFlightReachesFailedAfterReclaim(w: PayoutWorld, d: PayoutDispatch, maxAttempts: BigInt): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    val w0        = w.copy(dispatches = putDispatch(w.dispatches, d))
+    val woken     = reclaim(w0, d.intentId, true)
+    val reclaimed = claim(woken, d.intentId)
+    val done      = dispatchFailure(reclaimed, d.intentId, false, maxAttempts)
+    findDispatch(done.dispatches, d.intentId) match
+      case Some(d2) => d2.status == DispatchStatus.Failed
+      case _        => false
+  }.holds
+
+  // (6) CONTRAST (this IS B1): without reclaim, `claim` cannot wake an InFlight row — it is left
+  //     unchanged — so a crashed-after-claim dispatch is a permanent dead end. The reaper closes it.
+  def claimCannotWakeInFlight(w: PayoutWorld, d: PayoutDispatch): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d))
+    claim(w0, d.intentId) == w0
+  }.holds
+
+  /* ---------------------------------------------------------------------------
+   * #3 — PERMANENT-DISPATCH-FAILURE REFUND COUPLING. A dispatch that fails permanently
+   * (non-retryable, or attempts exhausted) must not leave its withdrawal stranded in Submitted
+   * with the reserve locked: it drives the withdrawal Submitted -> Failed and posts the
+   * WithdrawalReturn refund leg (clearing -> user), like the webhook fail path. A retryable,
+   * non-exhausted failure only returns the dispatch to Pending (no refund).
+   * ------------------------------------------------------------------------ */
+  def dispatchPermanentFailureRefunds(
+      w: PayoutWorld, intentId: FMLong, retryable: Boolean, maxAttempts: BigInt,
+      freshTxId: FMLong, clearingAccount: String, userAccount: String): PayoutWorld =
+    findDispatch(w.dispatches, intentId) match
+      case Some(d) if d.status == DispatchStatus.InFlight =>
+        val nextAttempts = d.attempts + BigInt(1)
+        val permanent = !retryable || nextAttempts >= maxAttempts
+        if !permanent then
+          w.copy(dispatches = putDispatch(w.dispatches, d.copy(status = DispatchStatus.Pending, attempts = nextAttempts)))
+        else
+          val failedDispatch = putDispatch(w.dispatches, d.copy(status = DispatchStatus.Failed, attempts = nextAttempts))
+          findWithdrawal(w.withdrawals, d.withdrawalId) match
+            case Some(wd) if wd.status == WithdrawalStatus.Submitted =>
+              val tx = twoLegTx(freshTxId, TxKind.WithdrawalReturn, clearingAccount, userAccount, wd.amount, None[String](), None[String](), wd.userUid)
+              w.copy(dispatches = failedDispatch,
+                     withdrawals = putWithdrawal(w.withdrawals, wd.copy(status = WithdrawalStatus.Failed)),
+                     ledger = tx :: w.ledger)
+            case _ => w.copy(dispatches = failedDispatch)
+      case _ => w
+
+  // (1) CENTERPIECE: a permanent failure fails the withdrawal AND posts the refund (return) leg.
+  def permanentFailureFailsWithdrawalAndRefunds(w: PayoutWorld, d: PayoutDispatch, wd: Withdrawal, maxAttempts: BigInt, freshTxId: FMLong, clearingAccount: String, userAccount: String): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    require(wd.status == WithdrawalStatus.Submitted)
+    require(d.withdrawalId == wd.id)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d), withdrawals = putWithdrawal(w.withdrawals, wd))
+    val w1 = dispatchPermanentFailureRefunds(w0, d.intentId, false, maxAttempts, freshTxId, clearingAccount, userAccount)
+    val dispatchFailed = findDispatch(w1.dispatches, d.intentId) match
+      case Some(d2) => d2.status == DispatchStatus.Failed
+      case _        => false
+    val withdrawalFailed = findWithdrawal(w1.withdrawals, wd.id) match
+      case Some(w2) => w2.status == WithdrawalStatus.Failed
+      case _        => false
+    val refundPosted = w1.ledger match
+      case Cons(tx, _) => tx.kind == TxKind.WithdrawalReturn && tx.userUid == wd.userUid
+      case _           => false
+    dispatchFailed && withdrawalFailed && refundPosted
+  }.holds
+
+  // (2) NO-STUCK: a permanent failure never leaves the withdrawal in Submitted (the withdrawal's B1).
+  def permanentFailureNeverLeavesWithdrawalSubmitted(w: PayoutWorld, d: PayoutDispatch, wd: Withdrawal, maxAttempts: BigInt, freshTxId: FMLong, clearingAccount: String, userAccount: String): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    require(wd.status == WithdrawalStatus.Submitted)
+    require(d.withdrawalId == wd.id)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d), withdrawals = putWithdrawal(w.withdrawals, wd))
+    findWithdrawal(dispatchPermanentFailureRefunds(w0, d.intentId, false, maxAttempts, freshTxId, clearingAccount, userAccount).withdrawals, wd.id) match
+      case Some(w2) => w2.status != WithdrawalStatus.Submitted
+      case _        => false
+  }.holds
+
+  // (3) SAFETY: a retryable, non-exhausted failure returns the dispatch to Pending and does NOT
+  //     touch the withdrawal (no premature refund) — withdrawal stays Submitted, ledger unchanged.
+  def retryableFailureDoesNotRefund(w: PayoutWorld, d: PayoutDispatch, wd: Withdrawal, maxAttempts: BigInt, freshTxId: FMLong, clearingAccount: String, userAccount: String): Boolean = {
+    require(d.status == DispatchStatus.InFlight)
+    require(wd.status == WithdrawalStatus.Submitted)
+    require(d.withdrawalId == wd.id)
+    require(d.attempts + BigInt(1) < maxAttempts)
+    val w0 = w.copy(dispatches = putDispatch(w.dispatches, d), withdrawals = putWithdrawal(w.withdrawals, wd))
+    val w1 = dispatchPermanentFailureRefunds(w0, d.intentId, true, maxAttempts, freshTxId, clearingAccount, userAccount)
+    val pending = findDispatch(w1.dispatches, d.intentId) match
+      case Some(d2) => d2.status == DispatchStatus.Pending
+      case _        => false
+    val stillSubmitted = findWithdrawal(w1.withdrawals, wd.id) match
+      case Some(w2) => w2.status == WithdrawalStatus.Submitted
+      case _        => false
+    pending && stillSubmitted && w1.ledger == w0.ledger
+  }.holds
+
+  /* ---------------------------------------------------------------------------
+   * #7 — GATEWAY RESPONSE CLASSIFICATION (decision only; the JSON parsing itself stays shell).
+   * A 2xx whose body we cannot parse an id from is AMBIGUOUS: the transfer may well have been
+   * created, so it must be retried (same Idempotency-Key) / reconciled, never booked as a terminal
+   * failure that loses real money. This proves the policy the shell's StripeGateway must mirror.
+   * ------------------------------------------------------------------------ */
+  enum DispatchOutcome { case Succeeded, AmbiguousSuccess, TransientFailure, PermanentFailure }
+
+  def classifyResponse(httpOk: Boolean, idParsed: Boolean, serverError: Boolean): DispatchOutcome =
+    if httpOk && idParsed then DispatchOutcome.Succeeded
+    else if httpOk then DispatchOutcome.AmbiguousSuccess
+    else if serverError then DispatchOutcome.TransientFailure
+    else DispatchOutcome.PermanentFailure
+
+  def outcomeRetryable(o: DispatchOutcome): Boolean =
+    o == DispatchOutcome.TransientFailure || o == DispatchOutcome.AmbiguousSuccess
+
+  def parsedOkIsSucceeded(serverError: Boolean): Boolean = {
+    classifyResponse(true, true, serverError) == DispatchOutcome.Succeeded
+  }.holds
+
+  // THE #7 PROPERTY: a 2xx we cannot parse is AmbiguousSuccess — retryable, and NOT a permanent
+  // (money-losing terminal) failure.
+  def unparseableOkIsRetryableNotPermanent(serverError: Boolean): Boolean = {
+    val o = classifyResponse(true, false, serverError)
+    o == DispatchOutcome.AmbiguousSuccess && outcomeRetryable(o) && o != DispatchOutcome.PermanentFailure
+  }.holds
+
+  def serverErrorIsTransient(): Boolean = {
+    classifyResponse(false, false, true) == DispatchOutcome.TransientFailure && outcomeRetryable(DispatchOutcome.TransientFailure)
+  }.holds
+
+  def clientErrorIsPermanent(): Boolean = {
+    classifyResponse(false, false, false) == DispatchOutcome.PermanentFailure && !outcomeRetryable(DispatchOutcome.PermanentFailure)
+  }.holds
 }

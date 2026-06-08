@@ -336,6 +336,18 @@ final class LedgerStore(ds: DataSource):
           WHERE PAYOUT_INTENT_ID = $payoutIntentId AND STATUS = 'inflight'""".update.run()(using dbc)
   }
 
+  /** Reaper (B1): reclaim dispatch rows wedged in 'inflight' past `timeoutSeconds` — a crash between
+    * claim and completion — back to 'pending', so the next tick re-dispatches under the same
+    * Idempotency-Key (safe, never double-pays). Mirrors the verified PayoutLifecycleProofs.reclaim
+    * decision exactly: the SQL `now - updated_at > timeout` is the proof's opaque `stale` guard, and
+    * ATTEMPTS is deliberately left unchanged (a reclaim is not a failure). Returns rows reclaimed. */
+  def reclaimStaleInflight(timeoutSeconds: Int): Int = transaction {
+    sql"""UPDATE PAYOUT_DISPATCH
+             SET STATUS = 'pending', UPDATED_AT = CURRENT_TIMESTAMP
+           WHERE STATUS = 'inflight'
+             AND UPDATED_AT < CURRENT_TIMESTAMP - make_interval(secs => $timeoutSeconds)""".update.run()(using dbc)
+  }
+
   def withdrawalIdByProviderTransferRef(ref: String): Option[Long] = readOnly {
     sql"SELECT WITHDRAWAL_ID FROM PAYOUT_INTENT WHERE PROVIDER_TRANSFER_REF = $ref".query[Long].run()(using dbc).headOption
       .orElse(sql"SELECT WITHDRAWAL_ID FROM PAYOUT_DISPATCH WHERE PROVIDER_TRANSFER_REF = $ref".query[Long].run()(using dbc).headOption)
@@ -645,6 +657,7 @@ object Db:
   def dispatchByWithdrawal(withdrawalId: Long): Option[PayoutDispatchRecord] = store.dispatchByWithdrawal(withdrawalId)
   def markDispatched(payoutIntentId: Long, providerTransferRef: String): Unit = store.markDispatched(payoutIntentId, providerTransferRef)
   def markDispatchFailed(payoutIntentId: Long, newStatus: String, error: String): Unit = store.markDispatchFailed(payoutIntentId, newStatus, error)
+  def reclaimStaleInflight(timeoutSeconds: Int): Int = store.reclaimStaleInflight(timeoutSeconds)
   def withdrawalIdByProviderTransferRef(ref: String): Option[Long] = store.withdrawalIdByProviderTransferRef(ref)
   def stripeWebhookSecret: String = store.stripeWebhookSecret
   def payoutCurrency: String = store.payoutCurrency

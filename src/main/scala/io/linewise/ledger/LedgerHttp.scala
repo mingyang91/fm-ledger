@@ -419,10 +419,10 @@ class LedgerApi:
   // Observed provider fee: try the object's own fee, then a (possibly expanded) balance_transaction
   // fee; absent either, fall back to the quoted fee so the settlement reconciles as "matched". The
   // exact field is rail-dependent (see the integration plan) — this is the one swappable seam.
-  private def feeFromObject(obj: ujson.Value, quotedFallback: Long): Long =
-    jlong(obj, "fee")
-      .orElse(jchild(obj, "balance_transaction").flatMap(bt => jlong(bt, "fee")))
-      .getOrElse(quotedFallback)
+  // #5: the provider reports its fee in MINOR currency units (e.g. cents); None when the event
+  // carries no fee. The caller converts minor -> ledger points before posting/reconciling.
+  private def feeMinorFromObject(obj: ujson.Value): Option[Long] =
+    jlong(obj, "fee").orElse(jchild(obj, "balance_transaction").flatMap(bt => jlong(bt, "fee")))
 
   private def resolveWithdrawalId(obj: ujson.Value, transferRef: Option[String]): Option[Long] =
     jchild(obj, "metadata").flatMap(m => jstr(m, "withdrawal_id")).flatMap(s => scala.util.Try(s.toLong).toOption)
@@ -454,7 +454,13 @@ class LedgerApi:
                           case None => Left((StatusCode.NotFound, "withdrawal not found"))
                           case Some(withdrawal) =>
                             val intentOpt = Db.payoutIntentByWithdrawal(withdrawalId)
-                            val observedFee = feeFromObject(obj, intentOpt.map(_.quotedProviderFee).getOrElse(0L))
+                            // #5: convert the provider fee (minor units) to ledger points
+                            // (points = minor * pointsPerMinorUnit) before posting/reconciling, so a
+                            // non-default ratio never mis-books the fee. No fee on the event -> fall
+                            // back to the quoted fee (already in points).
+                            val observedFee = feeMinorFromObject(obj) match
+                              case Some(minor) => minor * Db.payoutPointsPerMinorUnit
+                              case None        => intentOpt.map(_.quotedProviderFee).getOrElse(0L)
                             if observedFee < 0 then Left((StatusCode.BadRequest, "bad_fee"))
                             else processWebhook(withdrawal, intentOpt, eventId, outcome, observedFee, transferRef)
 
@@ -494,6 +500,20 @@ class LedgerApi:
         Db.withdrawalById(withdrawal.id) match
           case Some(w) => Right(WebhookAck(eventId, handled = true, Some(w.id), Some(w.status.toString)))
           case None    => Left((StatusCode.NotFound, "withdrawal not found"))
+
+  /** #3: drive the verified withdrawal-fail (Submitted -> Failed + WithdrawalReturn refund leg) for
+    * a permanently-failed dispatch, so the reserve is returned and the withdrawal is never stranded
+    * in Submitted. Best-effort: a withdrawal not in Submitted (e.g. already settled by a race) is
+    * left as-is by wservice.fail's status guard. Wired into PayoutDispatcher.onPermanentFailure. */
+  def failWithdrawalForFailedDispatch(withdrawalId: Long): Unit =
+    Db.transaction {
+      Db.asActor("system") {
+        Db.withTxMeta(TxWriteMeta(withdrawalId = Some(withdrawalId), rawInput = Some("dispatch_permanent_failure"))) {
+          wservice.fail(world, withdrawalId, WithdrawalStatus.Submitted, Db.nextId(), Accounts.WithdrawalClearing, userAcctOf(withdrawalId))._2
+        }
+      }
+      ()
+    }
 
   def serverEndpoints: List[SE] = List(
     incentiveCredit.handleSecurity(resolveAdmin).handle(admin => (req: CreditRequest) =>

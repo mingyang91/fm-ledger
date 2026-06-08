@@ -7,11 +7,12 @@ package io.linewise.ledger
  * holding a connection across the network). The gateway Idempotency-Key makes retries safe.
  * tick; permanent ones (or exhausted attempts) flip to 'failed' and raise a risk event.
  * ========================================================================== */
-final class PayoutDispatcher(gateway: PayoutGateway, batchSize: Int = 20, maxAttempts: Int = 6):
+final class PayoutDispatcher(gateway: PayoutGateway, onPermanentFailure: Long => Unit = _ => (), batchSize: Int = 20, maxAttempts: Int = 6, reclaimAfterSeconds: Int = 120):
 
   /** One pass over the pending outbox. Returns how many rows it successfully dispatched.
     * Idempotent and safe to call repeatedly; tests call this directly instead of run(). */
   def tick(): Int =
+    Db.reclaimStaleInflight(reclaimAfterSeconds)  // B1: wake rows stranded 'inflight' by a crashed prior tick
     Db.claimPendingDispatches(batchSize).foldLeft(0) { (n, d) =>
       val req = TransferRequest(
         amountMinor = d.amountMinor,
@@ -27,7 +28,12 @@ final class PayoutDispatcher(gateway: PayoutGateway, batchSize: Int = 20, maxAtt
           n + 1
         case Left(err) =>
           val giveUp = !err.retryable || d.attempts + 1 >= maxAttempts
-          Db.markDispatchFailed(d.payoutIntentId, if giveUp then "failed" else "pending", s"[${err.httpStatus}/${err.code}] ${err.message}")
+          // #3: on a permanent failure, mark the row failed AND fail+refund the withdrawal in ONE
+          // transaction, so a Failed dispatch never leaves the withdrawal stranded in Submitted.
+          Db.transaction {
+            Db.markDispatchFailed(d.payoutIntentId, if giveUp then "failed" else "pending", s"[${err.httpStatus}/${err.code}] ${err.message}")
+            if giveUp then onPermanentFailure(d.withdrawalId)
+          }
           if giveUp then Db.risk("payout_dispatch_failed", d.withdrawalId.toString, s"${err.code}:${err.message}")
           n
     }
