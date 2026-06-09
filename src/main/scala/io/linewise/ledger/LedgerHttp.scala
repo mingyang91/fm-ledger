@@ -259,39 +259,29 @@ class LedgerApi:
     * belt-and-suspenders read — the verified core already guarantees them by construction)
     * and record the run so latest/{runId} can return it. */
   private def runInvariants(): InvariantRunResponse =
-    def drSum(tx: LedgerTx): Long = tx.entries.filter(_.direction == EntryDirection.DR).map(_.amount).sum
-    def crSum(tx: LedgerTx): Long = tx.entries.filter(_.direction == EntryDirection.CR).map(_.amount).sum
-    val all          = Db.allTxs
-    val balancedTxs  = all.forall(tx => tx.entries.nonEmpty && tx.entries.exists(_.direction == EntryDirection.DR) && tx.entries.exists(_.direction == EntryDirection.CR) && tx.entries.forall(_.amount > 0L) && drSum(tx) == crSum(tx))
-    val incentiveExpense = Db.balanceOf(Accounts.IncentiveExpense)
-    val providerPayoutFee = Db.balanceOf(Accounts.ProviderPayoutFee)
-    val adjustment = Db.categoryBalance("adjustment")
-    val users      = Db.categoryBalance("user_liability")
-    val clearing   = Db.categoryBalance("clearing")
-    val settlement = Db.categoryBalance("settlement")
-    val revenue    = Db.categoryBalance("revenue")
-    val funds      = incentiveExpense + providerPayoutFee == users + clearing + settlement + revenue - adjustment
-    val userAccts = all.flatMap(_.entries.map(_.account)).filter(Accounts.isUser).distinct
-    val nonneg = userAccts.forall(a => Db.ledgerBalanceOf(a) >= 0L)
-    val clearingMatches = Db.balanceOf(Accounts.WithdrawalClearing) == Db.pendingWithdrawalClearing
+    val summary = Db.summaryBalances
+    val funds = summary.incentiveExpense + summary.providerPayoutFee == summary.users + summary.clearing + summary.settlement + summary.revenue - summary.adjustment
+    val negativeUsers = Db.negativeUserLedgerAccounts
+    val pendingClearing = Db.pendingWithdrawalClearing
+    val clearingMatches = summary.clearing == pendingClearing
     val drifts = Db.balanceDrifts
-    val collisions = Db.allOpenObligations.filter(o => Db.txBySource(o.sourceKind, o.sourceId).isDefined)
-    val rollbackProposals = Db.allProposals.filter(_.kind == TxKind.RollbackReversal).filter(_.status == ProposalStatus.Approved)
-    val rollbackRefsOk = rollbackProposals.forall(p => p.targetTxId.flatMap(Db.txById).isDefined)
-    val noReversalOfReversal = rollbackProposals.forall(p => p.targetTxId.flatMap(Db.txById).forall(_.kind != TxKind.RollbackReversal))
+    val collisions = Db.sourceCollisions
+    val rollbackRefsOk = Db.approvedRollbackRefsOk
+    val noReversalOfReversal = Db.noReversalOfReversal
     val checks = List(
-      InvariantCheckDto("ledger_balanced", balancedTxs, None),
+      InvariantCheckDto("ledger_balanced", Db.ledgerBalanced, None),
       InvariantCheckDto("funds_invariant", funds,
-        if funds then None else Some(s"incentiveExpense=$incentiveExpense providerPayoutFee=$providerPayoutFee users=$users clearing=$clearing settlement=$settlement revenue=$revenue adjustment=$adjustment")),
-      InvariantCheckDto("user_balance_nonneg", nonneg, None),
+        if funds then None else Some(s"incentiveExpense=${summary.incentiveExpense} providerPayoutFee=${summary.providerPayoutFee} users=${summary.users} clearing=${summary.clearing} settlement=${summary.settlement} revenue=${summary.revenue} adjustment=${summary.adjustment}")),
+      InvariantCheckDto("user_balance_nonneg", negativeUsers.isEmpty,
+        if negativeUsers.isEmpty then None else Some(negativeUsers.mkString(","))),
       InvariantCheckDto("withdrawal_clearing_matches_inflight", clearingMatches,
-        if clearingMatches then None else Some(s"clearing=${Db.balanceOf(Accounts.WithdrawalClearing)} inflight=${Db.pendingWithdrawalClearing}")),
+        if clearingMatches then None else Some(s"clearing=${summary.clearing} inflight=$pendingClearing")),
       InvariantCheckDto("account_balance_matches_replay", drifts.isEmpty,
         if drifts.isEmpty then None else Some(drifts.map(d => s"${d.account}:${d.materialized}/${d.replayed}").mkString(","))),
       InvariantCheckDto("rollback_references_prior_tx", rollbackRefsOk, None),
       InvariantCheckDto("no_reversal_of_reversal", noReversalOfReversal, None),
       InvariantCheckDto("at_most_one_state", collisions.isEmpty,
-        if collisions.isEmpty then None else Some(collisions.map(o => s"${o.sourceKind}:${o.sourceId}").mkString(","))),
+        if collisions.isEmpty then None else Some(collisions.map(c => s"${c.sourceKind}:${c.sourceId}").mkString(","))),
     )
     val resp = InvariantRunResponse(UUID.randomUUID.toString, checks.forall(_.passed), checks)
     invariantRuns.put(resp.runId, resp); latestRun = Some(resp)
@@ -570,7 +560,7 @@ class LedgerApi:
       }),
 
     listAdjustments.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(aservice.all(world).filter(_.kind == TxKind.ManualAdjustment).map(proposalResponse))),
+      Right(Db.proposalsByKind(TxKind.ManualAdjustment).map(proposalResponse))),
 
     getAdjustment.handleSecurity(resolveAdmin).handle(_ => (id: Long) =>
       aservice.get(world, id) match
@@ -624,7 +614,7 @@ class LedgerApi:
         case Left(_)   => Left((StatusCode.NotFound, "transaction not found"))),
 
     listTxs.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(service.all(world).map(txResponse))),
+      Right(Db.allTxs.map(txResponse))),
 
     accountBalance.handleSecurity(resolveAdmin).handle(_ => (account: String) =>
       Right(BalanceResponse(account, Db.balanceOf(account), Db.accountNormalSide(account)))),
@@ -636,15 +626,9 @@ class LedgerApi:
       val a = Accounts.user(uid); Right(BalanceResponse(a, Db.balanceOf(a), Db.accountNormalSide(a)))),
 
     summary.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      val incentiveExpense = Db.balanceOf(Accounts.IncentiveExpense)
-      val providerPayoutFee = Db.balanceOf(Accounts.ProviderPayoutFee)
-      val adjustment = Db.categoryBalance("adjustment")
-      val users = Db.categoryBalance("user_liability")
-      val clearing = Db.categoryBalance("clearing")
-      val settlement = Db.categoryBalance("settlement")
-      val feeRecovery = Db.categoryBalance("revenue")
-      Right(SummaryResponse(incentiveExpense, users, clearing, settlement, adjustment, feeRecovery, providerPayoutFee,
-        fundsInvariantHolds = incentiveExpense + providerPayoutFee == users + clearing + settlement + feeRecovery - adjustment))),
+      val s = Db.summaryBalances
+      Right(SummaryResponse(s.incentiveExpense, s.users, s.clearing, s.settlement, s.adjustment, s.revenue, s.providerPayoutFee,
+        fundsInvariantHolds = s.incentiveExpense + s.providerPayoutFee == s.users + s.clearing + s.settlement + s.revenue - s.adjustment))),
 
     requestWithdrawal.handleSecurity(resolveUser).handle(uid => (req: WithdrawalRequestBody) =>
       Db.withdrawalByClientReq(uid, req.clientRequestId) match
@@ -681,7 +665,7 @@ class LedgerApi:
                     case None     => Left((StatusCode.Conflict, "duplicate_client_request"))),
 
     myWithdrawals.handleSecurity(resolveUser).handle(uid => (_: Unit) =>
-      Right(wservice.all(world).filter(_.userUid == uid).map(withdrawalResponse))),
+      Right(Db.withdrawalsByUser(uid).map(withdrawalResponse))),
 
     cancelWithdrawal.handleSecurity(resolveUser).handle(uid => (in: (Long, DecisionRequest)) =>
       Db.withdrawalById(in._1) match
@@ -701,7 +685,7 @@ class LedgerApi:
               }),
 
     listWithdrawals.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(wservice.all(world).map(withdrawalResponse))),
+      Right(Db.allWithdrawals.map(withdrawalResponse))),
 
     getPayoutIntent.handleSecurity(resolveAdmin).handle(_ => (id: Long) =>
       Db.payoutIntentByWithdrawal(id) match
@@ -804,8 +788,7 @@ class LedgerApi:
       Right(UpcomingExpenseResponse(open.size.toLong, open.map(_.estimatedUnit).sum))),
 
     userTransactions.handleSecurity(resolveAdmin).handle(_ => (uid: String) =>
-      val acct = Accounts.user(uid)
-      Right(service.all(world).filter(t => t.entries.exists(_.account == acct)).map(txResponse))),
+      Right(Db.txsForAccount(Accounts.user(uid)).map(txResponse))),
 
     stripeWebhook.handle((in: (String, String)) => handleStripeWebhook(in._1, in._2)),
 

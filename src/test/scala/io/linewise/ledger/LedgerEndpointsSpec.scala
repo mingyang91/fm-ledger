@@ -3,6 +3,7 @@ package io.linewise.ledger
 import sttp.model.StatusCode
 
 import io.linewise.ledger.LedgerEndpoints as E
+import io.linewise.ledger.generated.LedgerModel.{TxKind, WithdrawalStatus}
 import scala.jdk.CollectionConverters.*
 
 /* =============================================================================
@@ -581,4 +582,43 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(secure(E.invariantById, be, svc, run.runId).body.toOption.get.runId, run.runId)
     val cp = secure(E.proposeConfig, be, svc, ConfigProposalRequest("single_payout_limit_points", "70000", "raise")).body.toOption.get
     assert(secure(E.listConfigProposals, be, svc, ()).body.toOption.get.exists(_.id == cp.id))
+  }
+
+  test("specialized Scala read paths match canonical ledger semantics") {
+    val api = freshApi(); val be = stubOf(api); val alice = api.adminToken("alice"); val bob = api.adminToken("bob"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, alice, CreditRequest("u1", 1000, "annotation_job", "perf-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(250, "perf-w1")).body.toOption.get
+    secure(E.rejectWithdrawal, be, bob, (w.id, DecisionRequest("PendingReview")))
+    secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", AdjustDirection.CREDIT, 100, "perf-adjust"))
+
+    val acct = Accounts.user("u1")
+    val txIdsFromSpecialized = Db.txsForAccount(acct).map(_.id)
+    val txIdsFromCanonical = Db.allTxs.filter(_.entries.exists(_.account == acct)).map(_.id)
+    assertEquals(txIdsFromSpecialized, txIdsFromCanonical)
+
+    val withdrawalsFromSpecialized = Db.withdrawalsByUser("u1").map(wd => wd.id -> wd.status.toString)
+    val withdrawalsFromCanonical = Db.allWithdrawals.filter(_.userUid == "u1").map(wd => wd.id -> wd.status.toString)
+    assertEquals(withdrawalsFromSpecialized, withdrawalsFromCanonical)
+
+    val adjustmentIdsFromSpecialized = Db.proposalsByKind(TxKind.ManualAdjustment).map(_.id)
+    val adjustmentIdsFromCanonical = Db.allProposals.filter(_.kind == TxKind.ManualAdjustment).map(_.id)
+    assertEquals(adjustmentIdsFromSpecialized, adjustmentIdsFromCanonical)
+
+    val summary = Db.summaryBalances
+    assertEquals(summary.incentiveExpense, Db.balanceOf(Accounts.IncentiveExpense))
+    assertEquals(summary.providerPayoutFee, Db.balanceOf(Accounts.ProviderPayoutFee))
+    assertEquals(summary.adjustment, Db.categoryBalance("adjustment"))
+    assertEquals(summary.users, Db.categoryBalance("user_liability"))
+    assertEquals(summary.clearing, Db.categoryBalance("clearing"))
+    assertEquals(summary.settlement, Db.categoryBalance("settlement"))
+    assertEquals(summary.revenue, Db.categoryBalance("revenue"))
+
+    val pendingViaQuery = Db.pendingWithdrawalClearing
+    val pendingViaFilter = Db.allWithdrawals.filter(wd => wd.status == WithdrawalStatus.PendingReview || wd.status == WithdrawalStatus.Submitted).map(_.amount).sum
+    assertEquals(pendingViaQuery, pendingViaFilter)
+
+    assert(Db.ledgerBalanced)
+    assert(Db.negativeUserLedgerAccounts.isEmpty)
+    assert(Db.approvedRollbackRefsOk)
+    assert(Db.noReversalOfReversal)
   }
