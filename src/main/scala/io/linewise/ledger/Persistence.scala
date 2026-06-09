@@ -901,7 +901,14 @@ final class LedgerStore(ds: DataSource):
   def pendingWithdrawalClearing: Long = readOnly {
     sql"""SELECT COALESCE(SUM(W.AMOUNT), 0)
           FROM WITHDRAWAL W
-         WHERE (SELECT SC.TO_STATUS FROM WITHDRAWAL_STATUS_CHANGE SC WHERE SC.WITHDRAWAL_ID = W.ID ORDER BY SC.ID DESC LIMIT 1) IN ('PendingReview', 'Submitted')"""
+         WHERE COALESCE(
+                 (SELECT SC.TO_STATUS
+                    FROM WITHDRAWAL_STATUS_CHANGE SC
+                   WHERE SC.WITHDRAWAL_ID = W.ID
+                   ORDER BY SC.ID DESC
+                   LIMIT 1),
+                 'PendingReview'
+               ) IN ('PendingReview', 'Submitted')"""
       .query[Long].run()(using dbc).head
   }
 
