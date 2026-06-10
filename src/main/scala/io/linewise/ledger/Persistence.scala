@@ -314,6 +314,93 @@ final class LedgerStore(ds: DataSource):
     )
   }
 
+  // ---- PAGED READS (HTTP-facing): keyset pagination by DESCENDING id, bounded to `limit` rows.
+  // The unbounded reads above are kept for the in-process drift gate and the verified-service path,
+  // which compare full state over small test data. Production HTTP must never materialize a whole
+  // table, so every list endpoint reads through one of these instead. `before` is the id of the last
+  // (smallest) row of the previous page; None asks for the newest page. Pages are newest-first.
+  private def kWhere(before: Option[Long]): SqlLiteral =
+    before.map(b => SqlLiteral(s" WHERE ID < $b ")).getOrElse(SqlLiteral(" "))
+  private def kAnd(before: Option[Long]): SqlLiteral =
+    before.map(b => SqlLiteral(s" AND ID < $b ")).getOrElse(SqlLiteral(" "))
+
+  def txPage(limit: Int, before: Option[Long]): List[LedgerTx] = readOnly {
+    assembleTxs(
+      sql"""SELECT T.ID, T.KIND, T.SOURCE_KIND, T.SOURCE_ID, T.USER_UID, E.LINE_NO, E.ACCOUNT_ID, E.DIRECTION, E.AMOUNT
+            FROM LEDGER_TX T
+            JOIN LEDGER_ENTRY E ON E.TX_ID = T.ID
+           WHERE T.ID IN (SELECT ID FROM LEDGER_TX ${kWhere(before)} ORDER BY ID DESC LIMIT $limit)
+           ORDER BY T.ID DESC, E.LINE_NO"""
+        .query[TxFlatRow].run()(using dbc).toList
+    )
+  }
+
+  def txsForAccountPage(account: String, limit: Int, before: Option[Long]): List[LedgerTx] = readOnly {
+    assembleTxs(
+      sql"""SELECT T.ID, T.KIND, T.SOURCE_KIND, T.SOURCE_ID, T.USER_UID, E.LINE_NO, E.ACCOUNT_ID, E.DIRECTION, E.AMOUNT
+            FROM LEDGER_TX T
+            JOIN LEDGER_ENTRY E ON E.TX_ID = T.ID
+           WHERE T.ID IN (
+             SELECT ID FROM LEDGER_TX
+              WHERE EXISTS (SELECT 1 FROM LEDGER_ENTRY U WHERE U.TX_ID = LEDGER_TX.ID AND U.ACCOUNT_ID = $account)
+              ${kAnd(before)}
+              ORDER BY ID DESC LIMIT $limit)
+           ORDER BY T.ID DESC, E.LINE_NO"""
+        .query[TxFlatRow].run()(using dbc).toList
+    )
+  }
+
+  def withdrawalsPage(limit: Int, before: Option[Long]): List[Withdrawal] = readOnly {
+    sql"""SELECT W.ID, W.USER_UID, W.AMOUNT, W.CLIENT_REQUEST_ID, W.RESERVE_TX_ID,
+                 COALESCE(S.TO_STATUS, 'PendingReview')
+            FROM WITHDRAWAL W
+            LEFT JOIN LATERAL (
+              SELECT TO_STATUS FROM WITHDRAWAL_STATUS_CHANGE WHERE WITHDRAWAL_ID = W.ID ORDER BY ID DESC LIMIT 1
+            ) S ON TRUE
+           WHERE W.ID IN (SELECT ID FROM WITHDRAWAL ${kWhere(before)} ORDER BY ID DESC LIMIT $limit)
+           ORDER BY W.ID DESC"""
+      .query[WithdrawalCurrentRow].run()(using dbc).toList.map(toWithdrawal)
+  }
+
+  def withdrawalsByUserPage(userUid: String, limit: Int, before: Option[Long]): List[Withdrawal] = readOnly {
+    sql"""SELECT W.ID, W.USER_UID, W.AMOUNT, W.CLIENT_REQUEST_ID, W.RESERVE_TX_ID,
+                 COALESCE(S.TO_STATUS, 'PendingReview')
+            FROM WITHDRAWAL W
+            LEFT JOIN LATERAL (
+              SELECT TO_STATUS FROM WITHDRAWAL_STATUS_CHANGE WHERE WITHDRAWAL_ID = W.ID ORDER BY ID DESC LIMIT 1
+            ) S ON TRUE
+           WHERE W.ID IN (SELECT ID FROM WITHDRAWAL WHERE USER_UID = $userUid ${kAnd(before)} ORDER BY ID DESC LIMIT $limit)
+           ORDER BY W.ID DESC"""
+      .query[WithdrawalCurrentRow].run()(using dbc).toList.map(toWithdrawal)
+  }
+
+  def proposalsByKindPage(kind: TxKind, limit: Int, before: Option[Long]): List[Proposal] = readOnly {
+    sql"""SELECT P.ID, P.KIND, P.USER_UID, P.DEBIT_ACCOUNT, P.CREDIT_ACCOUNT, P.AMOUNT, P.REASON, P.PROPOSED_BY,
+                 COALESCE(S.TO_STATUS, 'PendingReview'), S.RESULT_TX_ID, P.TARGET_TX_ID
+            FROM PROPOSAL P
+            LEFT JOIN LATERAL (
+              SELECT TO_STATUS, RESULT_TX_ID FROM PROPOSAL_STATUS_CHANGE WHERE PROPOSAL_ID = P.ID ORDER BY ID DESC LIMIT 1
+            ) S ON TRUE
+           WHERE P.ID IN (SELECT ID FROM PROPOSAL WHERE KIND = $kind ${kAnd(before)} ORDER BY ID DESC LIMIT $limit)
+           ORDER BY P.ID DESC"""
+      .query[ProposalCurrentRow].run()(using dbc).toList.map(toProposal)
+  }
+
+  def riskEventsPage(limit: Int, before: Option[Long]): List[RiskEventRecord] = readOnly {
+    sql"SELECT ID, KIND, SUBJECT, DETAIL FROM RISK_EVENT ${kWhere(before)} ORDER BY ID DESC LIMIT $limit"
+      .query[RiskEventRecord].run()(using dbc).toList
+  }
+
+  def auditLogsPage(limit: Int, before: Option[Long]): List[AuditLogRecord] = readOnly {
+    sql"SELECT ID, ACTION, ACTOR, SUBJECT, DETAIL FROM AUDIT_LOG ${kWhere(before)} ORDER BY ID DESC LIMIT $limit"
+      .query[AuditLogRecord].run()(using dbc).toList
+  }
+
+  def configProposalsPage(limit: Int, before: Option[Long]): List[ConfigProposalRecord] = readOnly {
+    sql"SELECT ID, CONFIG_KEY, CONFIG_VALUE, REASON, STATUS, PROPOSED_BY, APPROVED_BY, REJECTED_BY FROM SYSTEM_CONFIG_PROPOSAL ${kWhere(before)} ORDER BY ID DESC LIMIT $limit"
+      .query[ConfigProposalRecord].run()(using dbc).toList
+  }
+
   def balanceOf(account: String): Long = readOnly {
     sql"SELECT BALANCE FROM ACCOUNT_BALANCE WHERE ACCOUNT_ID = $account".query[Long].run()(using dbc).headOption.getOrElse(0L)
   }
@@ -1058,6 +1145,15 @@ object Db:
   def approveConfig(id: Long, approver: String): Either[String, ConfigProposalRecord] = store.approveConfig(id, approver)
   def rejectConfig(id: Long, rejecter: String): Either[String, ConfigProposalRecord] = store.rejectConfig(id, rejecter)
   def allConfigProposals: List[ConfigProposalRecord] = store.allConfigProposals
+  // bounded HTTP-facing reads (keyset by descending id) — see LedgerStore for the contract
+  def txPage(limit: Int, before: Option[Long]): List[LedgerTx] = store.txPage(limit, before)
+  def txsForAccountPage(account: String, limit: Int, before: Option[Long]): List[LedgerTx] = store.txsForAccountPage(account, limit, before)
+  def withdrawalsPage(limit: Int, before: Option[Long]): List[Withdrawal] = store.withdrawalsPage(limit, before)
+  def withdrawalsByUserPage(userUid: String, limit: Int, before: Option[Long]): List[Withdrawal] = store.withdrawalsByUserPage(userUid, limit, before)
+  def proposalsByKindPage(kind: TxKind, limit: Int, before: Option[Long]): List[Proposal] = store.proposalsByKindPage(kind, limit, before)
+  def riskEventsPage(limit: Int, before: Option[Long]): List[RiskEventRecord] = store.riskEventsPage(limit, before)
+  def auditLogsPage(limit: Int, before: Option[Long]): List[AuditLogRecord] = store.auditLogsPage(limit, before)
+  def configProposalsPage(limit: Int, before: Option[Long]): List[ConfigProposalRecord] = store.configProposalsPage(limit, before)
   def setPayoutsEnabled(enabled: Boolean, reason: String, actor: String): Unit = store.setPayoutsEnabled(enabled, reason, actor)
   def setSystemConfig(key: String, value: String, reason: String, actor: String): Unit = store.setSystemConfig(key, value, reason, actor)
   def payoutsEnabled: Boolean = store.payoutsEnabled

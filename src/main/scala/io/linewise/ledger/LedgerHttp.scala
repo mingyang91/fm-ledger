@@ -122,6 +122,18 @@ object LedgerJson:
   given Pickler[ConfigProposalRequest]  = Pickler.derived
   given Pickler[ConfigProposalResponse] = Pickler.derived
 
+/** Pagination bounds for the list endpoints. A request may ask for up to `Max` rows; an absent or
+  * non-positive `limit` falls back to `Default`. `before` is a keyset cursor — the id of the last
+  * (smallest) row of the previous page — and the store reads strictly-smaller ids, newest-first.
+  * Nothing is silently dropped: the client walks the whole set by following the cursor. This bounds
+  * the heap a single request can hold, which is the fix for the unbounded-collection finding. */
+object Paging:
+  val Default = 100
+  val Max = 500
+  def limitOf(requested: Option[Int]): Int = requested match
+    case Some(n) if n > 0 => math.min(n, Max)
+    case _                => Default
+
 /** The BARE endpoints (capability `Any`), shared by server and any typed client. */
 object LedgerEndpoints:
   import LedgerJson.given
@@ -132,7 +144,7 @@ object LedgerEndpoints:
   val incentiveCredit = endpoint.securityIn(bearer).post.in("ledger" / "incentive-credit").in(jsonBody[CreditRequest]).out(jsonBody[TxResponse]).errorOut(errOut)
   // two-person adjustments + reversals
   val proposeAdjustment = endpoint.securityIn(bearer).post.in("adjustments").in(jsonBody[AdjustProposeBody]).out(jsonBody[ProposalResponse]).errorOut(errOut)
-  val listAdjustments   = endpoint.securityIn(bearer).get.in("adjustments").out(jsonBody[List[ProposalResponse]]).errorOut(errOut)
+  val listAdjustments   = endpoint.securityIn(bearer).get.in("adjustments").in(query[Option[Int]]("limit")).in(query[Option[Long]]("before")).out(jsonBody[List[ProposalResponse]]).errorOut(errOut)
   val getAdjustment     = endpoint.securityIn(bearer).get.in("adjustments" / path[Long]("id")).out(jsonBody[ProposalResponse]).errorOut(errOut)
   val approveAdjustment = endpoint.securityIn(bearer).post.in("adjustments" / path[Long]("id") / "approve").in(jsonBody[DecisionRequest]).out(jsonBody[ProposalResponse]).errorOut(errOut)
   val rejectAdjustment  = endpoint.securityIn(bearer).post.in("adjustments" / path[Long]("id") / "reject").in(jsonBody[DecisionRequest]).out(jsonBody[ProposalResponse]).errorOut(errOut)
@@ -140,7 +152,7 @@ object LedgerEndpoints:
   val approveReversal   = endpoint.securityIn(bearer).post.in("rollback-reversals" / path[Long]("id") / "approve").in(jsonBody[DecisionRequest]).out(jsonBody[ProposalResponse]).errorOut(errOut)
   val rejectReversal    = endpoint.securityIn(bearer).post.in("rollback-reversals" / path[Long]("id") / "reject").in(jsonBody[DecisionRequest]).out(jsonBody[ProposalResponse]).errorOut(errOut)
   val getTx           = endpoint.securityIn(bearer).get.in("ledger" / "transactions" / path[Long]("id")).out(jsonBody[TxResponse]).errorOut(errOut)
-  val listTxs         = endpoint.securityIn(bearer).get.in("ledger" / "transactions").out(jsonBody[List[TxResponse]]).errorOut(errOut)
+  val listTxs         = endpoint.securityIn(bearer).get.in("ledger" / "transactions").in(query[Option[Int]]("limit")).in(query[Option[Long]]("before")).out(jsonBody[List[TxResponse]]).errorOut(errOut)
   val accountBalance  = endpoint.securityIn(bearer).get.in("ledger" / "accounts" / path[String]("account") / "balance").out(jsonBody[BalanceResponse]).errorOut(errOut)
   val userBalance     = endpoint.securityIn(bearer).get.in("ledger" / "users" / path[String]("uid") / "balance").out(jsonBody[BalanceResponse]).errorOut(errOut)
   val myBalance       = endpoint.securityIn(bearer).get.in("me" / "balance").out(jsonBody[BalanceResponse]).errorOut(errOut)
@@ -151,9 +163,9 @@ object LedgerEndpoints:
   val getPayoutReconciliation = endpoint.securityIn(bearer).get.in("withdrawals" / path[Long]("id") / "reconciliation").out(jsonBody[PayoutReconciliationResponse]).errorOut(errOut)
   val listProviderEvents = endpoint.securityIn(bearer).get.in("withdrawals" / path[Long]("id") / "provider-events").out(jsonBody[List[ProviderEventResponse]]).errorOut(errOut)
   val requestWithdrawal = endpoint.securityIn(bearer).post.in("me" / "withdrawals").in(jsonBody[WithdrawalRequestBody]).out(jsonBody[WithdrawalResponse]).errorOut(errOut)
-  val myWithdrawals     = endpoint.securityIn(bearer).get.in("me" / "withdrawals").out(jsonBody[List[WithdrawalResponse]]).errorOut(errOut)
+  val myWithdrawals     = endpoint.securityIn(bearer).get.in("me" / "withdrawals").in(query[Option[Int]]("limit")).in(query[Option[Long]]("before")).out(jsonBody[List[WithdrawalResponse]]).errorOut(errOut)
   val cancelWithdrawal  = endpoint.securityIn(bearer).post.in("me" / "withdrawals" / path[Long]("id") / "cancel").in(jsonBody[DecisionRequest]).out(jsonBody[WithdrawalResponse]).errorOut(errOut)
-  val listWithdrawals   = endpoint.securityIn(bearer).get.in("withdrawals").out(jsonBody[List[WithdrawalResponse]]).errorOut(errOut)
+  val listWithdrawals   = endpoint.securityIn(bearer).get.in("withdrawals").in(query[Option[Int]]("limit")).in(query[Option[Long]]("before")).out(jsonBody[List[WithdrawalResponse]]).errorOut(errOut)
   val approveWithdrawal = endpoint.securityIn(bearer).post.in("withdrawals" / path[Long]("id") / "approve").in(jsonBody[DecisionRequest]).out(jsonBody[WithdrawalResponse]).errorOut(errOut)
   val rejectWithdrawal  = endpoint.securityIn(bearer).post.in("withdrawals" / path[Long]("id") / "reject").in(jsonBody[DecisionRequest]).out(jsonBody[WithdrawalResponse]).errorOut(errOut)
   val settleWithdrawal  = endpoint.securityIn(bearer).post.in("withdrawals" / path[Long]("id") / "settle").in(jsonBody[DecisionRequest]).out(jsonBody[WithdrawalResponse]).errorOut(errOut)
@@ -166,17 +178,17 @@ object LedgerEndpoints:
   val upcomingExpense  = endpoint.securityIn(bearer).get.in("ledger" / "upcoming-expense").out(jsonBody[UpcomingExpenseResponse]).errorOut(errOut)
 
   // per-user transactions, Stripe payout webhook, risk/config/audit, and invariant runs
-  val userTransactions = endpoint.securityIn(bearer).get.in("ledger" / "users" / path[String]("uid") / "transactions").out(jsonBody[List[TxResponse]]).errorOut(errOut)
+  val userTransactions = endpoint.securityIn(bearer).get.in("ledger" / "users" / path[String]("uid") / "transactions").in(query[Option[Int]]("limit")).in(query[Option[Long]]("before")).out(jsonBody[List[TxResponse]]).errorOut(errOut)
   // Public (no bearer): the Stripe-Signature header IS the auth. Raw stringBody is required so the
   // HMAC is computed over the exact bytes Stripe sent (a JSON re-serialize would break the signature).
   val stripeWebhook    = endpoint.post.in("stripe" / "webhook").in(header[String]("Stripe-Signature")).in(stringBody).out(jsonBody[WebhookAck]).errorOut(errOut)
-  val riskEvents       = endpoint.securityIn(bearer).get.in("risk" / "events").out(jsonBody[List[RiskEventResponse]]).errorOut(errOut)
-  val auditLog         = endpoint.securityIn(bearer).get.in("audit-log").out(jsonBody[List[AuditLogResponse]]).errorOut(errOut)
+  val riskEvents       = endpoint.securityIn(bearer).get.in("risk" / "events").in(query[Option[Int]]("limit")).in(query[Option[Long]]("before")).out(jsonBody[List[RiskEventResponse]]).errorOut(errOut)
+  val auditLog         = endpoint.securityIn(bearer).get.in("audit-log").in(query[Option[Int]]("limit")).in(query[Option[Long]]("before")).out(jsonBody[List[AuditLogResponse]]).errorOut(errOut)
   val configCurrent    = endpoint.securityIn(bearer).get.in("system" / "config").out(jsonBody[List[ConfigEntryResponse]]).errorOut(errOut)
   val proposeConfig    = endpoint.securityIn(bearer).post.in("system" / "config" / "proposals").in(jsonBody[ConfigProposalRequest]).out(jsonBody[ConfigProposalResponse]).errorOut(errOut)
   val approveConfig    = endpoint.securityIn(bearer).post.in("system" / "config" / "proposals" / path[Long]("id") / "approve").out(jsonBody[ConfigProposalResponse]).errorOut(errOut)
   val rejectConfig     = endpoint.securityIn(bearer).post.in("system" / "config" / "proposals" / path[Long]("id") / "reject").out(jsonBody[ConfigProposalResponse]).errorOut(errOut)
-  val listConfigProposals = endpoint.securityIn(bearer).get.in("system" / "config" / "proposals").out(jsonBody[List[ConfigProposalResponse]]).errorOut(errOut)
+  val listConfigProposals = endpoint.securityIn(bearer).get.in("system" / "config" / "proposals").in(query[Option[Int]]("limit")).in(query[Option[Long]]("before")).out(jsonBody[List[ConfigProposalResponse]]).errorOut(errOut)
   val invariantsCheck  = endpoint.securityIn(bearer).post.in("invariants" / "check").out(jsonBody[InvariantRunResponse]).errorOut(errOut)
   val invariantsLatest = endpoint.securityIn(bearer).get.in("invariants" / "latest").out(jsonBody[InvariantRunResponse]).errorOut(errOut)
   val invariantById    = endpoint.securityIn(bearer).get.in("invariants" / path[String]("runId")).out(jsonBody[InvariantRunResponse]).errorOut(errOut)
@@ -559,8 +571,8 @@ class LedgerApi:
           case Left(e)  => Left(pErr(e))
       }),
 
-    listAdjustments.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(Db.proposalsByKind(TxKind.ManualAdjustment).map(proposalResponse))),
+    listAdjustments.handleSecurity(resolveAdmin).handle(_ => (q: (Option[Int], Option[Long])) =>
+      Right(Db.proposalsByKindPage(TxKind.ManualAdjustment, Paging.limitOf(q._1), q._2).map(proposalResponse))),
 
     getAdjustment.handleSecurity(resolveAdmin).handle(_ => (id: Long) =>
       aservice.get(world, id) match
@@ -613,8 +625,8 @@ class LedgerApi:
         case Right(tx) => Right(txResponse(tx))
         case Left(_)   => Left((StatusCode.NotFound, "transaction not found"))),
 
-    listTxs.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(Db.allTxs.map(txResponse))),
+    listTxs.handleSecurity(resolveAdmin).handle(_ => (q: (Option[Int], Option[Long])) =>
+      Right(Db.txPage(Paging.limitOf(q._1), q._2).map(txResponse))),
 
     accountBalance.handleSecurity(resolveAdmin).handle(_ => (account: String) =>
       Right(BalanceResponse(account, Db.balanceOf(account), Db.accountNormalSide(account)))),
@@ -664,8 +676,8 @@ class LedgerApi:
                     case Some(wd) => Right(withdrawalResponse(wd))
                     case None     => Left((StatusCode.Conflict, "duplicate_client_request"))),
 
-    myWithdrawals.handleSecurity(resolveUser).handle(uid => (_: Unit) =>
-      Right(Db.withdrawalsByUser(uid).map(withdrawalResponse))),
+    myWithdrawals.handleSecurity(resolveUser).handle(uid => (q: (Option[Int], Option[Long])) =>
+      Right(Db.withdrawalsByUserPage(uid, Paging.limitOf(q._1), q._2).map(withdrawalResponse))),
 
     cancelWithdrawal.handleSecurity(resolveUser).handle(uid => (in: (Long, DecisionRequest)) =>
       Db.withdrawalById(in._1) match
@@ -684,8 +696,8 @@ class LedgerApi:
                   case Left(e)   => Left(wErr(e))
               }),
 
-    listWithdrawals.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(Db.allWithdrawals.map(withdrawalResponse))),
+    listWithdrawals.handleSecurity(resolveAdmin).handle(_ => (q: (Option[Int], Option[Long])) =>
+      Right(Db.withdrawalsPage(Paging.limitOf(q._1), q._2).map(withdrawalResponse))),
 
     getPayoutIntent.handleSecurity(resolveAdmin).handle(_ => (id: Long) =>
       Db.payoutIntentByWithdrawal(id) match
@@ -787,16 +799,16 @@ class LedgerApi:
       val open = Db.allOpenObligations
       Right(UpcomingExpenseResponse(open.size.toLong, open.map(_.estimatedUnit).sum))),
 
-    userTransactions.handleSecurity(resolveAdmin).handle(_ => (uid: String) =>
-      Right(Db.txsForAccount(Accounts.user(uid)).map(txResponse))),
+    userTransactions.handleSecurity(resolveAdmin).handle(_ => (in: (String, Option[Int], Option[Long])) =>
+      Right(Db.txsForAccountPage(Accounts.user(in._1), Paging.limitOf(in._2), in._3).map(txResponse))),
 
     stripeWebhook.handle((in: (String, String)) => handleStripeWebhook(in._1, in._2)),
 
-    riskEvents.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(Db.riskEvents.map(riskResponse))),
+    riskEvents.handleSecurity(resolveAdmin).handle(_ => (q: (Option[Int], Option[Long])) =>
+      Right(Db.riskEventsPage(Paging.limitOf(q._1), q._2).map(riskResponse))),
 
-    auditLog.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(Db.auditLogs.map(auditResponse))),
+    auditLog.handleSecurity(resolveAdmin).handle(_ => (q: (Option[Int], Option[Long])) =>
+      Right(Db.auditLogsPage(Paging.limitOf(q._1), q._2).map(auditResponse))),
 
     configCurrent.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
       Right(Db.configEntries.map(configEntryResponse))),
@@ -817,8 +829,8 @@ class LedgerApi:
         case Left("status_conflict") => Left((StatusCode.Conflict, "status_conflict"))
         case Left(_)                 => Left((StatusCode.NotFound, "config proposal not found"))),
 
-    listConfigProposals.handleSecurity(resolveAdmin).handle(_ => (_: Unit) =>
-      Right(Db.allConfigProposals.map(configProposalResponse))),
+    listConfigProposals.handleSecurity(resolveAdmin).handle(_ => (q: (Option[Int], Option[Long])) =>
+      Right(Db.configProposalsPage(Paging.limitOf(q._1), q._2).map(configProposalResponse))),
 
     invariantsCheck.handleSecurity(resolveAdmin).handle(_ => (_: Unit) => Right(runInvariants())),
 

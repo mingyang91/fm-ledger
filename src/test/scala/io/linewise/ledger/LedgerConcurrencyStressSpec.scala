@@ -77,7 +77,7 @@ class LedgerConcurrencyStressSpec extends LedgerHttpSuite {
     assertEquals(ok.get, 3)
     assertEquals(rejected.get, 5)
     assertEquals(Db.pendingWithdrawalClearing, 900L)
-    assertEquals(secure(E.myWithdrawals, be, uTok, ()).body.toOption.get.count(w => w.status == "PendingReview"), 3)
+    assertEquals(secure(E.myWithdrawals, be, uTok, (None, None)).body.toOption.get.count(w => w.status == "PendingReview"), 3)
     assert(secure(E.invariantsCheck, be, admin, ()).body.toOption.get.allPassed)
   }
 

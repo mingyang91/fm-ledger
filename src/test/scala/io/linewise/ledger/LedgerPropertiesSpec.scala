@@ -57,7 +57,7 @@ class LedgerPropertiesSpec extends LedgerHttpSuite with LedgerGen with LedgerDif
       assertEquals(second.code, StatusCode.Ok)
       assertEquals(second.body.toOption.get.id, tx1.id)
       assertEquals(secure(E.userBalance, be, svc, uid.value).body.toOption.get.balancePoints, amount.value)
-      assert(secure(E.auditLog, be, svc, ()).body.toOption.get.exists(_.detail.contains(trace.value)))
+      assert(secure(E.auditLog, be, svc, (None, None)).body.toOption.get.exists(_.detail.contains(trace.value)))
     }
   }
 
@@ -112,7 +112,7 @@ class LedgerPropertiesSpec extends LedgerHttpSuite with LedgerGen with LedgerDif
       val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val user = api.userToken(uid.value)
       val r = secure(E.incentiveCredit, be, svc, CreditRequest(uid.value, huge.value, source.kind, source.id, Some("t"), Some("incentives")))
       assertEquals(r.code, StatusCode.UnprocessableEntity)
-      assert(secure(E.riskEvents, be, svc, ()).body.toOption.get.exists(_.kind == "single_ledger_amount"))
+      assert(secure(E.riskEvents, be, svc, (None, None)).body.toOption.get.exists(_.kind == "single_ledger_amount"))
       // kill switch tripped: fund a small balance, then a withdrawal is unavailable
       secure(E.incentiveCredit, be, svc, CreditRequest(uid.value, 1000, source.kind, source.id + "-ok"))
       assertEquals(secure(E.requestWithdrawal, be, user, WithdrawalRequestBody(1, "after")).code, StatusCode.ServiceUnavailable)

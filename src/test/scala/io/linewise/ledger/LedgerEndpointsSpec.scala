@@ -71,8 +71,43 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     val api = freshApi(); val be = stubOf(api); val tok = api.adminToken("svc")
     val tx = secure(E.incentiveCredit, be, tok, CreditRequest("u1", 700, "annotation_job", "job-3")).body.toOption.get
     assertEquals(secure(E.getTx, be, tok, tx.id).body.toOption.get.id, tx.id)
-    assert(secure(E.listTxs, be, tok, ()).body.toOption.get.nonEmpty)
+    assert(secure(E.listTxs, be, tok, (None, None)).body.toOption.get.nonEmpty)
     assertEquals(secure(E.getTx, be, tok, 999999L).code, StatusCode.NotFound)
+  }
+
+  test("list endpoints are bounded: a page caps at the limit and the cursor walks the whole set without loss") {
+    val api = freshApi(); val be = stubOf(api); val tok = api.adminToken("svc")
+    // seed five transactions (the newest has the largest id)
+    val ids = (1 to 5).map(i =>
+      secure(E.incentiveCredit, be, tok, CreditRequest("u1", 100, "annotation_job", s"job-page-$i")).body.toOption.get.id
+    ).toList
+    assertEquals(ids.distinct.size, 5)
+
+    // a bounded page never returns the whole table: limit 2 over 5 rows yields 2 rows, newest-first
+    val p1 = secure(E.listTxs, be, tok, (Some(2), None)).body.toOption.get
+    assertEquals(p1.size, 2)
+    assertEquals(p1.map(_.id), p1.map(_.id).sorted.reverse) // descending id (newest first)
+
+    // keyset cursor: each page reads strictly-smaller ids than the previous page's last row
+    val p2 = secure(E.listTxs, be, tok, (Some(2), Some(p1.last.id))).body.toOption.get
+    assertEquals(p2.size, 2)
+    assert(p2.forall(_.id < p1.last.id))
+    val p3 = secure(E.listTxs, be, tok, (Some(2), Some(p2.last.id))).body.toOption.get
+    assertEquals(p3.size, 1)
+
+    // walking the cursor reconstructs the full set exactly: no overlap, nothing dropped
+    val walked = (p1 ++ p2 ++ p3).map(_.id)
+    assertEquals(walked.distinct.size, walked.size)
+    assertEquals(walked.toSet, ids.toSet)
+
+    // the default page still bounds, and returns all five here since 5 < the default page size
+    assertEquals(secure(E.listTxs, be, tok, (None, None)).body.toOption.get.size, 5)
+
+    // limit clamping: absent / non-positive falls back to the default; over-max clamps to the max
+    assertEquals(Paging.limitOf(None), Paging.Default)
+    assertEquals(Paging.limitOf(Some(0)), Paging.Default)
+    assertEquals(Paging.limitOf(Some(Paging.Max + 1000)), Paging.Max)
+    assertEquals(Paging.limitOf(Some(2)), 2)
   }
 
   test("withdrawal lifecycle: reserve -> approve -> settle moves clearing to cash; over-balance and stale status are refused") {
@@ -120,7 +155,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(tx.amountPoints, 1500L)
     assertEquals(tx.sourceKind, Some("incentive_event"))
     assertEquals(tx.sourceId, Some("evt-1"))
-    assert(secure(E.auditLog, be, svc, ()).body.toOption.get.exists(log =>
+    assert(secure(E.auditLog, be, svc, (None, None)).body.toOption.get.exists(log =>
       log.action == "ledger.incentive_credit" && log.detail.contains("price-run-1")))
   }
 
@@ -131,14 +166,14 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(secure(E.approveConfig, be, bob, cp.id).body.toOption.get.status, "Approved")
     val cfg = secure(E.configCurrent, be, bob, ()).body.toOption.get
     assert(cfg.exists(c => c.key == "single_payout_limit_points" && c.value == "60000"))
-    assert(secure(E.auditLog, be, bob, ()).body.toOption.get.exists(_.action == "config.approve"))
+    assert(secure(E.auditLog, be, bob, (None, None)).body.toOption.get.exists(_.action == "config.approve"))
   }
 
   test("risk hard limits reject runaway credits and trip the payout kill switch") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
     assertEquals(secure(E.incentiveCredit, be, svc,
       CreditRequest("u1", 150000, "incentive_event", "huge", Some("risk-price-run"), Some("incentives"))).code, StatusCode.UnprocessableEntity)
-    assert(secure(E.riskEvents, be, svc, ()).body.toOption.get.exists(_.kind == "single_ledger_amount"))
+    assert(secure(E.riskEvents, be, svc, (None, None)).body.toOption.get.exists(_.kind == "single_ledger_amount"))
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "post-risk-fund"))
     assertEquals(secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(1, "after-risk")).code, StatusCode.ServiceUnavailable)
   }
@@ -292,7 +327,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, None)))
     PayoutDispatcher(FailingGateway(retryable = false)).tick()
     assertEquals(Db.dispatchByWithdrawal(w.id).map(_.status), Some("failed"))
-    assert(secure(E.riskEvents, be, svc, ()).body.toOption.get.exists(_.kind == "payout_dispatch_failed"))
+    assert(secure(E.riskEvents, be, svc, (None, None)).body.toOption.get.exists(_.kind == "payout_dispatch_failed"))
   }
 
   test("payout dispatcher: a transient gateway error leaves the row pending for retry") {
@@ -358,7 +393,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(Db.withdrawalById(w.id).map(_.status.toString), Some("Failed"))
     assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 1000L) // reserve refunded
     assertEquals(secure(E.accountBalance, be, svc, "system:withdrawal_clearing").body.toOption.get.balancePoints, 0L)
-    assert(secure(E.riskEvents, be, svc, ()).body.toOption.get.exists(_.kind == "payout_dispatch_failed"))
+    assert(secure(E.riskEvents, be, svc, (None, None)).body.toOption.get.exists(_.kind == "payout_dispatch_failed"))
   }
 
   test("#5: the webhook observed fee (minor units) is converted to points before posting/reconciling (ratio != 1)") {
@@ -533,8 +568,8 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     val w2 = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(200, "wr-2")).body.toOption.get
     assertEquals(secure(E.cancelWithdrawal, be, uTok, (w2.id, DecisionRequest("PendingReview"))).body.toOption.get.status, "Cancelled")
     assertEquals(secure(E.myBalance, be, uTok, ()).body.toOption.get.balancePoints, 1000L)
-    assertEquals(secure(E.myWithdrawals, be, uTok, ()).body.toOption.get.size, 2)
-    assertEquals(secure(E.listWithdrawals, be, svc, ()).body.toOption.get.size, 2)
+    assertEquals(secure(E.myWithdrawals, be, uTok, (None, None)).body.toOption.get.size, 2)
+    assertEquals(secure(E.listWithdrawals, be, svc, (None, None)).body.toOption.get.size, 2)
   }
 
   test("webhook failed outcome returns the reserve to the user (the refund leg), cash untouched") {
@@ -561,7 +596,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     val api = freshApi(); val be = stubOf(api); val alice = api.adminToken("alice"); val bob = api.adminToken("bob")
     secure(E.incentiveCredit, be, alice, CreditRequest("u1", 1000, "annotation_job", "adj-fund"))
     val p = secure(E.proposeAdjustment, be, alice, AdjustProposeBody("u1", AdjustDirection.CREDIT, 100, "bonus")).body.toOption.get
-    assert(secure(E.listAdjustments, be, alice, ()).body.toOption.get.exists(_.id == p.id))
+    assert(secure(E.listAdjustments, be, alice, (None, None)).body.toOption.get.exists(_.id == p.id))
     assertEquals(secure(E.getAdjustment, be, alice, p.id).body.toOption.get.id, p.id)
     assertEquals(secure(E.rejectAdjustment, be, bob, (p.id, DecisionRequest("PendingReview"))).body.toOption.get.status, "Rejected")
     assertEquals(secure(E.approveAdjustment, be, alice, (p.id, DecisionRequest("PendingReview"))).code, StatusCode.Conflict)
@@ -571,7 +606,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
   test("submit, user-transactions, obligation cancel, invariants run, and config-proposal listing") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "sub-fund"))
-    assert(secure(E.userTransactions, be, svc, "u1").body.toOption.get.nonEmpty)
+    assert(secure(E.userTransactions, be, svc, ("u1", None, None)).body.toOption.get.nonEmpty)
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "sub-1")).body.toOption.get
     assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 15, 285, Some("quote-sub"), Some("tr-sub")))).body.toOption.get.status, "Submitted")
     secure(E.openObligation, be, svc, ObligationOpenBody("annotation_job", "ob-x", "u2", 500))
@@ -581,7 +616,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(secure(E.invariantsLatest, be, svc, ()).body.toOption.get.runId, run.runId)
     assertEquals(secure(E.invariantById, be, svc, run.runId).body.toOption.get.runId, run.runId)
     val cp = secure(E.proposeConfig, be, svc, ConfigProposalRequest("single_payout_limit_points", "70000", "raise")).body.toOption.get
-    assert(secure(E.listConfigProposals, be, svc, ()).body.toOption.get.exists(_.id == cp.id))
+    assert(secure(E.listConfigProposals, be, svc, (None, None)).body.toOption.get.exists(_.id == cp.id))
   }
 
   test("specialized Scala read paths match canonical ledger semantics") {
