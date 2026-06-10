@@ -16,6 +16,10 @@ permanent one (4xx) or exhausted attempts flips it to `failed` and raises a `pay
 risk event. Because the call is outside any DB transaction and keyed for idempotency, a crash or a
 double tick never double-pays.
 
+Submit callers must not supply a provider transfer reference. The `tr_…` is created by the
+dispatcher and written back only after Stripe accepts the transfer; accepting one at submit time
+would mix the "already paid" and outbox-created paths.
+
 **Inbound (real webhook).** `POST /stripe/webhook` is public — the `Stripe-Signature` header is the
 auth, verified by `StripeSignature.verify` (HMAC-SHA256 over `"{t}.{rawBody}"`, 300 s tolerance,
 multiple `v1=` accepted for secret rotation). The raw body is taken as `stringBody` so the bytes

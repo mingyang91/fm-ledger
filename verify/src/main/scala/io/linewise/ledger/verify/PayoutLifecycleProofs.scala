@@ -17,7 +17,7 @@ object PayoutLifecycleProofs {
   enum DispatchStatus { case Pending, InFlight, Dispatched, Failed }
   enum ProviderOutcome { case Settled, Failed }
   enum ReconciliationResult { case Matched, FeeVariance }
-  enum PayoutError { case MissingWithdrawal, MissingIntent, StatusConflict, BadQuote, BadFee, IdempotencyConflict, DuplicateEvent }
+  enum PayoutError { case MissingWithdrawal, MissingIntent, StatusConflict, BadQuote, BadFee, BadTransferRef, IdempotencyConflict, DuplicateEvent }
 
   case class PayoutSubmit(
       expectedStatus: WithdrawalStatus,
@@ -26,7 +26,8 @@ object PayoutLifecycleProofs {
       quotedFee: FMLong,
       expectedNet: FMLong,
       amountMinor: FMLong,
-      idempotencyKey: String)
+      idempotencyKey: String,
+      providerTransferRef: Option[String])
 
   case class PayoutIntent(
       id: FMLong,
@@ -292,20 +293,22 @@ object PayoutLifecycleProofs {
     findWithdrawal(w.withdrawals, withdrawalId) match
       case None() => (w, Left[PayoutError, PayoutIntent](PayoutError.MissingWithdrawal))
       case Some(wd) =>
-        findIntentByWithdrawal(w.intents, withdrawalId) match
-          case Some(existing) =>
-            if intentMatches(wd, req, existing) then (w, Right[PayoutError, PayoutIntent](existing))
-            else (w, Left[PayoutError, PayoutIntent](PayoutError.IdempotencyConflict))
-          case None() =>
-            if !quoteValid(wd, req) then (w, Left[PayoutError, PayoutIntent](PayoutError.BadQuote))
-            else if wd.status != req.expectedStatus || wd.status != WithdrawalStatus.PendingReview then
-              (w, Left[PayoutError, PayoutIntent](PayoutError.StatusConflict))
-            else
-              val wd2 = wd.copy(status = WithdrawalStatus.Submitted)
-              val intent = PayoutIntent(freshIntentId, wd.id, wd.userUid, req.provider, req.destinationId, wd.amount, req.quotedFee, req.expectedNet, None[String]())
-              val dispatch = PayoutDispatch(freshIntentId, wd.id, req.amountMinor, req.idempotencyKey, DispatchStatus.Pending, BigInt(0), None[String]())
-              (w.copy(withdrawals = putWithdrawal(w.withdrawals, wd2), intents = intent :: w.intents, dispatches = dispatch :: w.dispatches),
-                Right[PayoutError, PayoutIntent](intent))
+        if !req.providerTransferRef.isEmpty then (w, Left[PayoutError, PayoutIntent](PayoutError.BadTransferRef))
+        else
+          findIntentByWithdrawal(w.intents, withdrawalId) match
+            case Some(existing) =>
+              if intentMatches(wd, req, existing) then (w, Right[PayoutError, PayoutIntent](existing))
+              else (w, Left[PayoutError, PayoutIntent](PayoutError.IdempotencyConflict))
+            case None() =>
+              if !quoteValid(wd, req) then (w, Left[PayoutError, PayoutIntent](PayoutError.BadQuote))
+              else if wd.status != req.expectedStatus || wd.status != WithdrawalStatus.PendingReview then
+                (w, Left[PayoutError, PayoutIntent](PayoutError.StatusConflict))
+              else
+                val wd2 = wd.copy(status = WithdrawalStatus.Submitted)
+                val intent = PayoutIntent(freshIntentId, wd.id, wd.userUid, req.provider, req.destinationId, wd.amount, req.quotedFee, req.expectedNet, None[String]())
+                val dispatch = PayoutDispatch(freshIntentId, wd.id, req.amountMinor, req.idempotencyKey, DispatchStatus.Pending, BigInt(0), None[String]())
+                (w.copy(withdrawals = putWithdrawal(w.withdrawals, wd2), intents = intent :: w.intents, dispatches = dispatch :: w.dispatches),
+                  Right[PayoutError, PayoutIntent](intent))
 
   def claim(w: PayoutWorld, intentId: FMLong): PayoutWorld =
     findDispatch(w.dispatches, intentId) match
@@ -388,14 +391,22 @@ object PayoutLifecycleProofs {
 
   def submitBadQuoteLeavesWorldUnchanged(w: PayoutWorld, wd: Withdrawal, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
     require(findIntentByWithdrawal(w.intents, wd.id).isEmpty)
+    require(req.providerTransferRef.isEmpty)
     require(!quoteValid(wd, req))
     val w0 = w.copy(withdrawals = putWithdrawal(w.withdrawals, wd))
     submit(w0, wd.id, req, freshIntentId) == (w0, Left[PayoutError, PayoutIntent](PayoutError.BadQuote))
   }.holds
 
+  def submitWithProviderTransferRefRejected(w: PayoutWorld, wd: Withdrawal, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
+    require(!req.providerTransferRef.isEmpty)
+    val w0 = w.copy(withdrawals = putWithdrawal(w.withdrawals, wd))
+    submit(w0, wd.id, req, freshIntentId) == (w0, Left[PayoutError, PayoutIntent](PayoutError.BadTransferRef))
+  }.holds
+
   def submitSuccessCreatesIntentAndDispatch(w: PayoutWorld, wd: Withdrawal, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
     require(wd.status == WithdrawalStatus.PendingReview)
     require(quoteValid(wd, req))
+    require(req.providerTransferRef.isEmpty)
     require(req.expectedStatus == WithdrawalStatus.PendingReview)
     val w0 = w.copy(withdrawals = putWithdrawal(w.withdrawals, wd), intents = Nil[PayoutIntent](), dispatches = Nil[PayoutDispatch]())
     val (w1, res) = submit(w0, wd.id, req, freshIntentId)
@@ -409,6 +420,7 @@ object PayoutLifecycleProofs {
   }.holds
 
   def submitExistingSameIntentIsIdempotent(w: PayoutWorld, withdrawalId: FMLong, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
+    require(req.providerTransferRef.isEmpty)
     require(findWithdrawal(w.withdrawals, withdrawalId) match
       case Some(wd) => findIntentByWithdrawal(w.intents, withdrawalId) match
         case Some(intent) => intentMatches(wd, req, intent)
@@ -418,6 +430,7 @@ object PayoutLifecycleProofs {
   }.holds
 
   def submitExistingDifferentIntentConflicts(w: PayoutWorld, withdrawalId: FMLong, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
+    require(req.providerTransferRef.isEmpty)
     require(findWithdrawal(w.withdrawals, withdrawalId) match
       case Some(wd) => findIntentByWithdrawal(w.intents, withdrawalId) match
         case Some(intent) => !intentMatches(wd, req, intent)
@@ -427,6 +440,7 @@ object PayoutLifecycleProofs {
   }.holds
 
   def submitDifferentPayloadConflictLeavesWorldUnchanged(w: PayoutWorld, withdrawalId: FMLong, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
+    require(req.providerTransferRef.isEmpty)
     require(findWithdrawal(w.withdrawals, withdrawalId) match
       case Some(wd) => findIntentByWithdrawal(w.intents, withdrawalId) match
         case Some(intent) => !intentMatches(wd, req, intent)
@@ -437,7 +451,7 @@ object PayoutLifecycleProofs {
 
   def submitWrongStatusLeavesWorldUnchanged(w: PayoutWorld, withdrawalId: FMLong, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
     require(findWithdrawal(w.withdrawals, withdrawalId) match
-      case Some(wd) => quoteValid(wd, req) && (wd.status != req.expectedStatus || wd.status != WithdrawalStatus.PendingReview)
+      case Some(wd) => quoteValid(wd, req) && req.providerTransferRef.isEmpty && (wd.status != req.expectedStatus || wd.status != WithdrawalStatus.PendingReview)
       case _        => false)
     require(findIntentByWithdrawal(w.intents, withdrawalId).isEmpty)
     submit(w, withdrawalId, req, freshIntentId) == (w, Left[PayoutError, PayoutIntent](PayoutError.StatusConflict))
@@ -446,6 +460,7 @@ object PayoutLifecycleProofs {
   def submitSuccessHasExactDelta(w: PayoutWorld, wd: Withdrawal, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
     require(wd.status == WithdrawalStatus.PendingReview)
     require(quoteValid(wd, req))
+    require(req.providerTransferRef.isEmpty)
     require(req.expectedStatus == WithdrawalStatus.PendingReview)
     require(findIntentByWithdrawal(w.intents, wd.id).isEmpty)
     val w0 = w.copy(withdrawals = putWithdrawal(w.withdrawals, wd))
@@ -458,6 +473,7 @@ object PayoutLifecycleProofs {
   def submitPreservesLedgerRows(w: PayoutWorld, wd: Withdrawal, req: PayoutSubmit, freshIntentId: FMLong): Boolean = {
     require(wd.status == WithdrawalStatus.PendingReview)
     require(quoteValid(wd, req))
+    require(req.providerTransferRef.isEmpty)
     require(req.expectedStatus == WithdrawalStatus.PendingReview)
     require(findIntentByWithdrawal(w.intents, wd.id).isEmpty)
     val w0 = w.copy(withdrawals = putWithdrawal(w.withdrawals, wd))

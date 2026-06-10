@@ -731,6 +731,7 @@ class LedgerApi:
       parseWStatus(in._2.expectedStatus) match
         case None => Left(statusConflict)
         case Some(es) if !supportedProviders.contains(in._2.provider) => Left((StatusCode.BadRequest, "unsupported_provider"))
+        case Some(_) if in._2.providerTransferRef.nonEmpty => Left((StatusCode.BadRequest, "provider_transfer_ref_not_allowed"))
         case Some(es) =>
           Db.transaction {
             Db.withdrawalById(in._1) match
@@ -750,7 +751,7 @@ class LedgerApi:
                       case Right(amountMinor) =>
                         Db.asActor(admin) { wservice.approve(world, in._1, es)._2 } match
                           case Right(w2) =>
-                            val intent = PayoutIntentRecord(Db.nextId(), wd.id, wd.userUid, in._2.provider, in._2.routeCode, in._2.destinationId, wd.amount, in._2.quotedProviderFee, in._2.expectedRecipientNet, in._2.quoteRef, in._2.providerTransferRef)
+                            val intent = PayoutIntentRecord(Db.nextId(), wd.id, wd.userUid, in._2.provider, in._2.routeCode, in._2.destinationId, wd.amount, in._2.quotedProviderFee, in._2.expectedRecipientNet, in._2.quoteRef, None)
                             Db.payoutIntentPut(intent)
                             // Outbox: the dispatcher transfers the recipient's NET to the provider account.
                             Db.payoutDispatchPut(PayoutDispatchRecord(intent.id, wd.id, intent.provider, intent.destinationId, amountMinor, Db.payoutCurrency, s"wd-${wd.id}-intent-${intent.id}", "pending", 0, None, None))

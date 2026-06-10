@@ -272,6 +272,18 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     assertEquals(mis.code, StatusCode.BadRequest); assertEquals(mis.body.swap.toOption.get._2, "quote_mismatch")
   }
 
+  test("submit rejects caller-supplied providerTransferRef before creating intent or dispatch") {
+    val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
+    secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "ref-fund"))
+    val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "ref-cr")).body.toOption.get
+    val res = secure(E.submitWithdrawal, be, svc,
+      (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 20, 280, None, Some("tr_external"))))
+    assertEquals(res.code, StatusCode.BadRequest)
+    assertEquals(res.body.swap.toOption.get._2, "provider_transfer_ref_not_allowed")
+    assertEquals(Db.payoutIntentByWithdrawal(w.id), None)
+    assertEquals(Db.dispatchByWithdrawal(w.id), None)
+  }
+
   test("submit is atomic on status conflict and detects idempotency conflicts") {
     val api = freshApi(); val be = stubOf(api); val svc = api.adminToken("svc"); val uTok = api.userToken("u1")
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "idem-fund"))
@@ -608,7 +620,7 @@ class LedgerEndpointsSpec extends LedgerHttpSuite:
     secure(E.incentiveCredit, be, svc, CreditRequest("u1", 1000, "annotation_job", "sub-fund"))
     assert(secure(E.userTransactions, be, svc, ("u1", None, None)).body.toOption.get.nonEmpty)
     val w = secure(E.requestWithdrawal, be, uTok, WithdrawalRequestBody(300, "sub-1")).body.toOption.get
-    assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 15, 285, Some("quote-sub"), Some("tr-sub")))).body.toOption.get.status, "Submitted")
+    assertEquals(secure(E.submitWithdrawal, be, svc, (w.id, PayoutSubmitRequest("PendingReview", "stripe", "stripe_standard", "acct-1", 15, 285, Some("quote-sub"), None))).body.toOption.get.status, "Submitted")
     secure(E.openObligation, be, svc, ObligationOpenBody("annotation_job", "ob-x", "u2", 500))
     assertEquals(secure(E.cancelObligation, be, svc, ObligationCancelBody("annotation_job", "ob-x")).body.toOption.get.status, "Cancelled")
     val run = secure(E.invariantsCheck, be, svc, ()).body.toOption.get
