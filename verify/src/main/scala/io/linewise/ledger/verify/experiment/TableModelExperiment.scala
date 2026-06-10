@@ -130,4 +130,66 @@ object TableModelExperiment {
     balancedStableUnderFreshLegs(w.headers, w.legs, newLegs, h.id)
     tableAllBalanced(tPost(w, h, newLegs))
   }.holds
+
+  // =========================================================================
+  // B3 — the AGGREGATION-OVER-JOIN proof: a per-tx grouped scan equals the flat scan, i.e. the
+  // join query returns the correct account total. This is the frontier the user cares about for
+  // production reads. Direct-recursion sums (no foldLeft-shift lemmas) + nested induction.
+  // =========================================================================
+  def contrib(l: LegRow, account: String): BigInt =
+    if l.account == account then (if l.dir == DR then l.amount else -l.amount) else BigInt(0)
+  def acctTotal(legs: List[LegRow], account: String): BigInt = legs match
+    case Nil()      => BigInt(0)
+    case Cons(l, t) => contrib(l, account) + acctTotal(t, account)
+  def sumOverHeaders(headers: List[HeaderRow], legs: List[LegRow], account: String): BigInt = headers match
+    case Nil()      => BigInt(0)
+    case Cons(h, t) => acctTotal(legsOf(legs, h.id), account) + sumOverHeaders(t, legs, account)
+  def distinctIds(hs: List[HeaderRow]): Boolean = hs match
+    case Nil()      => true
+    case Cons(h, t) => !headerIds(t).contains(h.id) && distinctIds(t)
+
+  def accountTotalFlat(w: TWorld, account: String): BigInt = acctTotal(w.legs, account)
+  def accountTotalViaJoin(w: TWorld, account: String): BigInt = sumOverHeaders(w.headers, w.legs, account)
+
+  @induct def sumOverHeadersEmpty(headers: List[HeaderRow], account: String): Unit = { () }
+    .ensuring(_ => sumOverHeaders(headers, Nil[LegRow](), account) == BigInt(0))
+
+  // a leg whose txId matches NO header changes no bucket
+  def sumOverHeadersConsMiss(headers: List[HeaderRow], l: LegRow, ls: List[LegRow], account: String): Unit = {
+    require(!headerIds(headers).contains(l.txId))
+    headers match
+      case Nil()      => ()
+      case Cons(h, t) => sumOverHeadersConsMiss(t, l, ls, account)
+  }.ensuring(_ => sumOverHeaders(headers, l :: ls, account) == sumOverHeaders(headers, ls, account))
+
+  // a leg whose txId matches a (unique, by distinctIds) header adds exactly its contribution
+  def sumOverHeadersConsHit(headers: List[HeaderRow], l: LegRow, ls: List[LegRow], account: String): Unit = {
+    require(distinctIds(headers))
+    require(headerIds(headers).contains(l.txId))
+    headers match
+      case Nil()      => ()
+      case Cons(h, t) =>
+        if h.id == l.txId then sumOverHeadersConsMiss(t, l, ls, account)
+        else sumOverHeadersConsHit(t, l, ls, account)
+  }.ensuring(_ => sumOverHeaders(headers, l :: ls, account) == contrib(l, account) + sumOverHeaders(headers, ls, account))
+
+  // MAIN: grouped (join) sum == flat sum, given PK distinctness + referential integrity.
+  def joinEqualsFlat(headers: List[HeaderRow], legs: List[LegRow], account: String): Unit = {
+    require(distinctIds(headers))
+    require(allRefOk(legs, headerIds(headers)))
+    legs match
+      case Nil()      => sumOverHeadersEmpty(headers, account)
+      case Cons(l, ls) =>
+        sumOverHeadersConsHit(headers, l, ls, account)
+        joinEqualsFlat(headers, ls, account)
+  }.ensuring(_ => sumOverHeaders(headers, legs, account) == acctTotal(legs, account))
+
+  // PROOF B3 (the join query is correct): only valid WITH the PK-distinctness invariant that the
+  // aggregate model gives for free; run 1 showed it INVALID (duplicate ids double-count) without it.
+  def joinSumEqualsFlatSum(w: TWorld, account: String): Boolean = {
+    require(distinctIds(w.headers))
+    require(refIntegrity(w))
+    joinEqualsFlat(w.headers, w.legs, account)
+    accountTotalViaJoin(w, account) == accountTotalFlat(w, account)
+  }.holds
 }
