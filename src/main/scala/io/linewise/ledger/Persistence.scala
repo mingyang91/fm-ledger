@@ -103,11 +103,14 @@ final class LedgerStore(ds: DataSource):
     if current.isBound then body
     else connect(transactor) { (c0: DbCon) ?=> scoped(c0)(body) }
 
-  // Up to 3 retries (4 attempts total: go(0) initial + go(1..3)) before the failure propagates.
+  // Up to 5 retries (6 attempts total) with a tiny linear backoff. Under hot SERIALIZABLE
+  // contention, immediately re-running the same statement can recreate the same pivot/deadlock.
   private def retryOnSerialization[A](body: => A): A =
     def go(attempt: Int): A =
       try body
-      catch case e: SqlException if attempt < 3 && isSerializationFailure(e) => go(attempt + 1)
+      catch case e: Throwable if attempt < 5 && isSerializationFailure(e) =>
+        java.util.concurrent.locks.LockSupport.parkNanos((attempt.toLong + 1L) * 5_000_000L)
+        go(attempt + 1)
     go(0)
 
   private def isSerializationFailure(t: Throwable): Boolean =
