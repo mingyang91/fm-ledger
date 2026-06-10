@@ -47,11 +47,11 @@ object `package` extends SbtModule {
   def ledgerVerifiedSources: T[Seq[PathRef]] =
     val base = moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "ledger" / "verify"
     Task.Sources(
-      base / "LedgerModel.scala", base / "Has.scala", base / "World.scala",
-      base / "LedgerRepository.scala", base / "LedgerValidation.scala", base / "LedgerService.scala",
-      base / "WithdrawalRepository.scala", base / "WithdrawalService.scala",
-      base / "ProposalRepository.scala", base / "AdjustmentService.scala",
-      base / "ObligationRepository.scala", base / "ObligationService.scala",
+      base / "LedgerModel.scala", base / "Has.scala", base / "Tables.scala",
+      base / "LedgerTables.scala", base / "LedgerValidation.scala", base / "LedgerService.scala",
+      base / "WithdrawalTables.scala", base / "WithdrawalService.scala",
+      base / "ProposalTables.scala", base / "AdjustmentService.scala",
+      base / "ObligationTables.scala", base / "ObligationService.scala",
     )
 
   /** Run the transpiler over the verified executable core and emit production

@@ -4,56 +4,52 @@ import stainless.lang._
 import stainless.collection._
 import io.linewise.verify.effect.FMLong
 import LedgerModel._
+import ObligationTables._
 
 /* =============================================================================
- * OBLIGATION SERVICE — verified open/cancel/realize over the obligation slice.
- *   open    -> insert an `open` row; idempotent replay; REFUSE a terminal source
- *   cancel  -> open -> cancelled (or a tombstone for an unknown source, so a late
- *              open is refused); REFUSE cancelling a realized source
- *   realize -> upsert a `realized` row (flips an open row, or lands directly when the
- *              credit beat the publish) — called on the credit path so the source
- *              leaves "upcoming" once it mints. The cross-entity credit+realize
- *              atomicity is a production concern; here the lifecycle is verified.
+ * OBLIGATION SERVICE — open/cancel/realize over the DB's composite-key OBLIGATION table, through the
+ * single Has[W, DB] lens and the obligation store. Terminal states are sticky; open is idempotent.
  * ========================================================================== */
-case class ObligationService[W](oLens: Has[W, ObligationRepository]) {
+case class ObligationService[W](has: Has[W, DB], store: ObligationStore) {
 
   def open(
       w: W, sourceKind: String, sourceId: String, userUid: String, role: String,
-      projectRef: String, taskKind: String, estimatedUnit: FMLong): (W, Either[LedgerError, Obligation]) =
-    // #P2-b: an open obligation feeds the upcoming-expense forecast, so its estimate must be positive;
-    // a non-positive estimate is rejected rather than skewing the projection. (realize may still land a
-    // terminal 0-estimate row when a credit beats the publish — that row is never summed into the forecast.)
+      projectRef: String, taskKind: String, estimatedUnit: FMLong): (W, Either[LedgerError, Obligation]) = {
+    val db = has.get(w)
     if !(estimatedUnit > FMLong(BigInt(0))) then (w, Left[LedgerError, Obligation](NonPositiveAmount))
-    else oLens.get(w).bySource(sourceKind, sourceId) match
+    else store.bySource(db, sourceKind, sourceId) match
       case Some(o) =>
         if o.status != ObligationStatus.Open then (w, Left[LedgerError, Obligation](SourceTerminal))
-        else (w, Right[LedgerError, Obligation](o))   // idempotent replay
+        else (w, Right[LedgerError, Obligation](o))
       case _ =>
         val o = Obligation(sourceKind, sourceId, userUid, role, projectRef, taskKind, estimatedUnit, ObligationStatus.Open, None[FMLong]())
-        (oLens(w).write((r: ObligationRepository) => r.put(o)), Right[LedgerError, Obligation](o))
+        (has(w).write((d: DB) => store.put(d, o)), Right[LedgerError, Obligation](o))
+  }
 
-  def cancel(w: W, sourceKind: String, sourceId: String): (W, Either[LedgerError, Obligation]) =
-    oLens.get(w).bySource(sourceKind, sourceId) match
+  def cancel(w: W, sourceKind: String, sourceId: String): (W, Either[LedgerError, Obligation]) = {
+    val db = has.get(w)
+    store.bySource(db, sourceKind, sourceId) match
       case Some(o) =>
         if o.status == ObligationStatus.Realized then (w, Left[LedgerError, Obligation](SourceTerminal))
         else
           val o2 = o.copy(status = ObligationStatus.Cancelled, realizedTxId = None[FMLong]())
-          (oLens(w).write((r: ObligationRepository) => r.put(o2)), Right[LedgerError, Obligation](o2))
+          (has(w).write((d: DB) => store.put(d, o2)), Right[LedgerError, Obligation](o2))
       case _ =>
         val o = Obligation(sourceKind, sourceId, "", "", "", "", FMLong(BigInt(0)), ObligationStatus.Cancelled, None[FMLong]())
-        (oLens(w).write((r: ObligationRepository) => r.put(o)), Right[LedgerError, Obligation](o))
+        (has(w).write((d: DB) => store.put(d, o)), Right[LedgerError, Obligation](o))
+  }
 
-  /** Mark a source realized (the credit minted). Flips an open row or lands a terminal
-    * realized row directly when the credit arrived before the obligation was opened. */
   def realize(
       w: W, sourceKind: String, sourceId: String, userUid: String, role: String,
-      projectRef: String, taskKind: String, estimatedUnit: FMLong, txId: FMLong): (W, Obligation) =
-    val o2 = oLens.get(w).bySource(sourceKind, sourceId) match
+      projectRef: String, taskKind: String, estimatedUnit: FMLong, txId: FMLong): (W, Obligation) = {
+    val db = has.get(w)
+    val o2 = store.bySource(db, sourceKind, sourceId) match
       case Some(o) if o.status == ObligationStatus.Cancelled => o
       case Some(o) => o.copy(status = ObligationStatus.Realized, realizedTxId = Some[FMLong](txId))
       case _       => Obligation(sourceKind, sourceId, userUid, role, projectRef, taskKind, estimatedUnit, ObligationStatus.Realized, Some[FMLong](txId))
-    (oLens(w).write((r: ObligationRepository) => r.put(o2)), o2)
+    (has(w).write((d: DB) => store.put(d, o2)), o2)
+  }
 
-  def bySource(w: W, kind: String, id: String): Option[Obligation] = oLens.get(w).bySource(kind, id)
-  def openObligations(w: W): List[Obligation] = oLens.get(w).allOpen
+  def bySource(w: W, kind: String, id: String): Option[Obligation] = store.bySource(has.get(w), kind, id)
+  def openObligations(w: W): List[Obligation] = store.allOpen(has.get(w))
 }

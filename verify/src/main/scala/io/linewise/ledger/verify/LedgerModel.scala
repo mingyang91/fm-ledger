@@ -27,9 +27,14 @@ object LedgerModel {
 
   case class LedgerEntry(account: String, direction: EntryDirection, amount: FMLong)
 
+  // recursion via isEmpty/head/tail (not `case Nil()/Cons()`) so it transpiles clean — the transpiler
+  // does not rewrite List patterns, and direct recursion (not foldLeft) keeps the conservation proof simple.
   def sumDirection(entries: List[LedgerEntry], direction: EntryDirection): BigInt =
-    entries.foldLeft(BigInt(0))((acc: BigInt, e: LedgerEntry) =>
-      if e.direction == direction then acc + e.amount.value else acc)
+    if entries.isEmpty then BigInt(0)
+    else {
+      val rest = sumDirection(entries.tail, direction)
+      if entries.head.direction == direction then rest + entries.head.amount.value else rest
+    }
 
   def hasDirection(entries: List[LedgerEntry], direction: EntryDirection): Boolean =
     entries.exists((e: LedgerEntry) => e.direction == direction)

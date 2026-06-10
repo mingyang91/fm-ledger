@@ -4,31 +4,34 @@ import stainless.lang._
 import stainless.collection._
 import io.linewise.verify.effect.FMLong
 import LedgerModel._
+import LedgerTables._
+import WithdrawalTables._
 
 /* =============================================================================
- * Withdrawal lifecycle over the ledger + withdrawal status slices. Standard reserve/
- * return/settle paths still post canonical two-leg txs. `transitionOnly` is exposed so
- * the production shell can settle a payout with a richer posting group (for example a
- * multi-entry fee-aware settlement) and then advance the status in the same DB tx.
+ * Withdrawal lifecycle over the DB's ledger + withdrawal tables, through the single Has[W, DB] lens
+ * and the ledger/withdrawal stores. A request posts a reserve tx and adds a withdrawal row + initial
+ * status; transitions prepend a status row (and, for settle/fail/reject/cancel, post the matching
+ * balanced tx). "Current status" is read by the latest-row join in the store.
  * ========================================================================== */
-case class WithdrawalService[W](ledgerLens: Has[W, LedgerRepository], wLens: Has[W, WithdrawalRepository]) {
+case class WithdrawalService[W](has: Has[W, DB], lstore: LedgerStore, wstore: WithdrawalStore) {
 
   def request(
       w: W, userUid: String, amount: FMLong, clientRequestId: String,
       freshWid: FMLong, freshTxId: FMLong, userAccount: String, clearingAccount: String)
-      : (W, Either[LedgerError, Withdrawal]) =
-    wLens.get(w).findByClientReq(userUid, clientRequestId) match
+      : (W, Either[LedgerError, Withdrawal]) = {
+    val db = has.get(w)
+    wstore.findByClientReq(db, userUid, clientRequestId) match
       case Some(existing) => (w, Right[LedgerError, Withdrawal](existing))
       case _ =>
         if !(amount > FMLong(BigInt(0))) then (w, Left[LedgerError, Withdrawal](NonPositiveAmount))
-        else if !ledgerLens.get(w).get(freshTxId).isEmpty then (w, Left[LedgerError, Withdrawal](DuplicateTxId))
+        else if !lstore.get(db, freshTxId).isEmpty then (w, Left[LedgerError, Withdrawal](DuplicateTxId))
         else
           val reserveTx = twoLegTx(freshTxId, TxKind.WithdrawalReserve, userAccount, clearingAccount, amount,
             None[String](), None[String](), userUid)
-          val w1 = ledgerLens(w).write((r: LedgerRepository) => r.post(reserveTx))
           val wd = Withdrawal(freshWid, userUid, amount, WithdrawalStatus.PendingReview, clientRequestId, freshTxId)
-          val w2 = wLens(w1).write((r: WithdrawalRepository) => r.put(wd))
-          (w2, Right[LedgerError, Withdrawal](wd))
+          val w1 = has(w).write((d: DB) => wstore.addWithdrawal(lstore.post(d, reserveTx), wd))
+          (w1, Right[LedgerError, Withdrawal](wd))
+  }
 
   def approve(w: W, id: FMLong, expectedStatus: WithdrawalStatus): (W, Either[LedgerError, Withdrawal]) =
     transitionOnly(w, id, expectedStatus, WithdrawalStatus.PendingReview, WithdrawalStatus.Submitted)
@@ -51,39 +54,41 @@ case class WithdrawalService[W](ledgerLens: Has[W, LedgerRepository], wLens: Has
 
   def transitionOnly(
       w: W, id: FMLong, expectedStatus: WithdrawalStatus, requiredFrom: WithdrawalStatus, toStatus: WithdrawalStatus)
-      : (W, Either[LedgerError, Withdrawal]) =
-    wLens.get(w).get(id) match
+      : (W, Either[LedgerError, Withdrawal]) = {
+    val db = has.get(w)
+    wstore.get(db, id) match
       case Some(wd) =>
         if wd.status != expectedStatus || wd.status != requiredFrom then
           (w, Left[LedgerError, Withdrawal](StatusConflict))
         else
-          val wd2 = wd.copy(status = toStatus)
-          (wLens(w).write((r: WithdrawalRepository) => r.put(wd2)), Right[LedgerError, Withdrawal](wd2))
+          (has(w).write((d: DB) => wstore.transition(d, id, toStatus)),
+            Right[LedgerError, Withdrawal](wd.copy(status = toStatus)))
       case _ => (w, Left[LedgerError, Withdrawal](WithdrawalNotFound))
+  }
 
   private def moveAndSet(
       w: W, id: FMLong, expectedStatus: WithdrawalStatus, requiredFrom: WithdrawalStatus, txKind: TxKind, toStatus: WithdrawalStatus,
-      freshTxId: FMLong, debitAccount: String, creditAccount: String): (W, Either[LedgerError, Withdrawal]) =
-    wLens.get(w).get(id) match
+      freshTxId: FMLong, debitAccount: String, creditAccount: String): (W, Either[LedgerError, Withdrawal]) = {
+    val db = has.get(w)
+    wstore.get(db, id) match
       case Some(wd) =>
         if wd.status != expectedStatus || wd.status != requiredFrom then
           (w, Left[LedgerError, Withdrawal](StatusConflict))
         else if !(wd.amount > FMLong(BigInt(0))) then
           (w, Left[LedgerError, Withdrawal](NonPositiveAmount))
-        else if !ledgerLens.get(w).get(freshTxId).isEmpty then
+        else if !lstore.get(db, freshTxId).isEmpty then
           (w, Left[LedgerError, Withdrawal](DuplicateTxId))
         else
           val tx = twoLegTx(freshTxId, txKind, debitAccount, creditAccount, wd.amount, None[String](), None[String](), wd.userUid)
-          val w1 = ledgerLens(w).write((r: LedgerRepository) => r.post(tx))
-          val wd2 = wd.copy(status = toStatus)
-          val w2 = wLens(w1).write((r: WithdrawalRepository) => r.put(wd2))
-          (w2, Right[LedgerError, Withdrawal](wd2))
+          val w1 = has(w).write((d: DB) => wstore.transition(lstore.post(d, tx), id, toStatus))
+          (w1, Right[LedgerError, Withdrawal](wd.copy(status = toStatus)))
       case _ => (w, Left[LedgerError, Withdrawal](WithdrawalNotFound))
+  }
 
   def get(w: W, id: FMLong): Either[LedgerError, Withdrawal] =
-    wLens.get(w).get(id) match
+    wstore.get(has.get(w), id) match
       case Some(wd) => Right[LedgerError, Withdrawal](wd)
       case _        => Left[LedgerError, Withdrawal](WithdrawalNotFound)
 
-  def all(w: W): List[Withdrawal] = wLens.get(w).all
+  def all(w: W): List[Withdrawal] = wstore.all(has.get(w))
 }

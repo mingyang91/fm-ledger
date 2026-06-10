@@ -11,7 +11,11 @@ import sttp.tapir.json.pickler.*
 import sttp.tapir.server.ServerEndpoint
 
 import io.linewise.ledger.generated.LedgerModel.*
-import io.linewise.ledger.generated.{World, HasLedger, HasWithdrawals, HasProposals, HasObligations, LedgerService, WithdrawalService, AdjustmentService, ObligationService, JdbcLedgerRepository, JdbcWithdrawalRepository, JdbcProposalRepository, JdbcObligationRepository, Withdrawal, Proposal, Obligation}
+import io.linewise.ledger.generated.{World, HasDb, DB, LedgerService, WithdrawalService, AdjustmentService, ObligationService, Withdrawal, Proposal, Obligation}
+import io.linewise.ledger.generated.LedgerTables.JdbcLedgerStore
+import io.linewise.ledger.generated.WithdrawalTables.JdbcWithdrawalStore
+import io.linewise.ledger.generated.ProposalTables.JdbcProposalStore
+import io.linewise.ledger.generated.ObligationTables.JdbcObligationStore
 
 // Thrown inside a webhook `Db.transaction` to force a rollback when the settle/fail
 // transition fails, so the provider-event dedup row is NOT persisted and the event stays
@@ -202,11 +206,12 @@ class LedgerApi:
 
   // The JDBC-backed world: field-less repositories delegate to the ambient `Db`
   // facade (bind it with Db.init(ds) before serving). The service is generated.
-  private val world    = World(JdbcLedgerRepository(), JdbcWithdrawalRepository(), JdbcProposalRepository(), JdbcObligationRepository())
-  private val service  = LedgerService[World](HasLedger())
-  private val wservice = WithdrawalService[World](HasLedger(), HasWithdrawals())
-  private val aservice = AdjustmentService[World](HasLedger(), HasProposals())
-  private val oservice = ObligationService[World](HasObligations())
+  private val world    = World(DB.empty)
+  private val ledgerStore = JdbcLedgerStore()
+  private val service  = LedgerService[World](HasDb(), ledgerStore)
+  private val wservice = WithdrawalService[World](HasDb(), ledgerStore, JdbcWithdrawalStore())
+  private val aservice = AdjustmentService[World](HasDb(), ledgerStore, JdbcProposalStore())
+  private val oservice = ObligationService[World](HasDb(), JdbcObligationStore())
   private val invariantRuns = ConcurrentHashMap[String, InvariantRunResponse]()
   @volatile private var latestRun: Option[InvariantRunResponse] = None
 

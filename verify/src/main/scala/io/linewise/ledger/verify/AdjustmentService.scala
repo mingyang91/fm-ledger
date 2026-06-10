@@ -4,33 +4,39 @@ import stainless.lang._
 import stainless.collection._
 import io.linewise.verify.effect.FMLong
 import LedgerModel._
+import LedgerTables._
+import ProposalTables._
 
 /* =============================================================================
- * Two-person manual adjustments and rollback reversals. Proposals stay scalar/two-leg
- * for now; approval materializes them as a LedgerTx whose core can now support many
- * entries even though this service still emits canonical two-leg postings.
+ * Two-person manual adjustments and rollback reversals over the DB's ledger + proposal tables.
+ * Propose adds a proposal row + initial status; approve posts the materialized tx and records an
+ * Approved status (with the result tx id); reject records a Rejected status. Through the single
+ * Has[W, DB] lens and the ledger/proposal stores.
  * ========================================================================== */
-case class AdjustmentService[W](ledgerLens: Has[W, LedgerRepository], pLens: Has[W, ProposalRepository]) {
+case class AdjustmentService[W](has: Has[W, DB], lstore: LedgerStore, pstore: ProposalStore) {
 
   def propose(
       w: W, kind: TxKind, userUid: String, debitAccount: String, creditAccount: String,
       amount: FMLong, reason: String, proposedBy: String, freshPid: FMLong,
-      targetTxId: Option[FMLong]): (W, Either[LedgerError, Proposal]) =
+      targetTxId: Option[FMLong]): (W, Either[LedgerError, Proposal]) = {
+    val db = has.get(w)
     if !(amount > FMLong(BigInt(0))) then (w, Left[LedgerError, Proposal](NonPositiveAmount))
-    else if alreadyReversed(pLens.get(w), kind, targetTxId) then
+    else if alreadyReversed(db, kind, targetTxId) then
       (w, Left[LedgerError, Proposal](AlreadyReversed))
     else
       val p = Proposal(freshPid, kind, userUid, debitAccount, creditAccount, amount, reason, proposedBy,
         ProposalStatus.PendingReview, None[FMLong](), targetTxId)
-      (pLens(w).write((r: ProposalRepository) => r.put(p)), Right[LedgerError, Proposal](p))
+      (has(w).write((d: DB) => pstore.propose(d, p)), Right[LedgerError, Proposal](p))
+  }
 
-  def alreadyReversed(repo: ProposalRepository, kind: TxKind, targetTxId: Option[FMLong]): Boolean =
+  def alreadyReversed(db: DB, kind: TxKind, targetTxId: Option[FMLong]): Boolean =
     kind == TxKind.RollbackReversal && (targetTxId match
-      case Some(t) => repo.all.exists((p: Proposal) => p.targetTxId == Some[FMLong](t) && p.status != ProposalStatus.Rejected)
+      case Some(t) => pstore.all(db).exists((p: Proposal) => p.targetTxId == Some[FMLong](t) && p.status != ProposalStatus.Rejected)
       case _       => false)
 
-  def approve(w: W, id: FMLong, expectedStatus: ProposalStatus, approver: String, freshTxId: FMLong): (W, Either[LedgerError, Proposal]) =
-    pLens.get(w).get(id) match
+  def approve(w: W, id: FMLong, expectedStatus: ProposalStatus, approver: String, freshTxId: FMLong): (W, Either[LedgerError, Proposal]) = {
+    val db = has.get(w)
+    pstore.get(db, id) match
       case Some(p) =>
         if p.status != expectedStatus || p.status != ProposalStatus.PendingReview then
           (w, Left[LedgerError, Proposal](StatusConflict))
@@ -38,29 +44,31 @@ case class AdjustmentService[W](ledgerLens: Has[W, LedgerRepository], pLens: Has
           (w, Left[LedgerError, Proposal](TwoPersonViolation))
         else if !(p.amount > FMLong(BigInt(0))) then
           (w, Left[LedgerError, Proposal](NonPositiveAmount))
-        else if !ledgerLens.get(w).get(freshTxId).isEmpty then
+        else if !lstore.get(db, freshTxId).isEmpty then
           (w, Left[LedgerError, Proposal](DuplicateTxId))
         else
           val tx = twoLegTx(freshTxId, p.kind, p.debitAccount, p.creditAccount, p.amount, None[String](), None[String](), p.userUid)
-          val w1 = ledgerLens(w).write((r: LedgerRepository) => r.post(tx))
-          val p2 = p.copy(status = ProposalStatus.Approved, resultTxId = Some[FMLong](freshTxId))
-          (pLens(w1).write((r: ProposalRepository) => r.put(p2)), Right[LedgerError, Proposal](p2))
+          val w1 = has(w).write((d: DB) => pstore.decide(lstore.post(d, tx), id, ProposalStatus.Approved, Some[FMLong](freshTxId)))
+          (w1, Right[LedgerError, Proposal](p.copy(status = ProposalStatus.Approved, resultTxId = Some[FMLong](freshTxId))))
       case _ => (w, Left[LedgerError, Proposal](ProposalNotFound))
+  }
 
-  def reject(w: W, id: FMLong, expectedStatus: ProposalStatus): (W, Either[LedgerError, Proposal]) =
-    pLens.get(w).get(id) match
+  def reject(w: W, id: FMLong, expectedStatus: ProposalStatus): (W, Either[LedgerError, Proposal]) = {
+    val db = has.get(w)
+    pstore.get(db, id) match
       case Some(p) =>
         if p.status != expectedStatus || p.status != ProposalStatus.PendingReview then
           (w, Left[LedgerError, Proposal](StatusConflict))
         else
-          val p2 = p.copy(status = ProposalStatus.Rejected)
-          (pLens(w).write((r: ProposalRepository) => r.put(p2)), Right[LedgerError, Proposal](p2))
+          (has(w).write((d: DB) => pstore.decide(d, id, ProposalStatus.Rejected, None[FMLong]())),
+            Right[LedgerError, Proposal](p.copy(status = ProposalStatus.Rejected)))
       case _ => (w, Left[LedgerError, Proposal](ProposalNotFound))
+  }
 
   def get(w: W, id: FMLong): Either[LedgerError, Proposal] =
-    pLens.get(w).get(id) match
+    pstore.get(has.get(w), id) match
       case Some(p) => Right[LedgerError, Proposal](p)
       case _       => Left[LedgerError, Proposal](ProposalNotFound)
 
-  def all(w: W): List[Proposal] = pLens.get(w).all
+  def all(w: W): List[Proposal] = pstore.all(has.get(w))
 }

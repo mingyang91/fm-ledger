@@ -4,8 +4,7 @@ import org.scalacheck.Prop.forAll
 import sttp.model.StatusCode
 
 import io.linewise.ledger.LedgerEndpoints as E
-import io.linewise.ledger.generated.{World, JdbcLedgerRepository, JdbcWithdrawalRepository, JdbcProposalRepository, JdbcObligationRepository}
-import io.linewise.ledger.generated.{InMemLedgerRepository, InMemWithdrawalRepository, InMemProposalRepository, InMemObligationRepository}
+import io.linewise.ledger.generated.{World, DB}
 
 class LedgerPropertiesSpec extends LedgerHttpSuite with LedgerGen with LedgerDiffGen:
   override val scalaCheckTestParameters: org.scalacheck.Test.Parameters =
@@ -21,27 +20,27 @@ class LedgerPropertiesSpec extends LedgerHttpSuite with LedgerGen with LedgerDif
       val ds = freshDs("ldiff")
       val c0 = ds.getConnection(); try Jdbc.initSchema(c0) finally c0.close()
       Db.init(ds)
-      val jdbcW = World(JdbcLedgerRepository(), JdbcWithdrawalRepository(), JdbcProposalRepository(), JdbcObligationRepository())
-      var memW: World = World(InMemLedgerRepository(Nil), InMemWithdrawalRepository(Nil), InMemProposalRepository(Nil), InMemObligationRepository(Nil))
+      val jdbcW = World(DB.empty)
+      var memW: World = World(DB.empty)
       var counter = 0L
       def fresh(): Long = { counter += 1; counter }
       ops.foreach { op =>
         val n = freshIdCount(op)
         val a = if n >= 1 then fresh() else 0L
         val b = if n >= 2 then fresh() else 0L
-        val (mw, mr) = applyOp(op, memW, a, b); memW = mw
-        val (_, jr) = applyOp(op, jdbcW, a, b)
+        val (mw, mr) = applyOp(op, memSvcs, memW, a, b); memW = mw
+        val (_, jr) = applyOp(op, jdbcSvcs, jdbcW, a, b)
         assert(mr == jr, s"verdict diverged on $op (ids a=$a b=$b):\n  mem  = $mr\n  jdbc = $jr")
       }
-      assertEquals(ledgerSvc.all(memW).sortBy(_.id), ledgerSvc.all(jdbcW).sortBy(_.id), "ledger txs diverged")
-      assertEquals(wSvc.all(memW).sortBy(_.id), wSvc.all(jdbcW).sortBy(_.id), "withdrawals diverged")
-      assertEquals(aSvc.all(memW).sortBy(_.id), aSvc.all(jdbcW).sortBy(_.id), "proposals diverged")
+      assertEquals(memSvcs.ledgerSvc.all(memW).sortBy(_.id), jdbcSvcs.ledgerSvc.all(jdbcW).sortBy(_.id), "ledger txs diverged")
+      assertEquals(memSvcs.wSvc.all(memW).sortBy(_.id), jdbcSvcs.wSvc.all(jdbcW).sortBy(_.id), "withdrawals diverged")
+      assertEquals(memSvcs.aSvc.all(memW).sortBy(_.id), jdbcSvcs.aSvc.all(jdbcW).sortBy(_.id), "proposals diverged")
       assertEquals(
-        oSvc.openObligations(memW).sortBy(o => (o.sourceKind, o.sourceId)),
-        oSvc.openObligations(jdbcW).sortBy(o => (o.sourceKind, o.sourceId)),
+        memSvcs.oSvc.openObligations(memW).sortBy(o => (o.sourceKind, o.sourceId)),
+        jdbcSvcs.oSvc.openObligations(jdbcW).sortBy(o => (o.sourceKind, o.sourceId)),
         "open obligations diverged")
       List(("job", "s1"), ("job", "s2")).foreach { (sk, si) =>
-        assertEquals(oSvc.bySource(memW, sk, si), oSvc.bySource(jdbcW, sk, si), s"obligation $sk:$si diverged")
+        assertEquals(memSvcs.oSvc.bySource(memW, sk, si), jdbcSvcs.oSvc.bySource(jdbcW, sk, si), s"obligation $sk:$si diverged")
       }
     }
   }

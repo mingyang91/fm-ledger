@@ -2,8 +2,12 @@ package io.linewise.ledger
 
 import org.scalacheck.Gen
 
-import io.linewise.ledger.generated.{World, HasLedger, HasWithdrawals, HasProposals, HasObligations}
+import io.linewise.ledger.generated.{World, HasDb, DB}
 import io.linewise.ledger.generated.{LedgerService, WithdrawalService, AdjustmentService, ObligationService}
+import io.linewise.ledger.generated.LedgerTables.{InMemLedgerStore, JdbcLedgerStore}
+import io.linewise.ledger.generated.WithdrawalTables.{InMemWithdrawalStore, JdbcWithdrawalStore}
+import io.linewise.ledger.generated.ProposalTables.{InMemProposalStore, JdbcProposalStore}
+import io.linewise.ledger.generated.ObligationTables.{InMemObligationStore, JdbcObligationStore}
 import io.linewise.ledger.generated.LedgerModel.{TxKind, WithdrawalStatus, ProposalStatus}
 
 /* =============================================================================
@@ -35,10 +39,30 @@ trait LedgerDiffGen:
     case RejectP(target: Long, exp: ProposalStatus)
   import LedgerOp.*
 
-  protected val ledgerSvc = LedgerService[World](HasLedger())
-  protected val wSvc      = WithdrawalService[World](HasLedger(), HasWithdrawals())
-  protected val aSvc      = AdjustmentService[World](HasLedger(), HasProposals())
-  protected val oSvc      = ObligationService[World](HasObligations())
+  // The realization now lives in the STORE (a service arg), not the World, so the InMem oracle and
+  // the JDBC realization are two service sets sharing the World shape: memSvcs operate on a
+  // materialized DB carried in the World; jdbcSvcs ignore the (empty) DB and hit the production Db.
+  protected class Svcs(
+      val ledgerSvc: LedgerService[World],
+      val wSvc:      WithdrawalService[World],
+      val aSvc:      AdjustmentService[World],
+      val oSvc:      ObligationService[World])
+
+  protected val memSvcs: Svcs =
+    val ls = InMemLedgerStore()
+    Svcs(
+      LedgerService[World](HasDb(), ls),
+      WithdrawalService[World](HasDb(), ls, InMemWithdrawalStore()),
+      AdjustmentService[World](HasDb(), ls, InMemProposalStore()),
+      ObligationService[World](HasDb(), InMemObligationStore()))
+
+  protected val jdbcSvcs: Svcs =
+    val ls = JdbcLedgerStore()
+    Svcs(
+      LedgerService[World](HasDb(), ls),
+      WithdrawalService[World](HasDb(), ls, JdbcWithdrawalStore()),
+      AdjustmentService[World](HasDb(), ls, JdbcProposalStore()),
+      ObligationService[World](HasDb(), JdbcObligationStore()))
 
   /** How many fresh ledger ids the op consumes (the runner allocates them and feeds the
     * SAME values to both worlds). Reference ops consume none — they target an existing id. */
@@ -48,20 +72,20 @@ trait LedgerDiffGen:
     case _ => 0
 
   /** Apply one op to a world; the returned verdict is compared across the two worlds. */
-  protected def applyOp(op: LedgerOp, w: World, a: Long, b: Long): (World, Any) = op match
-    case Credit(uid, amt, sk, si) => ledgerSvc.credit(w, Accounts.IncentiveExpense, Accounts.user(uid), uid, amt, a, sk, si)
-    case OpenObl(sk, si, uid)     => oSvc.open(w, sk, si, uid, "", "", "", 600L)
-    case CancelObl(sk, si)        => oSvc.cancel(w, sk, si)
-    case Reserve(uid, amt, creq)  => wSvc.request(w, uid, amt, creq, a, b, Accounts.user(uid), Accounts.WithdrawalClearing)
-    case ApproveW(t, exp)         => wSvc.approve(w, t, exp)
-    case SettleW(t, exp)          => wSvc.settle(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.Cash)
-    case RejectW(t, exp, u)       => wSvc.reject(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
-    case CancelW(t, exp, u)       => wSvc.cancel(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
-    case FailW(t, exp, u)         => wSvc.fail(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
-    case Propose(uid, amt, by)    => aSvc.propose(w, TxKind.ManualAdjustment, uid, Accounts.Adjustment, Accounts.user(uid), amt, "reason", by, a, None)
-    case Reverse(uid, amt, by, t) => aSvc.propose(w, TxKind.RollbackReversal, uid, Accounts.user(uid), Accounts.Adjustment, amt, "reason", by, a, Some(t))
-    case ApproveP(t, exp, ap)     => aSvc.approve(w, t, exp, ap, a)
-    case RejectP(t, exp)          => aSvc.reject(w, t, exp)
+  protected def applyOp(op: LedgerOp, s: Svcs, w: World, a: Long, b: Long): (World, Any) = op match
+    case Credit(uid, amt, sk, si) => s.ledgerSvc.credit(w, Accounts.IncentiveExpense, Accounts.user(uid), uid, amt, a, sk, si)
+    case OpenObl(sk, si, uid)     => s.oSvc.open(w, sk, si, uid, "", "", "", 600L)
+    case CancelObl(sk, si)        => s.oSvc.cancel(w, sk, si)
+    case Reserve(uid, amt, creq)  => s.wSvc.request(w, uid, amt, creq, a, b, Accounts.user(uid), Accounts.WithdrawalClearing)
+    case ApproveW(t, exp)         => s.wSvc.approve(w, t, exp)
+    case SettleW(t, exp)          => s.wSvc.settle(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.Cash)
+    case RejectW(t, exp, u)       => s.wSvc.reject(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
+    case CancelW(t, exp, u)       => s.wSvc.cancel(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
+    case FailW(t, exp, u)         => s.wSvc.fail(w, t, exp, a, Accounts.WithdrawalClearing, Accounts.user(u))
+    case Propose(uid, amt, by)    => s.aSvc.propose(w, TxKind.ManualAdjustment, uid, Accounts.Adjustment, Accounts.user(uid), amt, "reason", by, a, None)
+    case Reverse(uid, amt, by, t) => s.aSvc.propose(w, TxKind.RollbackReversal, uid, Accounts.user(uid), Accounts.Adjustment, amt, "reason", by, a, Some(t))
+    case ApproveP(t, exp, ap)     => s.aSvc.approve(w, t, exp, ap, a)
+    case RejectP(t, exp)          => s.aSvc.reject(w, t, exp)
 
   private val uids    = Gen.oneOf("u1", "u2")
   private val amounts = Gen.oneOf(0L, 100L, 200L, 300L) // 0 exercises NonPositiveAmount on both worlds

@@ -19,15 +19,4 @@ object LedgerValidation {
 
   def admissible(tx: LedgerTx): Boolean =
     positiveAmount(tx) && balanced(tx)
-
-  def txIdFresh(repo: LedgerRepository, tx: LedgerTx): Boolean =
-    repo.get(tx.id).isEmpty
-
-  def isFresh(repo: LedgerRepository, tx: LedgerTx): Boolean =
-    (tx.sourceKind, tx.sourceId) match
-      case (Some(k), Some(i)) => repo.findBySource(k, i).isEmpty
-      case _                  => true
-
-  def admissibleFresh(repo: LedgerRepository, tx: LedgerTx): Boolean =
-    admissible(tx) && txIdFresh(repo, tx) && isFresh(repo, tx)
 }
