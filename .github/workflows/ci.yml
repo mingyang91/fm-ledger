@@ -66,10 +66,32 @@ jobs:
         uses: actions/cache@v4
         with:
           path: verify/.stainless-cache
-          key: stainless-${{ hashFiles('verify/**/*.scala') }}
-          restore-keys: stainless-
+          key: stainless-vc-${{ hashFiles('verify/**/*.scala') }}
+          restore-keys: stainless-vc-
 
-      # Builds the Stainless verifier image from verify/stainless/ and runs the proofs over the
-      # whole verified core (Docker is available on ubuntu-latest).
+      # Cache the built verifier image (Stainless + z3) as a tarball, keyed on the verify/stainless
+      # build context. This skips the apt install and the hundreds-of-MB Stainless download on every
+      # run; verify.scala reuses an already-loaded image instead of rebuilding it.
+      - name: Cache Stainless verifier image
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/stainless-image
+          key: stainless-image-${{ hashFiles('verify/stainless/**') }}
+      - name: Load cached verifier image
+        run: |
+          tar="$HOME/.cache/stainless-image/stainless-verify.tar"
+          if [ -f "$tar" ]; then echo "loading cached stainless-verify image"; docker load -i "$tar"; fi
+
+      # Runs the proofs over the whole verified core (Docker is available on ubuntu-latest).
       - name: Verify
         run: ./mill verify.scala
+
+      # Persist the image on a cache miss so the next run restores it instead of rebuilding.
+      - name: Save verifier image to cache
+        if: always()
+        run: |
+          tar="$HOME/.cache/stainless-image/stainless-verify.tar"
+          if [ -n "$(docker images -q stainless-verify)" ] && [ ! -f "$tar" ]; then
+            mkdir -p "$HOME/.cache/stainless-image"
+            docker save stainless-verify -o "$tar"
+          fi

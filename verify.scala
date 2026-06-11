@@ -17,15 +17,24 @@ def main(args: String*): Unit =
   val image = "stainless-verify"
   val projectRoot = os.pwd
 
-  // Always rebuild the verifier image so Docker/runtime changes are not hidden
-  // behind a stale local tag. (The image layers are cached, so a no-change
-  // rebuild is fast.)
-  System.err.println(s"Building verifier image '$image'...")
-  os.proc("docker", "build", "-t", image, "verify/stainless/").call(
-    cwd = projectRoot,
-    stdout = os.Inherit,
-    stderr = os.Inherit
-  )
+  // Build the verifier image only if it is not already present (or if STAINLESS_REBUILD is set).
+  // Reusing an existing image lets CI restore it from a cache instead of re-downloading and
+  // re-installing Stainless + z3 on every run, and makes local re-runs instant. To force a fresh
+  // build: change the Dockerfile (CI keys its image cache on verify/stainless/), set
+  // STAINLESS_REBUILD=1, or `docker rmi stainless-verify`.
+  val imagePresent =
+    os.proc("docker", "image", "inspect", image)
+      .call(cwd = projectRoot, check = false, stdout = os.Pipe, stderr = os.Pipe)
+      .exitCode == 0
+  if !imagePresent || sys.env.contains("STAINLESS_REBUILD") then
+    System.err.println(s"Building verifier image '$image'...")
+    os.proc("docker", "build", "-t", image, "verify/stainless/").call(
+      cwd = projectRoot,
+      stdout = os.Inherit,
+      stderr = os.Inherit
+    )
+  else
+    System.err.println(s"Reusing existing verifier image '$image' (STAINLESS_REBUILD=1 to rebuild).")
 
   // Resolve files
   val files: Seq[String] =
