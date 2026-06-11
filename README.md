@@ -1,5 +1,7 @@
 # fm-ledger — a formally verified incentive-points ledger
 
+[![CI](https://github.com/mingyang91/fm-ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/mingyang91/fm-ledger/actions/workflows/ci.yml)
+
 A double-entry **ledger** for incentive points (earning, two-person adjustments, withdrawals, and
 recipient-pays-fee payouts via Stripe) whose business core is **proven correct with
 [Stainless](https://github.com/epfl-lara/stainless)** and then **transpiled into the production
