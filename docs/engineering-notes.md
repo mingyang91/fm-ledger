@@ -209,7 +209,7 @@ them twice. Don't chase a VC number; chase coverage of the code that ships.
 
 ## §13 — Two `Db.scala` files
 
-There are two files named `Db.scala`, which is confusing: `verify/.../io/linewise/ledger/Db.scala`
+There are two files named `Db.scala`, which is confusing: `verify/.../dev/mingyang91/ledger/Db.scala`
 is the `@extern` **stub** for the production persistence facade (verify-only, never transpiled,
 references the boundary DTOs), while the relational state object is `DB` (capitalised) in
 `verify/.../verify/Tables.scala`. Keep them distinct — the migration originally named the new file

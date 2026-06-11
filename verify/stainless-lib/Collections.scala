@@ -1,4 +1,4 @@
-package io.linewise.verify.verify
+package dev.mingyang91.verify.verify
 
 import stainless.lang._
 import stainless.collection._

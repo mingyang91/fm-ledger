@@ -1,4 +1,4 @@
-package io.linewise.verify.effect
+package dev.mingyang91.verify.effect
 
 import stainless.lang._
 

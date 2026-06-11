@@ -13,7 +13,7 @@ import mill._, scalalib._
  *   - The root module registers a `generatedSources` entry produced by the
  *     `transpile` task. `transpile` runs the transpiler over the verified ledger
  *     executable core and writes the production core under
- *       <generatedSources>/io/linewise/ledger/generated/
+ *       <generatedSources>/dev/mingyang91/ledger/generated/
  *   - Because `generatedSources` feeds `allSourceFiles`, `./mill compile`
  *     automatically regenerates the production core from verified source first.
  *   - `./mill transpile` can also be invoked directly to regenerate on demand.
@@ -28,7 +28,7 @@ object `package` extends SbtModule {
   // This makes the runtime requirement JDK 25+ explicit (Ox virtual threads need only 21+).
   def scalacOptions = Seq()
 
-  def mainClass = Some("io.linewise.ledger.LedgerServer")
+  def mainClass = Some("dev.mingyang91.ledger.LedgerServer")
 
   def mvnDeps = Seq(
     // ox: direct-style concurrency. Tapir's sync Netty server runs handlers on
@@ -45,7 +45,7 @@ object `package` extends SbtModule {
   // The incentive-points ledger's verified executable core. The proof files are
   // verify-only and never transpiled.
   def ledgerVerifiedSources: T[Seq[PathRef]] =
-    val base = moduleDir / "verify" / "src" / "main" / "scala" / "io" / "linewise" / "ledger" / "verify"
+    val base = moduleDir / "verify" / "src" / "main" / "scala" / "dev" / "mingyang91" / "ledger" / "verify"
     Task.Sources(
       base / "LedgerModel.scala", base / "Has.scala", base / "Tables.scala",
       base / "LedgerTables.scala", base / "LedgerValidation.scala", base / "LedgerService.scala",
@@ -55,7 +55,7 @@ object `package` extends SbtModule {
     )
 
   /** Run the transpiler over the verified executable core and emit production
-    * code under io.linewise.ledger.generated. Registered in `generatedSources`
+    * code under dev.mingyang91.ledger.generated. Registered in `generatedSources`
     * below, so `./mill compile` regenerates automatically. */
   def transpile: T[PathRef] = Task {
     val genRoot = Task.dest
@@ -69,7 +69,7 @@ object `package` extends SbtModule {
         val label = in.relativeTo(moduleDir).toString
         transpiler.runner().run(
           args = Seq(in.toString, dest.toString, label, targetPkg),
-          mainClass = "io.linewise.fm.transpiler.Main"
+          mainClass = "dev.mingyang91.fm.transpiler.Main"
         )
         val leaked = os.read.lines(dest).zipWithIndex.collect {
           case (l, i)
@@ -86,7 +86,7 @@ object `package` extends SbtModule {
       }
     }
 
-    genInto(ledgerVerifiedSources(), "io.linewise.ledger.generated")
+    genInto(ledgerVerifiedSources(), "dev.mingyang91.ledger.generated")
     PathRef(genRoot)
   }
 

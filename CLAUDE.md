@@ -15,7 +15,7 @@ Scala is *generated* from it by a transpiler, with a thin hand-written shell aro
    │
    │  ./mill transpile  (build-time, scalameta text-rewrite: Stainless → Ox/JDBC)
    ▼
- out/transpile.dest/io/linewise/ledger/generated/   (NOT checked in; regenerated each compile)
+ out/transpile.dest/dev/mingyang91/ledger/generated/   (NOT checked in; regenerated each compile)
    │
    ▼
  src/  (hand-written shell: HTTP/tapir, Persistence, Stripe, dispatcher) ── ./mill compile / test
@@ -23,7 +23,7 @@ Scala is *generated* from it by a transpiler, with a thin hand-written shell aro
 
 - **`verify/`** is the source of truth. Edit the model and the proofs here.
 - The **transpiler** (`transpiler/`, a separate Mill module) rewrites the *executable* verified files
-  into `io.linewise.ledger.generated`. It is a build-time tool, never shipped.
+  into `dev.mingyang91.ledger.generated`. It is a build-time tool, never shipped.
 - **`src/`** is the production shell that imports the generated core and adds I/O (PostgreSQL via
   Magnum, tapir HTTP, Stripe, the outbox dispatcher). The generated core is wired in via
   `generatedSources`, so `./mill compile` regenerates it automatically.
@@ -65,12 +65,12 @@ Scala is *generated* from it by a transpiler, with a thin hand-written shell aro
 
 | Path | What |
 |---|---|
-| `verify/src/main/scala/io/linewise/ledger/verify/` | the verified core (executable model + proofs) |
-| `verify/src/main/scala/io/linewise/ledger/Db.scala` | `@extern` stub for the production `Db` facade (verify-only; never transpiled) |
+| `verify/src/main/scala/dev/mingyang91/ledger/verify/` | the verified core (executable model + proofs) |
+| `verify/src/main/scala/dev/mingyang91/ledger/Db.scala` | `@extern` stub for the production `Db` facade (verify-only; never transpiled) |
 | `verify/stainless-lib/` | `FMLong`/`FMInt`, `SafeArith`, collection helpers |
 | `transpiler/` | the Stainless→Ox transpiler (scalameta text-rewrite) |
-| `src/main/scala/io/linewise/ledger/` | production shell: `LedgerHttp`, `Persistence`, `Jdbc`, `PayoutDispatcher`, `PayoutGateway`, `StripeSignature`, `LedgerServer` |
-| `src/test/scala/io/linewise/ledger/` | endpoint specs + the differential drift gate |
+| `src/main/scala/dev/mingyang91/ledger/` | production shell: `LedgerHttp`, `Persistence`, `Jdbc`, `PayoutDispatcher`, `PayoutGateway`, `StripeSignature`, `LedgerServer` |
+| `src/test/scala/dev/mingyang91/ledger/` | endpoint specs + the differential drift gate |
 | `docs/` | design notes; **engineering-notes.md** = the friction/lessons log |
 
 Executable model files: `Tables.scala` (`DB`/`World`/`HasDb`/rows/DTOs), `LedgerTables`,

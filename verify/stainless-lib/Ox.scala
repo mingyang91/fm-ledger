@@ -1,4 +1,4 @@
-package io.linewise.verify.ox
+package dev.mingyang91.verify.ox
 
 import stainless.lang._
 import stainless.annotation._
@@ -10,7 +10,7 @@ import stainless.annotation._
  * The names here are IDENTICAL to Ox's (`supervised`, `fork`, `forkUser`,
  * `Fork`, `.join()`, `par`), so verified business code reads exactly like the
  * production Ox code. The transpiler's only job for concurrency is to swap the
- * import `io.linewise.verify.ox.*` -> `ox.*`; the call sites need no rewriting.
+ * import `dev.mingyang91.verify.ox.*` -> `ox.*`; the call sites need no rewriting.
  * This file is NEVER transpiled (it is the verification substitute that the real
  * Ox library replaces in production, just like IO -> cats-effect).
  *

@@ -1,4 +1,4 @@
-package io.linewise.verify.verify
+package dev.mingyang91.verify.verify
 
 // Stainless-lib replacement: core annotations (lemma, noverify) are generator
 // infrastructure only — not needed in verification output.

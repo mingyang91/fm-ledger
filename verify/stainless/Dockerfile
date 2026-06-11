@@ -11,7 +11,7 @@
 #   docker build -t stainless-verify verify/stainless/
 #   docker run --rm -v $(pwd)/verify:/work stainless-verify \
 #     /work/stainless-lib/IO.scala /work/stainless-lib/EitherT.scala \
-#     /work/src/main/scala/io/linewise/verify/mvp/GivenWorld.scala
+#     /work/src/main/scala/dev/mingyang91/verify/mvp/GivenWorld.scala
 # =============================================================================
 
 ARG JAVA_VERSION=17
