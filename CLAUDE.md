@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code and other agents working in **linewise-fm** — a formal-methods-first
+Guidance for Claude Code and other agents working in **fm-ledger** — a formal-methods-first
 incentive-points **ledger**. The verified Stainless core is the single source of truth; production
 Scala is *generated* from it by a transpiler, with a thin hand-written shell around the edges.
 
@@ -103,7 +103,7 @@ dependency, e.g. `verify/stainless-lib/FMTypes.scala`.)
   to `Nil`). Higher-order ops (`map`/`filter`/`find`/`exists`/`forall`) are also fine.
 - **Proofs go in proof-only files.** If a predicate is only used by proofs, it does not belong in a
   whitelisted (transpiled) file.
-- **Separate git repo.** linewise-fm has its own git, outside any parent supermodule. Commit/push
+- **Separate git repo.** fm-ledger has its own git, outside any parent supermodule. Commit/push
   only when asked. Commit trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 - **Read [docs/engineering-notes.md](docs/engineering-notes.md)** before non-trivial work in the
   verified core — it records the specific traps (lens-law blow-up, `FMLong` vs `List.contains`,
